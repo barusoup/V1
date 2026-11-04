@@ -32,6 +32,21 @@ jobs:
       - name: Build the app
         run: cargo build --release -p v1-app
 
+      - name: Fetch FFmpeg (LGPL build, pinned and checksummed)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-03-12-50/ffmpeg-n9.0.2-45-g1e65c6cd5d-win64-lgpl-9.0.zip"
+          $sha256 = "b1bae38cca5d84eb0f004f80cfb712d7bb755ef060e5a34207391228793c4406"
+          New-Item -ItemType Directory -Force build\ffmpeg-download | Out-Null
+          $zip = "build\ffmpeg-download\ffmpeg.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $sha256) { throw "FFmpeg checksum mismatch: $actual" }
+          Expand-Archive $zip -DestinationPath build\ffmpeg-download\extract -Force
+          $root = Get-ChildItem build\ffmpeg-download\extract -Directory | Select-Object -First 1
+          New-Item -ItemType Directory -Force build\ffmpeg | Out-Null
+          Copy-Item "$($root.FullName)\bin\ffmpeg.exe", "$($root.FullName)\bin\ffprobe.exe", "$($root.FullName)\LICENSE.txt" -Destination build\ffmpeg
+
       - name: Install NSIS
         run: choco install nsis --yes --no-progress
 

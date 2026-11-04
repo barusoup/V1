@@ -40,6 +40,14 @@ Section "Install"
   File "${ROOT}\LICENSE"
   File "${ROOT}\NOTICE"
   File "${ROOT}\THIRD-PARTY-LICENSES.md"
+
+  ; FFmpeg and ffprobe, staged by the release workflow. The app finds them in this folder.
+  SetOutPath "$INSTDIR\ffmpeg"
+  File "${ROOT}\build\ffmpeg\ffmpeg.exe"
+  File "${ROOT}\build\ffmpeg\ffprobe.exe"
+  File "/oname=LICENSE-FFmpeg.txt" "${ROOT}\build\ffmpeg\LICENSE.txt"
+  SetOutPath "$INSTDIR"
+
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   WriteRegStr HKCU "Software\${APP_NAME}" "InstallDir" "$INSTDIR"
@@ -63,6 +71,7 @@ Section "Uninstall"
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\NOTICE"
   Delete "$INSTDIR\THIRD-PARTY-LICENSES.md"
+  RMDir /r "$INSTDIR\ffmpeg"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 

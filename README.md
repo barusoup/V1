@@ -15,7 +15,8 @@ Lyrics are synced line by line from Boidu (the Better Lyrics API), with
 
 - Rust 1.85 or newer
 - A GPU with Vulkan 1.3
-- `ffmpeg` and `ffprobe` on `PATH`, or set `DREAM_FFMPEG` and `DREAM_FFPROBE` to their paths
+- To run from source: `ffmpeg` and `ffprobe` on `PATH`, or set `DREAM_FFMPEG` and `DREAM_FFPROBE`.
+  The Windows installer includes them.
 
 ## Install
 
