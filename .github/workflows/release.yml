@@ -1,0 +1,59 @@
+name: Release
+
+# Runs when a full release is tagged, for example `v0.2.0`. Nightly commits never reach this.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the Cargo version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$version" != "$manifest" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the app
+        run: cargo build --release -p v1-app
+
+      - name: Install NSIS
+        run: choco install nsis --yes --no-progress
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          & "C:\Program Files (x86)\NSIS\makensis.exe" "/DVERSION=$env:VERSION" installer\V1.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
+
+      - name: Write checksums
+        shell: pwsh
+        run: |
+          $installer = "dist\V1-Setup-$env:VERSION.exe"
+          $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $installer -Leaf)" | Set-Content -Encoding ascii dist\SHA256SUMS
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/V1-Setup-$VERSION.exe" dist/SHA256SUMS \
+            --title "V1 $VERSION" --generate-notes

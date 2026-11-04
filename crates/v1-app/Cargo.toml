@@ -1,0 +1,32 @@
+[package]
+name = "v1-app"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+default-run = "v1"
+
+[[bin]]
+name = "v1"
+path = "src/main.rs"
+
+[build-dependencies]
+winres = "0.1"
+
+[dependencies]
+dream = { path = "../../vendor/dream" }
+# Vendored to allow http(s) inputs in the protocol whitelist; see vendor/dream-media/README-v1.md.
+dream-media = { path = "../../vendor/dream-media" }
+winit = "0.30"
+yt-client = { path = "../yt-client" }
+yt-stream = { path = "../yt-stream" }
+yt-proxy = { path = "../yt-proxy" }
+yt-js = { path = "../yt-js" }
+yt-lyrics = { path = "../yt-lyrics" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"

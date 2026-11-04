@@ -1,0 +1,62 @@
+V1
+Copyright (c) 2026 Hunter Lehr (Barusoup)
+https://github.com/barusoup/v1
+
+V1 is a native YouTube Music client, licensed under the GNU Affero General
+Public License v3.0 with additional attribution terms. See LICENSE.
+
+
+Built on
+
+  Dream Engine (including BedFrame)
+  Copyright (c) 2026 Hunter Lehr (Barusoup)
+  https://github.com/barusoup/dream
+  Vendored in vendor/dream. Licensed AGPL-3.0 with additional terms,
+  see vendor/dream/LICENSE.
+
+  Dream Media Handler
+  Copyright (c) 2026 Hunter Lehr (Barusoup)
+  https://github.com/barusoup/dream-media
+  Vendored in vendor/dream-media, with the changes described in
+  vendor/dream-media/README-v1.md. Licensed AGPL-3.0 with additional terms,
+  see vendor/dream-media/LICENSE.
+
+  Dream Engine and Dream Media Handler are by the same author as V1. They
+  are released under the same license, so the whole program is AGPL-3.0.
+
+
+Bundled fonts (vendor/dream/assets/fonts, compiled into Dream)
+
+  Inter                  SIL Open Font License 1.1   vendor/dream/assets/fonts/inter/OFL.txt
+  JetBrains Mono         SIL Open Font License 1.1   vendor/dream/assets/fonts/jetbrains-mono/OFL.txt
+  Press Start 2P         SIL Open Font License 1.1   vendor/dream/assets/fonts/press-start-2p/OFL.txt
+  Roboto                 Apache License 2.0          vendor/dream/assets/fonts/roboto/LICENSE.txt
+
+
+Derived code
+
+  Dream's FSR 3.1 upscaler (vendor/dream/src/fsr3*) reimplements shaders and
+  host logic from AMD FidelityFX SDK 1.1.4, Copyright (c) AMD, MIT License.
+
+
+Icons
+
+  Lucide icons (crates/v1-app/assets/icons), ISC License.
+  See crates/v1-app/assets/icons/LICENSE-lucide.txt.
+
+
+Rust dependencies
+
+  Every other crate compiled into V1 is listed with its version and license
+  in THIRD-PARTY-LICENSES.md.
+
+
+Services and external tools
+
+  V1 talks to YouTube Music's web API (InnerTube), and fetches lyrics from
+  Boidu (Better Lyrics) and LRCLIB. It fetches YouTube's player script at
+  run time; that script is not bundled. V1 is not affiliated with or endorsed
+  by YouTube, Google, Boidu or LRCLIB.
+
+  FFmpeg is not bundled. V1 runs the ffmpeg and ffprobe executables that the
+  user installs. FFmpeg's license depends on how it was built (LGPL or GPL).

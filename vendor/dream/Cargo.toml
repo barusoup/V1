@@ -1,0 +1,33 @@
+[package]
+name = "dream"
+version = "0.1.0"
+edition = "2024"
+license-file = "LICENSE"
+publish = false
+
+[dependencies]
+ash = "0.38"
+ash-window = "0.13"
+bytemuck = { version = "1.25", features = ["derive"] }
+cpal = "0.16"
+fontdue = "0.8"
+ttf-parser = "0.20"
+glam = "0.30"
+gltf = { version = "1.4", features = [
+    "extensions",
+    "KHR_texture_transform",
+    "KHR_materials_emissive_strength",
+] }
+gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan", "std"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+naga = { version = "27.0.3", default-features = false, features = ["wgsl-in", "spv-out"] }
+raw-window-handle = "0.6"
+unicode-segmentation = "1.13.3"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "ogg", "vorbis", "flac", "wav", "pcm"] }
+winit = "0.30"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2.7"
+
+[build-dependencies]
+naga = { version = "27.0.3", default-features = false, features = ["wgsl-in", "spv-out"] }

@@ -1,0 +1,4 @@
+# Copy to .cargo/config.toml (gitignored) to build the `gpu` feature against a
+# local Dream checkout instead of the repository.
+[patch."https://github.com/barusoup/Dream.git"]
+dream = { path = "../Dream" }

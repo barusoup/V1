@@ -1,0 +1,22 @@
+Dream Engine
+Copyright (c) 2026 Hunter Lehr. Dream Engine is licensed under AGPL-3.0 with
+additional terms; see LICENSE.
+
+This repository contains third-party assets that remain under their
+original licenses:
+
+- assets/fonts/Roboto-Regular.ttf
+  Roboto font — Apache License 2.0
+  https://fonts.google.com/specimen/Roboto
+
+- assets/fonts/press-start-2p.ttf
+  Press Start 2P font — SIL Open Font License 1.1
+  https://fonts.google.com/specimen/Press+Start+2P
+
+- fixtures/DamagedHelmet.glb
+  Khronos glTF sample model — CC BY 4.0
+  https://github.com/KhronosGroup/glTF-Sample-Assets
+
+The FSR 3.1 upscaler port in src/fsr3*.rs reimplements shaders and host
+logic from AMD FidelityFX SDK 1.1.4, which is MIT licensed
+(copyright (c) AMD).

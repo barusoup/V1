@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+# Local tooling that is not part of the app.
+exclude = ["dev"]
+members = [
+    "crates/yt-client",
+    "crates/yt-stream",
+    "crates/yt-proxy",
+    "crates/yt-player",
+    "crates/yt-js",
+    "crates/yt-lyrics",
+    "crates/v1-app",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+publish = false
+license = "AGPL-3.0-only"
+
+[workspace.dependencies]
+# Shared versions. Crates opt in with `dep.workspace = true`.
+bytes = "1"
+futures-util = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rand = "0.8"
+# `http2` is on so that clients that benefit can use it: a screenful of covers shares one connection
+# instead of opening a TLS handshake each. Clients that must stay on HTTP/1.1 ask for it with
+# `http1_only()`: the range proxy and stream probe (their speed was measured on HTTP/1.1), and the
+# InnerTube client and player-script fetch, because YouTube's pages reset HTTP/2 requests from this
+# client with a PROTOCOL_ERROR.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "gzip", "brotli", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"] }
+tracing = "0.1"
+
+
+[profile.release]
+# One codegen unit and fat LTO: the app is a single binary, so the extra build time buys a smaller,
+# faster executable (less to page in at launch). Stripping symbols shrinks it further.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+# Dependencies are compiled optimised even in dev builds. The UI, image decoding and TLS are far too
+# slow unoptimised to judge the app by, and the dependencies rarely change.
+[profile.dev.package."*"]
+opt-level = 2

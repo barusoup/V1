@@ -1,0 +1,23 @@
+[package]
+name = "dream-media"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Dream Media Handler: fast, bounded FFmpeg still, video and audio playback for Dream apps"
+license-file = "LICENSE"
+readme = "README.md"
+repository = "https://github.com/barusoup/dream-media"
+keywords = ["gamedev", "media", "ffmpeg", "video", "audio"]
+categories = ["multimedia", "game-development"]
+publish = false
+
+[features]
+default = ["gpu"]
+# The Dream GPU bridge: VideoSurface, VideoPlayer and Image::upload. Without
+# it the crate has no dependency on Dream and runs headless.
+gpu = ["dep:dream"]
+
+[dependencies]
+cpal = "0.16"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+dream = { git = "https://github.com/barusoup/Dream.git", branch = "main", optional = true }

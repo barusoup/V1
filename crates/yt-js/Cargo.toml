@@ -1,0 +1,15 @@
+[package]
+name = "yt-js"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+rquickjs = "0.9"
+regex = "1"
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
