@@ -14,7 +14,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.1.1"
+version = "0.1.2"
 publish = false
 license = "AGPL-3.0-only"
 
