@@ -182,18 +182,30 @@ async fn get(client: &reqwest::Client, url: &str, timeout: Duration) -> Option<V
 #[cfg(windows)]
 fn restart_into_update(installer: &Path, install_dir: &Path) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW gives the script and the tools it runs a hidden console. Do not add
+    // DETACHED_PROCESS: Windows then ignores CREATE_NO_WINDOW, every tool gets a visible window,
+    // and the tasklist check stops seeing its output, so the installer could run over a live app.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    /// About two minutes of waiting, then the update is dropped instead of hanging.
+    const WAIT_TRIES: u32 = 120;
 
     let pid = std::process::id();
     let script = installer.with_file_name("v1-update.cmd");
     let body = format!(
         "@echo off\r\n\
+         set /a tries=0\r\n\
          :wait\r\n\
          tasklist /FI \"PID eq {pid}\" /NH | find \"{pid}\" >nul\r\n\
-         if not errorlevel 1 (ping -n 2 127.0.0.1 >nul & goto wait)\r\n\
+         if errorlevel 1 goto install\r\n\
+         set /a tries+=1\r\n\
+         if %tries% GEQ {WAIT_TRIES} goto abort\r\n\
+         ping -n 2 127.0.0.1 >nul\r\n\
+         goto wait\r\n\
+         :install\r\n\
          \"{installer}\" /S /D={dir}\r\n\
          start \"\" \"{dir}\\v1.exe\"\r\n\
+         :abort\r\n\
          del \"{installer}\" >nul 2>&1\r\n\
          (goto) 2>nul & del \"%~f0\"\r\n",
         installer = installer.display(),
@@ -203,7 +215,7 @@ fn restart_into_update(installer: &Path, install_dir: &Path) -> std::io::Result<
     std::process::Command::new("cmd")
         .arg("/C")
         .arg(&script)
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
         .spawn()?;
     Ok(())
 }
