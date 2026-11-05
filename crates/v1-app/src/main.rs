@@ -7,6 +7,10 @@
 //! what is on screen. Input is latched into plain fields and handed to the UI once per frame,
 //! because `UiInput` edges are single-use.
 
+// Release builds are GUI-subsystem so no console window opens with the app. Debug builds keep
+// the console so tracing output stays visible.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod anim;
 mod backend;
 mod clock;
