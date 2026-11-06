@@ -225,6 +225,7 @@ mod tests {
             thumbnail: None,
             artist_id: None,
             album_id: None,
+            artist_ids: Vec::new(),
         }
     }
 

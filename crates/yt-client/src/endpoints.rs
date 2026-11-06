@@ -304,6 +304,7 @@ fn top_result(card: &Value) -> Option<TopResult> {
         thumbnail,
         artist_id: credits.artist_id,
         album_id: credits.album_id,
+        artist_ids: credits.artist_ids,
     }))
 }
 
@@ -453,6 +454,7 @@ pub(crate) fn row_hit(row: &Value) -> Option<SongHit> {
         thumbnail,
         artist_id: credits.artist_id,
         album_id: credits.album_id,
+        artist_ids: credits.artist_ids,
     })
 }
 
@@ -461,6 +463,7 @@ pub(crate) fn row_hit(row: &Value) -> Option<SongHit> {
 struct Credits {
     artists: Vec<String>,
     artist_id: Option<String>,
+    artist_ids: Vec<Option<String>>,
     album: Option<String>,
     album_id: Option<String>,
     duration: Option<String>,
@@ -475,6 +478,7 @@ fn read_credits(runs: &[Value]) -> Credits {
         match run_page(run) {
             Some(("MUSIC_PAGE_TYPE_ARTIST" | "MUSIC_PAGE_TYPE_USER_CHANNEL", id)) => {
                 credits.artists.push(text.to_owned());
+                credits.artist_ids.push(id.map(str::to_owned));
                 credits.artist_id = credits.artist_id.or(id.map(str::to_owned));
             }
             Some(("MUSIC_PAGE_TYPE_ALBUM", id)) => {
@@ -559,6 +563,39 @@ mod tests {
         assert_eq!(h.thumbnail.as_deref(), Some("https://x/large"));
         assert_eq!(h.artist_id.as_deref(), Some("UCdaftpunk"));
         assert_eq!(h.album_id.as_deref(), Some("MPREb_homework"));
+    }
+
+    #[test]
+    fn every_artist_credit_keeps_its_own_link() {
+        let artist = |name: &str, id: &str| {
+            json!({ "text": name, "navigationEndpoint": { "browseEndpoint": {
+                "browseId": id,
+                "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": {
+                    "pageType": "MUSIC_PAGE_TYPE_ARTIST" } } } } })
+        };
+        let root = json!({
+          "contents": [{
+            "musicResponsiveListItemRenderer": {
+              "playlistItemData": { "videoId": "duo" },
+              "overlay": play_overlay(ATV),
+              "flexColumns": [
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    { "text": "Instant Crush" } ] } } },
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    artist("Daft Punk", "UCdaftpunk"),
+                    { "text": " & " },
+                    artist("Julian Casablancas", "UCjulian") ] } } }
+              ]
+            }
+          }]
+        });
+        let hit = &parse_song_hits(&root)[0];
+        let links: Vec<_> = hit.artist_links().collect();
+        assert_eq!(
+            links,
+            vec![("Daft Punk", Some("UCdaftpunk")), ("Julian Casablancas", Some("UCjulian"))]
+        );
+        assert_eq!(hit.artist_id.as_deref(), Some("UCdaftpunk"));
     }
 
     #[test]
@@ -881,6 +918,7 @@ mod tests {
             thumbnail: None,
             artist_id: None,
             album_id: None,
+            artist_ids: Vec::new(),
         }
     }
 }

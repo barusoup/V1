@@ -504,7 +504,8 @@ struct Row<'a> {
     album: &'a str,
     duration: &'a str,
     thumbnail: Option<&'a str>,
-    artist_id: Option<&'a str>,
+    /// Each artist credit and the page it links to, if any.
+    artists: Vec<(&'a str, Option<&'a str>)>,
     album_id: Option<&'a str>,
 }
 
@@ -538,7 +539,7 @@ impl<'a> Row<'a> {
                 .or_else(|| lengths.get(&hit.video_id).map(String::as_str))
                 .unwrap_or_default(),
             thumbnail: hit.thumbnail.as_deref(),
-            artist_id: hit.artist_id.as_deref(),
+            artists: hit.artist_links().collect(),
             album_id: hit.album_id.as_deref(),
         }
     }
@@ -1068,6 +1069,7 @@ impl State {
                 thumbnail: std::env::var_os("V1_SHOT_COVERS").map(|_| format!("demo://{index}")),
                 artist_id: None,
                 album_id: None,
+                artist_ids: Vec::new(),
             })
             .collect();
         if std::env::var_os("V1_SHOT_COVERS").is_some() {
@@ -2581,7 +2583,7 @@ fn collection_page(
     };
     let offset = cx.ui.scroll_state(id).0;
     let labels = CollectionTab::ALL.map(|tab| (tab.label(), tab.icon()));
-    if let Some(index) = tab_pills(cx, &labels, target.index(), view.x + 8.0, PAGE_TOP - offset, 0) {
+    if let Some(index) = tab_pills(cx, &labels, target.index(), view.x + 8.0, PAGE_TOP - offset, &COLLECTION_PILLS) {
         actions.push(Action::CollectionTab(CollectionTab::ALL[index]));
     }
 }
@@ -2653,6 +2655,7 @@ fn collection_list(
                 body.y + content_top,
                 6000,
                 f32::INFINITY,
+                true,
                 false,
                 Action::PlayLibrary,
                 first,
@@ -2710,17 +2713,43 @@ fn collection_list(
     cx.ui.scrollbar = bar;
 }
 
+/// The animation slots one row of pill tabs owns. Springs are keyed by `(name, index)`, so two rows
+/// on screen at once must not share a name: the sidebar's own tabs use `tab_hv`, and each pill row
+/// brings names of its own. Sharing one made hovering a pill move a sidebar tab.
+struct PillKeys {
+    hover: &'static str,
+    on: &'static str,
+    glide_x: &'static str,
+    glide_w: &'static str,
+}
+
+/// The Collection page's tabs (Songs, Albums, Artists).
+const COLLECTION_PILLS: PillKeys = PillKeys {
+    hover: "collection_tab_hv",
+    on: "collection_tab_on",
+    glide_x: "collection_tab_glide_x",
+    glide_w: "collection_tab_glide_w",
+};
+
+/// The search results' tabs (Songs, Albums, Artists).
+const RESULT_PILLS: PillKeys = PillKeys {
+    hover: "result_tab_hv",
+    on: "result_tab_on",
+    glide_x: "result_tab_glide_x",
+    glide_w: "result_tab_glide_w",
+};
+
 /// A row of pill tabs (icon and label each), left-aligned at `(x, y)`. The `current` one is lit and
 /// its pill glides between tabs; the others wash under the pointer. Returns the index of a tab
-/// clicked this frame, never the chosen one. `key` offsets the animation keys, so two rows of pills
-/// on screen keep their own springs.
+/// clicked this frame, never the chosen one. `keys` names this row's animation slots, so every row
+/// on screen keeps its own.
 fn tab_pills(
     cx: &mut Cx,
     tabs: &[(&'static str, Icon)],
     current: usize,
     x: f32,
     y: f32,
-    key: u32,
+    keys: &PillKeys,
 ) -> Option<usize> {
     let widths: Vec<f32> = tabs
         .iter()
@@ -2733,8 +2762,8 @@ fn tab_pills(
         left += width + 8.0;
     }
     // The chosen pill is a single shape that glides from tab to tab: position and width are springs.
-    let pill_x = cx.anims.spring("tab_pill_x", key, lefts[current] - x, 700.0) + x;
-    let pill_w = cx.anims.spring("tab_pill_w", key, widths[current], 700.0);
+    let pill_x = cx.anims.spring(keys.glide_x, 0, lefts[current] - x, 700.0) + x;
+    let pill_w = cx.anims.spring(keys.glide_w, 0, widths[current], 700.0);
     cx.draw()
         .round_rect(Rect::new(pill_x, y, pill_w, COLLECTION_TAB_H), COLLECTION_TAB_H * 0.5, theme::PRESS);
 
@@ -2743,9 +2772,8 @@ fn tab_pills(
         let rect = Rect::new(lefts[index], y, widths[index], COLLECTION_TAB_H);
         let selected = index == current;
         let hover = cx.over_clickable(rect);
-        let slot = key + index as u32;
-        let hv = cx.anims.toggle("tab_hv", slot, hover, rate::SNAP);
-        let on = cx.anims.toggle("tab_on", slot, selected, rate::SNAP);
+        let hv = cx.anims.toggle(keys.hover, index as u32, hover, rate::SNAP);
+        let on = cx.anims.toggle(keys.on, index as u32, selected, rate::SNAP);
         // Hover only warms the text and icon; the container belongs to the chosen tab alone.
         let ink = mix(theme::MUTED, theme::FG, hv.max(on));
         cx.icon(*icon, (rect.x + 17.0 + COLLECTION_TAB_ICON * 0.5, rect.y + rect.h * 0.5), COLLECTION_TAB_ICON, ink);
@@ -3187,7 +3215,7 @@ fn track_list(
     let content_h = top + rows.len() as f32 * theme::ROW_H + 24.0;
     let body = cx.ui.scroll_begin(scroll_id, view, content_h);
     let play: fn(usize) -> Action = if queued { Action::PlayQueued } else { Action::Play };
-    track_rows(cx, track, rows, view, body, body.y + top, base, age, queued, play, 0, actions);
+    track_rows(cx, track, rows, view, body, body.y + top, base, age, true, queued, play, 0, actions);
     cx.ui.scroll_end();
 }
 
@@ -3195,6 +3223,9 @@ fn track_list(
 /// visible part of the page: a row takes the pointer only inside it. A press on a row plays it through
 /// `play`, unless it landed on the artist or the album, which opens that page instead, or on the save
 /// button, which saves the song.
+///
+/// `covers` draws each row's cover, with the play glyph or equalizer over it. A page that already
+/// shows one cover for the whole list (an album's) passes `false`, and the rows start at their text.
 ///
 /// `rows` may be only a window of a longer list (a big collection builds just what is on screen):
 /// `first` is the position of `rows[0]` in the whole list, which places the rows and numbers them
@@ -3209,13 +3240,16 @@ fn track_rows(
     top: f32,
     base: u32,
     age: f32,
+    covers: bool,
     queued: bool,
     play: fn(usize) -> Action,
     first: usize,
     actions: &mut Vec<Action>,
 ) {
     let playing_id = track.map(|track| track.video_id.as_str());
-    let wide = view.w > 760.0;
+    // A row wide enough for a column of albums gives the album one; one with no album to show uses
+    // the whole width for its names.
+    let columns = view.w > 760.0;
     let pointer_in_view = cx.pointer_in(view);
 
     // A queue row is moved by its handle. Letting go ends the drag and asks for the move to the
@@ -3277,11 +3311,15 @@ fn track_rows(
         }
         cx.draw().round_rect(pill, 10.0, wash);
 
-        // Cover, with the play glyph (hovered) or the equalizer (playing) over it.
+        // Cover, with the play glyph (hovered) or the equalizer (playing) over it. A list that
+        // already has one cover at its head leaves the columns out, and the names start there.
         let handle_w = if queued { HANDLE_W } else { 0.0 };
-        let cover = Rect::new(pill.x + 8.0 + handle_w, pill.y + 6.0, 44.0, 44.0);
-        cx.cover(row.thumbnail, cover, 7.0, a);
-        cover_overlay(cx, track, row.video_id, playing, cover, 7.0, a, hv);
+        let cover_w = if covers { 44.0 } else { 0.0 };
+        let cover = Rect::new(pill.x + 8.0 + handle_w, pill.y + 6.0, cover_w, 44.0);
+        if covers {
+            cx.cover(row.thumbnail, cover, 7.0, a);
+            cover_overlay(cx, track, row.video_id, playing, cover, 7.0, a, hv);
+        }
 
         // A queue row's grip on the left: grabbing it moves the row. The remove button sits on the right.
         let mut handle_pressed = false;
@@ -3314,7 +3352,9 @@ fn track_rows(
             trash_clicked = pointer_in_view && cx.clicked(trash);
         }
 
-        let text_x = cover.x + cover.w + 14.0;
+        // With no cover the names start where one would have: on the page's left edge, level with
+        // the album's own cover above them.
+        let text_x = if covers { cover.x + cover.w + 14.0 } else { cover.x };
         // Clear of the scrollbar, which floats in the right-hand margin. A queue row leaves room
         // for its remove button.
         let end = if queued { trash.x - 12.0 } else { pill.x + pill.w - 16.0 };
@@ -3325,6 +3365,7 @@ fn track_rows(
 
         // Wide rows put the album in a column of its own; narrow ones run the artist and album on
         // one line. Either way the title takes what is left.
+        let wide = columns && !row.album.is_empty();
         let album_w = (pill.w * 0.26).clamp(120.0, 300.0);
         let album_x = tail - 20.0 - album_w;
         // The save button sits right of the names, so the names stop short of it by its width and gap.
@@ -3367,15 +3408,14 @@ fn track_rows(
         // opens its page rather than playing the row.
         let meta_y = pill.y + 28.0;
         let opened = if wide {
-            let artist = row_text(
+            let artist = artist_text(
                 cx,
                 "link_artist",
                 key,
                 Rect::new(text_x, meta_y, title_w, 18.0),
-                &row.artist,
+                &row.artists,
                 12.5,
                 a,
-                row.artist_id.map(|id| Detail::Artist(id.to_owned())),
             );
             let album = row_text(
                 cx,
@@ -3399,15 +3439,14 @@ fn track_rows(
             } else {
                 cx.text_width(ROW_SEP, 12.5)
             };
-            let artist = row_text(
+            let artist = artist_text(
                 cx,
                 "link_artist",
                 key,
                 Rect::new(text_x, meta_y, full_w, 18.0),
-                &row.artist,
+                &row.artists,
                 12.5,
                 a,
-                row.artist_id.map(|id| Detail::Artist(id.to_owned())),
             );
             if sep_w > 0.0 {
                 cx.text_fit(
@@ -3715,6 +3754,45 @@ fn row_text(
     cx.clicked(hit).then_some(target)
 }
 
+/// Between a song's artist credits, as `artists.join(", ")` puts it.
+const ARTIST_SEP: &str = ", ";
+
+/// A song's artists, side by side and comma-separated, each its own [`row_text`] link to that
+/// artist's page (a credit without a page stays plain). Returns the artist pressed, if any.
+#[allow(clippy::too_many_arguments)]
+fn artist_text(
+    cx: &mut Cx,
+    name: &'static str,
+    key: u32,
+    rect: Rect,
+    artists: &[(&str, Option<&str>)],
+    size: f32,
+    alpha: f32,
+) -> Option<Detail> {
+    let right = rect.x + rect.w;
+    let mut x = rect.x;
+    let mut opened = None;
+    for (i, (artist, id)) in artists.iter().enumerate() {
+        if i > 0 {
+            if x >= right {
+                break;
+            }
+            cx.text_fit(Rect::new(x, rect.y, right - x, rect.h), ARTIST_SEP, size, fade(theme::MUTED, alpha), Align::Left);
+            x += cx.text_width(ARTIST_SEP, size);
+        }
+        if x >= right {
+            break;
+        }
+        // Each credit hovers on its own; the first keeps the key a lone artist always had.
+        let link_key = key.wrapping_add((i as u32).wrapping_mul(0x9E37_79B9));
+        let target = id.map(|id| Detail::Artist(id.to_owned()));
+        let pressed = row_text(cx, name, link_key, Rect::new(x, rect.y, right - x, rect.h), artist, size, alpha, target);
+        opened = opened.or(pressed);
+        x += cx.text_width(artist, size);
+    }
+    opened
+}
+
 /// A song's title, when it names the album the song is from: drawn in `color`, and a press on it
 /// returns the album.
 #[allow(clippy::too_many_arguments)]
@@ -3827,7 +3905,11 @@ fn artist_page(
         .iter()
         .map(|hit| {
             let mut row = Row::from(hit, lengths);
-            row.artist_id = None;
+            for (_, id) in &mut row.artists {
+                if *id == Some(page.browse_id.as_str()) {
+                    *id = None;
+                }
+            }
             row
         })
         .collect();
@@ -3892,6 +3974,7 @@ fn artist_page(
             rows_top,
             8000,
             f32::INFINITY,
+            true,
             false,
             Action::PlayDetail,
             0,
@@ -4017,14 +4100,14 @@ fn search_results(
 
     let labels = ResultsTab::ALL.map(|kind| (kind.label(), kind.icon()));
     let current = ResultsTab::ALL.iter().position(|kind| *kind == tab).unwrap_or(0);
-    if let Some(index) = tab_pills(cx, &labels, current, left, y, 8) {
+    if let Some(index) = tab_pills(cx, &labels, current, left, y, &RESULT_PILLS) {
         actions.push(Action::ResultsTab(ResultsTab::ALL[index]));
     }
     y += TAB_ROW_H;
 
     match tab {
         ResultsTab::Songs if !rows.is_empty() => {
-            track_rows(cx, track, &rows, view, body, y, 0, age, false, Action::Play, 0, actions);
+            track_rows(cx, track, &rows, view, body, y, 0, age, true, false, Action::Play, 0, actions);
         }
         ResultsTab::Artists if !state.result_artists.is_empty() => {
             for (k, artist) in state.result_artists.iter().enumerate() {
@@ -4124,16 +4207,8 @@ fn top_card(
 
     let (title, meta, thumbnail, round, target): (&str, String, Option<&str>, bool, Option<Detail>) =
         match top {
-            TopResult::Song(hit) => {
-                let mut parts = Vec::new();
-                if !hit.artists.is_empty() {
-                    parts.push(hit.artists.join(", "));
-                }
-                if let Some(album) = hit.album.as_deref().filter(|album| !album.is_empty()) {
-                    parts.push(album.to_owned());
-                }
-                (hit.title.as_str(), parts.join(ROW_SEP), hit.thumbnail.as_deref(), false, None)
-            }
+            // A song's artists and album are drawn below as links of their own, not as one string.
+            TopResult::Song(hit) => (hit.title.as_str(), String::new(), hit.thumbnail.as_deref(), false, None),
             TopResult::Artist(artist) => (
                 artist.name.as_str(),
                 artist.meta.clone(),
@@ -4173,14 +4248,54 @@ fn top_card(
         theme::FG,
         Align::Left,
     );
-    cx.text_fit(
-        Rect::new(text_x, pill.y + 98.0, text_w, 20.0),
-        &meta,
-        13.0,
-        theme::MUTED,
-        Align::Left,
-    );
-    if pointer_in_view && cx.clicked(pill) {
+    // The meta line. A song's artist credits are links of their own, as a row's are, followed by
+    // its album; an artist's or an album's meta is plain.
+    let meta_rect = Rect::new(text_x, pill.y + 98.0, text_w, 20.0);
+    let opened = if let TopResult::Song(hit) = top {
+        let credits: Vec<(&str, Option<&str>)> = hit.artist_links().collect();
+        let credits_w = if credits.is_empty() {
+            0.0
+        } else {
+            cx.text_width(&hit.artists.join(ARTIST_SEP), 13.0).min(text_w)
+        };
+        let mut opened = artist_text(
+            cx,
+            "link_top_artist",
+            0,
+            Rect::new(text_x, meta_rect.y, credits_w, meta_rect.h),
+            &credits,
+            13.0,
+            1.0,
+        );
+        let mut x = text_x + credits_w;
+        if let Some(album) = hit.album.as_deref().filter(|album| !album.is_empty()) {
+            let sep_w = if credits.is_empty() { 0.0 } else { cx.text_width(ROW_SEP, 13.0) };
+            if sep_w > 0.0 {
+                cx.text_fit(
+                    Rect::new(x, meta_rect.y, sep_w, meta_rect.h),
+                    ROW_SEP,
+                    13.0,
+                    theme::MUTED,
+                    Align::Left,
+                );
+            }
+            x += sep_w;
+            let room = Rect::new(x, meta_rect.y, (meta_rect.x + meta_rect.w - x).max(0.0), meta_rect.h);
+            match hit.album_id.as_deref().map(|id| Detail::Album(id.to_owned())) {
+                Some(target) => {
+                    opened = opened.or(row_text(cx, "link_top_album", 0, room, album, 13.0, 1.0, Some(target)));
+                }
+                None => cx.text_fit(room, album, 13.0, theme::MUTED, Align::Left),
+            }
+        }
+        opened
+    } else {
+        cx.text_fit(meta_rect, &meta, 13.0, theme::MUTED, Align::Left);
+        None
+    };
+    if let Some(detail) = opened {
+        actions.push(Action::Open(detail));
+    } else if pointer_in_view && cx.clicked(pill) {
         actions.push(match target {
             Some(detail) => Action::Open(detail),
             None => Action::PlayTop,
@@ -4198,7 +4313,7 @@ const EMPTY_PART_H: f32 = 64.0;
 const TOP_COVER: f32 = 120.0;
 
 /// An album: its cover, its title, the artist (a link), and its meta line; then its tracks. The
-/// rows do not repeat the album's name, since the page is the album.
+/// rows repeat neither the album's name nor its cover, since the page already shows both.
 fn album_page(
     cx: &mut Cx,
     track: Option<&TrackView>,
@@ -4295,6 +4410,7 @@ fn album_page(
             body.y + rows_top_off,
             8000,
             f32::INFINITY,
+            false,
             false,
             Action::PlayDetail,
             0,
@@ -4497,17 +4613,26 @@ fn draw_bar(
     ) {
         actions.push(Action::Open(target));
     }
-    // The artist names the track's page: a press on it opens the artist.
-    let artist_link = track.and_then(|track| track.artist_id.clone()).map(Detail::Artist);
-    if let Some(target) = row_text(
+    // Each artist names their page: a press on one opens that artist.
+    let artists: Vec<(&str, Option<&str>)> = match track {
+        Some(track) => match track.hit.as_ref().filter(|hit| !hit.artists.is_empty()) {
+            Some(hit) => hit
+                .artist_links()
+                .enumerate()
+                .map(|(i, (name, id))| (name, id.or(if i == 0 { track.artist_id.as_deref() } else { None })))
+                .collect(),
+            None => vec![(sub, track.artist_id.as_deref())],
+        },
+        None => Vec::new(),
+    };
+    if let Some(target) = artist_text(
         cx,
         "bar_artist",
         0,
         Rect::new(text_x, bar.y + 35.0, text_w, 18.0),
-        sub,
+        &artists,
         12.5,
         1.0,
-        artist_link,
     ) {
         actions.push(Action::Open(target));
     }

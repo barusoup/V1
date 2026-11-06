@@ -706,6 +706,10 @@ pub fn fill_gaps(song: &mut SongHit, other: &SongHit) -> bool {
     if song.artists.is_empty() {
         song.artists = other.artists.clone();
     }
+    // Songs saved before each artist's link was kept pick the links up from a fresher copy.
+    if song.artist_ids.is_empty() && !other.artist_ids.is_empty() && song.artists == other.artists {
+        song.artist_ids = other.artist_ids.clone();
+    }
     if song.thumbnail.is_none() {
         song.thumbnail = other.thumbnail.clone();
     }
@@ -782,6 +786,7 @@ mod tests {
             thumbnail: Some(format!("https://example.test/{id}")),
             artist_id: None,
             album_id: None,
+            artist_ids: Vec::new(),
         }
     }
 

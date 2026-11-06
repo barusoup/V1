@@ -196,4 +196,22 @@ pub struct SongHit {
     pub artist_id: Option<String>,
     /// The browse id (`MPREb_…`) of the album, when the row links to it.
     pub album_id: Option<String>,
+    /// The browse id of each artist credit, in the order of `artists`, when the row links to it.
+    /// Empty for songs saved before it was kept: then only the first artist links, by `artist_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artist_ids: Vec<Option<String>>,
+}
+
+impl SongHit {
+    /// Each artist credit with the browse id it links to, if any.
+    pub fn artist_links(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
+        self.artists.iter().enumerate().map(|(i, name)| {
+            let id = if self.artist_ids.is_empty() {
+                (i == 0).then_some(self.artist_id.as_deref()).flatten()
+            } else {
+                self.artist_ids.get(i).and_then(Option::as_deref)
+            };
+            (name.as_str(), id)
+        })
+    }
 }

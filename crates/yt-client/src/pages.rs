@@ -196,6 +196,13 @@ pub(crate) const META_SEP: &str = "  ·  ";
 fn credit(song: &mut SongHit, name: &str, artist_id: Option<&str>) {
     if song.artists.is_empty() && !name.is_empty() {
         song.artists.push(name.to_owned());
+        song.artist_ids = vec![artist_id.map(str::to_owned)];
+    }
+    // The page's own artist links to the page, even where the row left that credit unlinked.
+    for (credited, id) in song.artists.iter().zip(song.artist_ids.iter_mut()) {
+        if id.is_none() && credited == name {
+            *id = artist_id.map(str::to_owned);
+        }
     }
     if song.artist_id.is_none() {
         song.artist_id = artist_id.map(str::to_owned);
