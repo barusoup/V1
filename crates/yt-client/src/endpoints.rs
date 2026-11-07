@@ -113,6 +113,77 @@ impl InnerTube {
         let mixed = mixed.map(|value| parse_mixed(&value)).unwrap_or_default();
         Ok(assemble(songs, mixed))
     }
+
+    /// The album a name and artist point at, when a search finds it. Used to give a song's album
+    /// (which some rows name but do not link) its browse id, so the album can be opened.
+    pub async fn find_album(&self, title: &str, artist: &str) -> Result<Option<AlbumCard>> {
+        let mut query = title.trim().to_owned();
+        if !artist.trim().is_empty() {
+            query.push(' ');
+            query.push_str(artist.trim());
+        }
+        if query.is_empty() {
+            return Ok(None);
+        }
+        let value = self
+            .post(
+                "search",
+                ClientKind::WebRemix,
+                Auth::Anonymous,
+                json!({ "query": query }),
+            )
+            .await?;
+        let mut mixed = parse_mixed(&value);
+        // The best match can be the top card rather than one of the result rows.
+        if let Some(TopResult::Album(card)) = mixed.top.take() {
+            mixed.albums.insert(0, card);
+        }
+        let wanted = normalize_name(title);
+        if let Some(found) = mixed
+            .albums
+            .into_iter()
+            .find(|album| normalize_name(&album.title) == wanted)
+        {
+            return Ok(Some(found));
+        }
+        // Albums below the top result can be drawn as carousel cards rather than list rows.
+        let mut cards = Vec::new();
+        collect_key(&value, "musicTwoRowItemRenderer", &mut cards);
+        for card in cards {
+            let Some(browse_id) = card
+                .get("navigationEndpoint")
+                .and_then(|endpoint| endpoint.get("browseEndpoint"))
+                .and_then(|endpoint| endpoint.get("browseId"))
+                .and_then(Value::as_str)
+                .filter(|id| id.starts_with("MPRE"))
+            else {
+                continue;
+            };
+            let Some(card_title) = text_field(card, "title") else {
+                continue;
+            };
+            if normalize_name(&card_title) != wanted {
+                continue;
+            }
+            let mut parts = Vec::new();
+            meta_parts(card.get("subtitle"), &mut parts);
+            return Ok(Some(AlbumCard {
+                browse_id: browse_id.to_owned(),
+                title: card_title,
+                meta: parts.join(META_SEP),
+                thumbnail: card.get("thumbnail").and_then(url_in),
+            }));
+        }
+        Ok(None)
+    }
+}
+
+/// A name reduced to its letters and digits, for comparing an album's title across pages.
+fn normalize_name(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// What a search shows. See [`InnerTube::search`].
@@ -419,19 +490,22 @@ pub(crate) fn row_hit(row: &Value) -> Option<SongHit> {
 
     // Credits are read from every column after the title. A search row keeps them all in the
     // second column; an artist's top songs spread them out (artists, plays, then the album).
-    let credit_runs: Vec<Value> = (1..)
+    // Each column is read on its own: in the first, a run with no link is usually the artist (or
+    // the album, after a separator); in a later one it is the album.
+    let credit_columns: Vec<Vec<Value>> = (1..)
         .map_while(|i| row.get("flexColumns")?.get(i))
         .filter_map(|column| {
-            column
-                .get("musicResponsiveListItemFlexColumnRenderer")?
-                .get("text")?
-                .get("runs")?
-                .as_array()
+            Some(
+                column
+                    .get("musicResponsiveListItemFlexColumnRenderer")?
+                    .get("text")?
+                    .get("runs")?
+                    .as_array()?
+                    .clone(),
+            )
         })
-        .flatten()
-        .cloned()
         .collect();
-    let credits = read_credits(&credit_runs);
+    let credits = read_credit_columns(&credit_columns);
     let duration = credits.duration.or_else(|| fixed_duration(row));
 
     let thumbnail = row
@@ -469,27 +543,156 @@ struct Credits {
     duration: Option<String>,
 }
 
-/// Read a song's credits from the runs of its second line. Each artist, album or length is
-/// recognised by the page its run links to, or by its shape.
-fn read_credits(runs: &[Value]) -> Credits {
+impl Credits {
+    fn push_artist(&mut self, name: &str, id: Option<&str>) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        self.artists.push(name.to_owned());
+        self.artist_ids.push(id.map(str::to_owned));
+        if self.artist_id.is_none() {
+            self.artist_id = id.map(str::to_owned);
+        }
+    }
+
+    fn set_album(&mut self, name: &str, id: Option<&str>) {
+        if self.album.is_some() {
+            return;
+        }
+        let name = name.trim();
+        if !name.is_empty() {
+            self.album = Some(name.to_owned());
+            self.album_id = id.map(str::to_owned);
+        }
+    }
+
+    /// Add another line's credits to this one, keeping what this one already knows.
+    fn add(&mut self, other: Credits) {
+        for (name, id) in other.artists.into_iter().zip(other.artist_ids) {
+            if self.artist_id.is_none() {
+                self.artist_id = id.clone();
+            }
+            self.artists.push(name);
+            self.artist_ids.push(id);
+        }
+        if self.album.is_none() {
+            self.album = other.album;
+            self.album_id = other.album_id;
+        }
+        if self.duration.is_none() {
+            self.duration = other.duration;
+        }
+    }
+}
+
+/// Read a song's credits from its flex columns, each on its own. The first is the line beside the
+/// title; later ones are extra columns (a play count, then the album on an artist's top songs).
+fn read_credit_columns(columns: &[Vec<Value>]) -> Credits {
     let mut credits = Credits::default();
+    for (index, runs) in columns.iter().enumerate() {
+        credits.add(read_credits_line(runs, index == 0));
+    }
+    credits
+}
+
+/// Read a song's credits from the runs of one line. Each artist, album or length is recognised by
+/// the page its run links to, or by its shape. YouTube does not always link a credit (a karaoke
+/// upload's artist, say), so an unlinked run is placed by its position on the line: the first part
+/// is the artist, a later part is the album, and a later column is the album.
+fn read_credits(runs: &[Value]) -> Credits {
+    read_credits_line(runs, true)
+}
+
+fn read_credits_line(runs: &[Value], first_line: bool) -> Credits {
+    let mut credits = Credits::default();
+    let mut segment: Vec<&Value> = Vec::new();
+    let mut segments: Vec<Vec<&Value>> = Vec::new();
     for run in runs {
         let text = run.get("text").and_then(Value::as_str).unwrap_or_default();
-        match run_page(run) {
-            Some(("MUSIC_PAGE_TYPE_ARTIST" | "MUSIC_PAGE_TYPE_USER_CHANNEL", id)) => {
-                credits.artists.push(text.to_owned());
-                credits.artist_ids.push(id.map(str::to_owned));
-                credits.artist_id = credits.artist_id.or(id.map(str::to_owned));
+        if is_credit_separator(text) {
+            segments.push(std::mem::take(&mut segment));
+        } else {
+            segment.push(run);
+        }
+    }
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+
+    for (index, segment) in segments.iter().enumerate() {
+        let mut linked_artist = false;
+        let mut linked_album = false;
+        let mut plain = Vec::new();
+        for run in segment {
+            let text = run.get("text").and_then(Value::as_str).unwrap_or_default();
+            match run_page(run) {
+                Some(("MUSIC_PAGE_TYPE_ARTIST" | "MUSIC_PAGE_TYPE_USER_CHANNEL", id)) => {
+                    credits.push_artist(text, id);
+                    linked_artist = true;
+                }
+                Some(("MUSIC_PAGE_TYPE_ALBUM", id)) => {
+                    credits.set_album(text, id);
+                    linked_album = true;
+                }
+                _ if is_duration(text) => credits.duration = Some(text.to_owned()),
+                _ if is_unlinked_credit(text) => plain.push(text),
+                _ => {}
             }
-            Some(("MUSIC_PAGE_TYPE_ALBUM", id)) => {
-                credits.album = Some(text.to_owned());
-                credits.album_id = id.map(str::to_owned);
+        }
+        // A part with no link at all still names something. Join its runs first: a credit split
+        // over punctuation runs ("Smith, Jones") is one name, not several.
+        let plain = plain.join("").trim().to_owned();
+        if plain.is_empty() || is_duration(&plain) || is_stat(&plain) || is_kind(&plain) {
+            continue;
+        }
+        let album_part = index > 0;
+        if linked_album {
+            // A link already named the album; an unlinked run here is another artist credit.
+            credits.push_artist(&plain, None);
+        } else if linked_artist {
+            // Inside the artist part, so the unlinked run is another credit, not the album.
+            if !(album_part && !first_line) {
+                credits.push_artist(&plain, None);
             }
-            _ if is_duration(text) => credits.duration = Some(text.to_owned()),
-            _ => {}
+        } else if album_part || !first_line {
+            credits.set_album(&plain, None);
+        } else {
+            credits.push_artist(&plain, None);
         }
     }
     credits
+}
+
+/// A run that separates the parts of a credit line ("•", "·", "|").
+fn is_credit_separator(text: &str) -> bool {
+    matches!(text.trim(), "•" | "·" | "|")
+}
+
+/// A run that could be a credit, as opposed to punctuation or noise.
+fn is_unlinked_credit(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty()
+        && text.chars().any(char::is_alphanumeric)
+        && !text.chars().all(|c| c.is_ascii_digit() || c == '-')
+        && !is_stat(text)
+        && !is_kind(text)
+}
+
+/// A play count, an audience figure, or a view count: not a credit.
+fn is_stat(text: &str) -> bool {
+    let text = text.trim().to_ascii_lowercase();
+    [" plays", " views", " audience", " subscribers"]
+        .iter()
+        .any(|suffix| text.ends_with(suffix))
+}
+
+/// A row's kind word ("Song", "Album", "Video", …): not a credit.
+fn is_kind(text: &str) -> bool {
+    matches!(
+        text.trim(),
+        "Song" | "Video" | "Album" | "Single" | "EP" | "Playlist" | "Profile" | "Artist" | "Podcast" | "Episode"
+    )
 }
 
 /// `m:ss` or `h:mm:ss`.
@@ -596,6 +799,102 @@ mod tests {
             vec![("Daft Punk", Some("UCdaftpunk")), ("Julian Casablancas", Some("UCjulian"))]
         );
         assert_eq!(hit.artist_id.as_deref(), Some("UCdaftpunk"));
+    }
+
+    #[test]
+    fn an_unlinked_artist_is_still_read_from_its_position() {
+        // A live karaoke row: the artist credit is plain text, while the album still links.
+        let root = json!({
+          "contents": [{
+            "musicResponsiveListItemRenderer": {
+              "playlistItemData": { "videoId": "karaoke" },
+              "overlay": play_overlay(ATV),
+              "flexColumns": [
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    { "text": "Sanctuary (By Joji) (Melody Karaoke Version)" } ] } } },
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    { "text": "ZZang KARAOKE" },
+                    { "text": " • " },
+                    { "text": "ZZang KARAOKE 2024 POP Vol.179", "navigationEndpoint": { "browseEndpoint": {
+                        "browseId": "MPREb_sVmnqMDhb7A",
+                        "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_ALBUM" } } } } },
+                    { "text": " • " },
+                    { "text": "2:58" } ] } } },
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    { "text": "1.7K plays" } ] } } }
+              ]
+            }
+          }]
+        });
+        let hit = &parse_song_hits(&root)[0];
+        assert_eq!(hit.artists, vec!["ZZang KARAOKE".to_owned()]);
+        assert_eq!(hit.album.as_deref(), Some("ZZang KARAOKE 2024 POP Vol.179"));
+        assert_eq!(hit.album_id.as_deref(), Some("MPREb_sVmnqMDhb7A"));
+        assert_eq!(hit.duration.as_deref(), Some("2:58"));
+        assert_eq!(hit.artists.len(), 1, "the play count is not a credit");
+    }
+
+    #[test]
+    fn an_unlinked_album_is_still_read_after_the_artist() {
+        let root = json!({
+          "contents": [{
+            "musicResponsiveListItemRenderer": {
+              "playlistItemData": { "videoId": "abc123" },
+              "overlay": play_overlay(ATV),
+              "flexColumns": [
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    { "text": "Teachers" } ] } } },
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    { "text": "Daft Punk", "navigationEndpoint": { "browseEndpoint": {
+                        "browseId": "UCdaftpunk",
+                        "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_ARTIST" } } } } },
+                    { "text": " • " },
+                    { "text": "Homework" },
+                    { "text": " • " },
+                    { "text": "5:54" } ] } } }
+              ]
+            }
+          }]
+        });
+        let hit = &parse_song_hits(&root)[0];
+        assert_eq!(hit.artists, vec!["Daft Punk".to_owned()]);
+        assert_eq!(hit.album.as_deref(), Some("Homework"));
+        assert_eq!(hit.album_id, None, "the album had no link to keep");
+        assert_eq!(hit.duration.as_deref(), Some("5:54"));
+    }
+
+    #[test]
+    fn an_artist_top_song_takes_an_unlinked_album_from_a_later_column() {
+        // The live shape: the artist links in the first column, the play count sits in the second,
+        // and the album is plain text in the third.
+        let root = json!({
+          "contents": [{
+            "musicResponsiveListItemRenderer": {
+              "playlistItemData": { "videoId": "abc123" },
+              "overlay": play_overlay(ATV),
+              "flexColumns": [
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    { "text": "Instant Crush" } ] } } },
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    { "text": "Daft Punk", "navigationEndpoint": { "browseEndpoint": {
+                        "browseId": "UCdaftpunk",
+                        "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_ARTIST" } } } } } ] } } },
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    { "text": "1.2B plays" } ] } } },
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    { "text": "Random Access Memories" } ] } } }
+              ]
+            }
+          }]
+        });
+        let hit = &parse_song_hits(&root)[0];
+        assert_eq!(hit.artists, vec!["Daft Punk".to_owned()]);
+        assert_eq!(hit.album.as_deref(), Some("Random Access Memories"));
+        assert_eq!(hit.album_id, None);
+        assert_eq!(hit.artists.len(), 1, "the play count is not an artist");
     }
 
     #[test]

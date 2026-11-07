@@ -8,7 +8,7 @@
 //! placeholder tile), and the host makes the texture before the next frame. Covers arrive decoded
 //! from the network thread; icons are rasterized here on demand.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use dream::gfx::GpuContext;
@@ -31,6 +31,11 @@ const WORDMARK_PNG: &[u8] = include_bytes!("../assets/icon/V1_wordmark_sidebar.p
 /// Covers uploaded per frame. Each upload is a blocking round trip to the GPU; see [`Gpu::sync`].
 const COVER_UPLOADS_PER_FRAME: usize = 4;
 
+/// How many cover textures are kept. A 256×256 RGBA cover is 256 KiB, so this bounds the cover
+/// cache to 16 MiB; a screenful of rows and pages is far below it. Older covers are dropped first,
+/// and a row that still shows one simply asks for it again on the next frame.
+const COVER_CACHE: usize = 64;
+
 /// The decoded wordmark texture and its pixel size, so the caller can keep its aspect ratio.
 pub struct Wordmark {
     pub texture: Arc<GpuTexture>,
@@ -42,6 +47,9 @@ pub struct Wordmark {
 pub struct Gpu {
     pub icons: HashMap<(Icon, u32), Arc<GpuTexture>>,
     pub covers: HashMap<String, Arc<GpuTexture>>,
+    /// Cover URLs in the order they entered the cache, oldest first. `covers` may lose entries as
+    /// they are evicted; stale URLs in here are skipped when the next eviction runs.
+    cover_order: VecDeque<String>,
     pub wordmark: Option<Wordmark>,
     /// Icon sizes the last frame wanted and did not have.
     pub wanted_icons: HashSet<(Icon, u32)>,
@@ -94,7 +102,8 @@ impl Gpu {
         // Each upload waits for the GPU to drain, so a search result list bringing in dozens of covers
         // at once would stall one frame. The rest wait their turn; the grey tile stands in meanwhile.
         let take = self.incoming.len().min(COVER_UPLOADS_PER_FRAME);
-        for cover in self.incoming.drain(..take) {
+        let incoming: Vec<_> = self.incoming.drain(..take).collect();
+        for cover in incoming {
             let texture = GpuTexture::from_rgba8(
                 ctx,
                 "cover",
@@ -107,7 +116,19 @@ impl Gpu {
                     mip_levels: None,
                 },
             );
-            self.covers.insert(cover.url, Arc::new(texture));
+            self.insert_cover(cover.url, Arc::new(texture));
+        }
+    }
+
+    /// Put a cover in the cache, evicting the oldest ones once it is full. The caller asked for this
+    /// URL because a row on screen needs it, so it goes at the newest end.
+    fn insert_cover(&mut self, url: String, texture: Arc<GpuTexture>) {
+        if self.covers.insert(url.clone(), texture).is_none() {
+            self.cover_order.push_back(url);
+        }
+        while self.covers.len() > COVER_CACHE {
+            let Some(oldest) = self.cover_order.pop_front() else { break };
+            self.covers.remove(&oldest);
         }
     }
 }

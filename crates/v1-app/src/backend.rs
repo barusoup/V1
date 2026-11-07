@@ -24,6 +24,35 @@ use yt_stream::{FileCache, HttpProber, Resolver, ResolverConfig, YtScripts};
 use crate::library::Job;
 use crate::store::{cover_key, safe_id};
 
+/// Fill a song's empty metadata fields from another copy of the same song. Never overwrites: a
+/// search result is less complete than what the app may already know.
+fn fill_meta(song: &mut yt_client::SongHit, other: &yt_client::SongHit) {
+    if song.video_id != other.video_id {
+        return;
+    }
+    if song.album_id.is_none() {
+        song.album_id = other.album_id.clone();
+    }
+    if song.album.is_none() {
+        song.album = other.album.clone();
+    }
+    if song.artist_id.is_none() {
+        song.artist_id = other.artist_id.clone();
+    }
+    if song.artist_ids.is_empty() && !other.artist_ids.is_empty() {
+        song.artist_ids = other.artist_ids.clone();
+    }
+    if song.artists.is_empty() {
+        song.artists = other.artists.clone();
+    }
+    if song.duration.is_none() {
+        song.duration = other.duration.clone();
+    }
+    if song.thumbnail.is_none() {
+        song.thumbnail = other.thumbnail.clone();
+    }
+}
+
 /// What the UI asks for.
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -43,6 +72,9 @@ pub enum Command {
     Album(String),
     /// The length of a track whose list row gave none.
     Length(String),
+    /// Fill in a song's missing metadata (its album, and the album's link). Asked for again later
+    /// when it cannot be found now.
+    SongMeta(yt_client::SongHit),
     /// Make a saved song's offline copy: 128 kbps Opus under `downloads/`. Quiet and unhurried.
     Download(Job),
     /// Keep a cover's bytes on disk, so a saved item still has its picture offline.
@@ -93,6 +125,9 @@ pub enum Event {
     Album { id: String, result: Result<AlbumPage, String> },
     /// The answer to a [`Command::Length`]: the length in seconds, if YouTube gave one.
     Length { video_id: String, seconds: Option<u64> },
+    /// The answer to a [`Command::SongMeta`]: the song as it is now known, or `None` when the
+    /// missing fields could not be found.
+    SongMeta { video_id: String, hit: Option<yt_client::SongHit> },
     /// A [`Command::Download`] finished: the file is in place.
     Downloaded {
         video_id: String,
@@ -105,6 +140,9 @@ pub enum Event {
 
 /// How many length lookups run at once.
 const LENGTHS_AT_ONCE: usize = 4;
+/// How many metadata lookups run at once. They are searches, so they are kept few and behind the
+/// interactive ones, like lengths.
+const META_AT_ONCE: usize = 2;
 /// How many covers are fetched and decoded at once. A page of results asks for dozens together;
 /// all of them in flight at once only fights the song being loaded for the connection.
 const COVERS_AT_ONCE: usize = 8;
@@ -271,6 +309,9 @@ struct Net {
     /// Length lookups come in bursts (a page of songs at once); a few at a time keeps YouTube from
     /// throttling them into empty answers.
     length_gate: Semaphore,
+    /// Metadata lookups are one search each; a pair at a time is enough to fill links in behind the
+    /// lists, without competing with the search the listener is waiting for.
+    meta_gate: Semaphore,
     download_gate: Semaphore,
     cover_gate: Semaphore,
 }
@@ -357,6 +398,43 @@ impl Net {
         let _ = self.events.send(Event::Length { video_id, seconds });
     }
 
+    /// Find the metadata a song row left out, chiefly the album it belongs to and the album's browse
+    /// id (the pages that list a song do not always link it). When the row named an album, the album
+    /// is searched for by name and artist; when it did not, the song itself is searched for by title
+    /// and artist, since that finds its exact video. Only empty fields are filled.
+    async fn song_meta(&self, song: yt_client::SongHit) {
+        let Ok(_turn) = self.meta_gate.acquire().await else { return };
+        let mut updated = song.clone();
+        // A row that names the album but does not link it is the common case: one album search
+        // finds its browse id. Only when no album name is known is the song itself searched for.
+        if let Some(album) = updated.album.as_deref().filter(|album| !album.is_empty()) {
+            let artist = song.artists.first().map(String::as_str).unwrap_or_default();
+            if let Ok(Some(card)) = self.tube.find_album(album, artist).await {
+                updated.album = Some(card.title);
+                updated.album_id = Some(card.browse_id);
+                if updated.thumbnail.is_none() {
+                    updated.thumbnail = card.thumbnail;
+                }
+            }
+        }
+        if updated.album_id.is_none() {
+            let mut query = song.title.trim().to_owned();
+            if let Some(artist) = song.artists.first().filter(|artist| !artist.is_empty()) {
+                query.push(' ');
+                query.push_str(artist);
+            }
+            if !query.is_empty() {
+                if let Ok(hits) = self.tube.search_songs(&query, false).await {
+                    if let Some(found) = hits.into_iter().find(|hit| hit.video_id == song.video_id) {
+                        fill_meta(&mut updated, &found);
+                    }
+                }
+            }
+        }
+        let hit = (updated != song).then_some(updated);
+        let _ = self.events.send(Event::SongMeta { video_id: song.video_id, hit });
+    }
+
     async fn keep_cover(&self, url: String) {
         let path = kept_cover_path(&self.data_dir, &url);
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
@@ -439,6 +517,7 @@ fn refuse(command: Command, events: &Sender<Event>, message: &str) {
         Command::Artist(id) => events.send(Event::Artist { id, result: Err(message) }),
         Command::Album(id) => events.send(Event::Album { id, result: Err(message) }),
         Command::Length(video_id) => events.send(Event::Length { video_id, seconds: None }),
+        Command::SongMeta(song) => events.send(Event::SongMeta { video_id: song.video_id, hit: None }),
         Command::Download(job) => events.send(Event::DownloadFailed { video_id: job.video_id, message }),
         Command::Cover(url) => events.send(Event::CoverFailed(url)),
         Command::Preload(_) | Command::KeepCover(_) | Command::Shutdown => Ok(()),
@@ -559,6 +638,7 @@ async fn serve(
         events: events.clone(),
         preload_gate: Semaphore::new(1),
         length_gate: Semaphore::new(LENGTHS_AT_ONCE),
+        meta_gate: Semaphore::new(META_AT_ONCE),
         download_gate: Semaphore::new(DOWNLOADS_AT_ONCE),
         cover_gate: Semaphore::new(COVERS_AT_ONCE),
     });
@@ -625,6 +705,9 @@ async fn serve(
             }
             Command::Length(video_id) => {
                 tokio::spawn(async move { net.length(video_id).await });
+            }
+            Command::SongMeta(song) => {
+                tokio::spawn(async move { net.song_meta(song).await });
             }
             Command::KeepCover(url) => {
                 tokio::spawn(async move { net.keep_cover(url).await });

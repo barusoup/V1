@@ -17,6 +17,7 @@ mod clock;
 mod gpu;
 mod icons;
 mod library;
+mod media;
 mod playlist;
 mod spectrum;
 mod store;
@@ -38,7 +39,7 @@ use dream::ui::widgets::{Key, KeyFeed, Ui, UiInput};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WinitKey, NamedKey};
 use winit::window::{CursorIcon, Window};
 #[cfg(windows)]
@@ -83,6 +84,13 @@ fn data_dir() -> PathBuf {
     base.join("v1")
 }
 
+/// Events outside winit's own, delivered to the UI thread from background callbacks. The media
+/// controls send their transport buttons this way, since SMTC raises them on a COM thread.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum UserEvent {
+    Media(media::Command),
+}
+
 /// Everything the UI thread owns.
 struct Host {
     window: Option<Arc<Window>>,
@@ -118,6 +126,13 @@ struct Host {
     /// another monitor takes effect at once. `None` when the platform does not report one.
     display_hz: Option<f32>,
     hand_cursor: bool,
+    /// The window is occluded (another window covers it fully) or minimized. Nothing visible needs
+    /// drawing then, and drawing would only animate panels the user cannot see.
+    occluded: bool,
+    /// Wakes the event loop when a background callback has work for the UI (SMTC buttons).
+    proxy: EventLoopProxy<UserEvent>,
+    /// The Windows media-controls session, once the window exists.
+    media: Option<media::MediaControls>,
     /// A window drag in progress, if the host is moving the window (see [`Host::start_drag`]).
     drag: Option<WindowDrag>,
     /// `--shot <path>`: render one frame, save it, exit. With `--delay`, run first.
@@ -202,7 +217,7 @@ fn map_key(key: &WinitKey) -> Vec<Key> {
     }
 }
 
-impl ApplicationHandler for Host {
+impl ApplicationHandler<UserEvent> for Host {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // `V1_SHOT_SIZE=1920x1080` sizes the window for screenshots.
         let (start_w, start_h) = std::env::var("V1_SHOT_SIZE")
@@ -245,10 +260,25 @@ impl ApplicationHandler for Host {
             },
         );
         boot_mark("renderer ready");
+        // `V1_MEM=1` prints the UI renderer's own GPU allocations, to keep an eye on the app-side
+        // share of the process footprint (the Vulkan driver's own allocations are not visible here).
+        if std::env::var_os("V1_MEM").is_some() {
+            let ui: u64 = renderer.ui_allocation_sizes().iter().map(|(_, bytes)| *bytes).sum();
+            eprintln!("ui gpu allocations {:.1} MB", ui as f64 / (1024.0 * 1024.0));
+        }
         self.renderer = Some(renderer);
         self.ui = Some(Ui::new(Fonts::bundled(), AtlasConfig::default()));
         boot_mark("fonts and ui ready");
         self.window = Some(window);
+        // Windows routes earbud and keyboard transport buttons through SMTC, not through a Win32
+        // window message, so a session is what makes them reach the app at all.
+        let proxy = self.proxy.clone();
+        self.media = self.window.as_ref().and_then(|window| {
+            media::MediaControls::new(window, move |command| {
+                let _ = proxy.send_event(UserEvent::Media(command));
+            })
+        });
+        boot_mark("media controls attached");
         self.update_zoom();
         self.attach_library();
         boot_mark("collection attached");
@@ -281,13 +311,29 @@ impl ApplicationHandler for Host {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
+                // Minimizing sends a zero-sized resize on Windows. It is not a layout the app should
+                // adopt: at zero width the sidebar would animate shut, and restoring would replay
+                // its opening. The real size arrives with the restore.
+                if size.width == 0 || size.height == 0 || self.hidden() {
+                    return;
+                }
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
                 }
                 self.update_zoom();
                 self.redraw_request();
             }
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if !occluded {
+                    self.update_zoom();
+                    self.redraw_request();
+                }
+            }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if self.hidden() {
+                    return;
+                }
                 self.scale = scale_factor as f32;
                 if let Some(window) = &self.window {
                     if let Some(renderer) = self.renderer.as_mut() {
@@ -367,7 +413,29 @@ impl ApplicationHandler for Host {
         }
     }
 
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Media(command) => {
+                self.state.media_command(command);
+                // The next frame shows the change, even when the window is hidden (the player
+                // state still has to be applied); the hidden tick will present nothing.
+                self.redraw_request();
+            }
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Nothing in the window can be seen while it is minimized or covered. Tick the player now
+        // and then so the queue still advances, but do not build, animate or present frames: doing
+        // that is what replayed the sidebar's opening when the window came back.
+        if self.hidden() {
+            if self.state.is_playing() || self.state.busy() || self.state.awaiting_covers() {
+                self.pace(event_loop, HIDDEN_TICK);
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            return;
+        }
         if let Some(window) = &self.window {
             self.display_hz = monitor_hz(window);
         }
@@ -377,15 +445,15 @@ impl ApplicationHandler for Host {
                 return;
             }
         }
-        // Motion (a transition, a spring, a window drag) is drawn at the monitor's refresh rate, so
-        // it follows the pointer and the animations without a lag.
+        // Motion (a transition, a spring, a window drag) is drawn at the monitor's refresh rate, up
+        // to a cap, so it follows the pointer and the animations without a lag while a high-refresh
+        // display does not make the app render hundreds of frames a second.
         if self.state.animating() || self.drag.is_some() {
             self.pace(event_loop, self.frame_period());
         } else if self.state.is_playing() {
-            // Playback moves the progress bar, the clock and the equalizer, and is paced to the
-            // monitor like motion. Asking for a redraw on every turn of the loop, with no pacing,
-            // is what kept a core busy that the decoder and audio threads need.
-            self.pace(event_loop, self.frame_period());
+            // Playback moves the progress bar, the clock and the equalizer, and is paced below the
+            // monitor's rate: only those move, and the app should not burn a core drawing them.
+            self.pace(event_loop, self.playback_period());
         } else if self.state.busy() || self.state.awaiting_covers() {
             self.pace(event_loop, WAITING_FRAME);
         } else if let Some(at) = self
@@ -414,18 +482,55 @@ impl ApplicationHandler for Host {
 /// frames, not a target to reach. (Motion and playback use [`Host::frame_period`] instead.)
 const WAITING_FRAME: std::time::Duration = std::time::Duration::from_millis(80);
 
+/// How often the app ticks while its window is minimized or fully covered. Nothing is drawn; the
+/// player still needs a poll now and then so a finished song moves on and timers fire.
+const HIDDEN_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Frames per second for steady playback. The playhead, the time and the small equalizers are the
+/// only things moving then, and 30 Hz is smooth for them while costing half the CPU of the display's
+/// refresh rate. Anything that is actually animating still gets the full rate.
+const PLAYBACK_FPS: f32 = 30.0;
+
+/// The fastest the app animates or follows a dragged window. A 360 Hz monitor would otherwise ask
+/// for six times the frames of a 60 Hz one for the same springs and curves; 120 Hz is already past
+/// what the eye needs for UI motion and still leaves input events to redraw at once.
+const MOTION_FPS: f32 = 120.0;
+
 /// The rate used when the platform does not report the monitor's refresh rate.
 const FALLBACK_HZ: f32 = 60.0;
 
 impl Host {
     /// Time between frames while something is moving or playing: one frame per refresh of the
-    /// monitor the window is on, so the picture is never drawn faster than the display can show it.
+    /// monitor the window is on, capped at [`MOTION_FPS`], so the picture is never drawn faster than
+    /// the display can show it (or faster than the app needs to animate).
     fn frame_period(&self) -> std::time::Duration {
         let hz = self
             .display_hz
             .filter(|hz| hz.is_finite() && *hz > 1.0)
-            .unwrap_or(FALLBACK_HZ);
+            .unwrap_or(FALLBACK_HZ)
+            .min(MOTION_FPS);
         std::time::Duration::from_secs_f32(1.0 / hz.clamp(10.0, 1000.0))
+    }
+
+    /// Time between frames while only playback is moving: no faster than [`PLAYBACK_FPS`], and never
+    /// faster than the display.
+    fn playback_period(&self) -> std::time::Duration {
+        let hz = self
+            .display_hz
+            .filter(|hz| hz.is_finite() && *hz > 1.0)
+            .unwrap_or(FALLBACK_HZ)
+            .min(PLAYBACK_FPS);
+        std::time::Duration::from_secs_f32(1.0 / hz.clamp(10.0, 1000.0))
+    }
+
+    /// Whether the window is minimized or fully occluded, so a frame would not be seen.
+    fn hidden(&self) -> bool {
+        self.occluded
+            || self
+                .window
+                .as_ref()
+                .and_then(|window| window.is_minimized())
+                .unwrap_or(false)
     }
 
     /// Ask for the next frame once `interval` has passed since the last began, and otherwise sleep
@@ -440,6 +545,13 @@ impl Host {
         event_loop.set_control_flow(ControlFlow::WaitUntil(due.max(now)));
     }
 
+    /// Push the current track to the Windows media controls. Does nothing when SMTC is unavailable.
+    fn update_media(&mut self) {
+        if let Some(media) = self.media.as_mut() {
+            media.update(self.state.media_info().as_ref());
+        }
+    }
+
     /// Device pixels per UI unit: the display's scale times the window zoom.
     fn ui_scale(&self) -> f32 {
         self.scale * self.zoom
@@ -448,6 +560,11 @@ impl Host {
     fn update_zoom(&mut self) {
         if let Some(window) = &self.window {
             let size = window.inner_size();
+            // A minimized window reports a zero size; `zoom_for(0, 0)` would shrink the whole UI
+            // and start every width-dependent animation over on restore.
+            if size.width == 0 || size.height == 0 {
+                return;
+            }
             self.zoom = zoom_for(size.width as f32 / self.scale, size.height as f32 / self.scale);
         }
     }
@@ -484,6 +601,25 @@ impl Host {
             }
             WinitKey::Named(NamedKey::Space) if !command && !self.editing() => {
                 self.state.toggle_request = true;
+                true
+            }
+            // Keyboard media keys that Windows delivers as ordinary key events. Most earbuds go
+            // through SMTC instead, and when an SMTC session exists the OS may deliver the key both
+            // ways; guarding on SMTC avoids toggling the song twice for one press.
+            WinitKey::Named(NamedKey::MediaPlayPause) if self.media.is_none() => {
+                self.state.media_command(media::Command::Toggle);
+                true
+            }
+            WinitKey::Named(NamedKey::MediaTrackNext) if self.media.is_none() => {
+                self.state.media_command(media::Command::Next);
+                true
+            }
+            WinitKey::Named(NamedKey::MediaTrackPrevious) if self.media.is_none() => {
+                self.state.media_command(media::Command::Previous);
+                true
+            }
+            WinitKey::Named(NamedKey::MediaStop) if self.media.is_none() => {
+                self.state.media_command(media::Command::Stop);
                 true
             }
             _ => false,
@@ -617,6 +753,16 @@ impl Host {
         self.follow_drag();
         self.state.pump();
         self.state.tick();
+        self.update_media();
+        // Hidden: the player and the backend still advance, but there is no reason to lay out,
+        // animate or present anything the user cannot see.
+        if self.hidden() {
+            self.pressed = false;
+            self.released = false;
+            self.secondary_pressed = false;
+            self.wheel = 0.0;
+            return;
+        }
 
         self.update_zoom();
         let scale = self.ui_scale();
@@ -816,10 +962,11 @@ fn main() {
         smoke();
         return;
     }
-    // Before any window or background work exists: an available update is installed and the app
-    // restarts here, so the user never sees the old version. `--shot` renders a frame, so it skips it.
+    // An available update is installed and the app restarts, so the user never sees the old
+    // version. `--shot` renders a frame, so it skips it. The check runs on its own thread: a slow
+    // release lookup must not delay the window opening.
     if !arguments.iter().any(|argument| argument == "--shot") {
-        update::run_at_startup();
+        update::check_in_background();
     }
     let shot = arguments
         .iter()
@@ -847,6 +994,10 @@ fn main() {
             None
         }
     };
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .expect("create event loop");
+    let proxy = event_loop.create_proxy();
     let host = Host {
         window: None,
         renderer: None,
@@ -868,15 +1019,15 @@ fn main() {
         last_frame: Instant::now(),
         display_hz: None,
         hand_cursor: false,
+        occluded: false,
+        proxy,
+        media: None,
         drag: None,
         shot,
         shot_delay,
         shoot_at: None,
     };
-    EventLoop::new()
-        .expect("create event loop")
-        .run_app(&mut { host })
-        .expect("run the app");
+    event_loop.run_app(&mut { host }).expect("run the app");
 }
 
 /// `--smoke`: run search → resolve → proxy → decode → play without a window, then exit.

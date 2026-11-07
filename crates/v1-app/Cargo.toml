@@ -30,3 +30,13 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+
+# Windows media controls (SMTC): earbud and keyboard play/pause/next/previous, and the media
+# flyout. There is no Win32 message for earbud transport buttons; they arrive through SMTC.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Foundation",
+    "Media",
+    "Win32_Foundation",
+    "Win32_System_WinRT",
+] }

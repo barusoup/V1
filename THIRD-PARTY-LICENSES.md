@@ -220,10 +220,16 @@ Components vendored in `vendor/` and the bundled fonts and icons are listed in [
 | want | 0.3.2 | MIT |
 | webpki-roots | 1.0.11 | CDLA-Permissive-2.0 |
 | windows | 0.54.0 | MIT OR Apache-2.0 |
+| windows | 0.58.0 | MIT OR Apache-2.0 |
 | windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 |
 | windows-core | 0.54.0 | MIT OR Apache-2.0 |
+| windows-core | 0.58.0 | MIT OR Apache-2.0 |
+| windows-implement | 0.58.0 | MIT OR Apache-2.0 |
+| windows-interface | 0.58.0 | MIT OR Apache-2.0 |
 | windows-link | 0.2.1 | MIT OR Apache-2.0 |
 | windows-result | 0.1.2 | MIT OR Apache-2.0 |
+| windows-result | 0.2.0 | MIT OR Apache-2.0 |
+| windows-strings | 0.1.0 | MIT OR Apache-2.0 |
 | windows-sys | 0.52.0 | MIT OR Apache-2.0 |
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 |
 | windows-targets | 0.52.6 | MIT OR Apache-2.0 |

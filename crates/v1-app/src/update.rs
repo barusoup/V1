@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Hunter Lehr (Barusoup)
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Startup self-update. Before the window exists, the app asks GitHub for the latest full release.
+//! Startup self-update. Beside the app starting, a thread asks GitHub for the latest full release.
 //! If it is newer than this build and its installer matches the published checksum, a helper script
 //! waits for this process to exit, installs silently, and starts the updated app in its place. Any
 //! failure (no network, a failed request, a bad download) is dropped and the app starts as usual.
@@ -121,6 +121,15 @@ pub fn run_at_startup() {
         std::process::exit(0);
     }
     let _ = std::fs::remove_file(&installer);
+}
+
+/// Start the update check on a thread of its own, so a slow or unreachable GitHub can never hold
+/// the window shut. An installed copy still checks on every start; if a newer release is staged,
+/// the app exits and the helper installs it and starts it again.
+pub fn check_in_background() {
+    let _ = std::thread::Builder::new()
+        .name("v1-update".to_owned())
+        .spawn(run_at_startup);
 }
 
 /// The folder the app is installed in, or `None` for a build run from anywhere else.

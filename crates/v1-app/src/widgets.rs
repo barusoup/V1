@@ -92,6 +92,9 @@ pub struct Cx<'a> {
     /// Textures this frame drew a stand-in for.
     pub wanted_icons: Vec<(Icon, u32)>,
     pub wanted_covers: Vec<String>,
+    /// Songs drawn this frame whose album (or its link) is still missing, so the host can look the
+    /// metadata up once each and retry later.
+    pub wanted_meta: Vec<yt_client::SongHit>,
     /// Set when a hit test has landed under the pointer this frame, so a press that a widget took
     /// is not also taken as a grab of the window.
     pub touched: Cell<bool>,
@@ -290,6 +293,17 @@ impl Cx<'_> {
     ) {
         if let Some(icon) = icons.get(current).copied() {
             self.icon(icon, center, size, color);
+        }
+    }
+
+    /// Ask for a song's missing metadata, at most once per frame. The host decides whether a lookup
+    /// is due; this only records that a row on screen still needs it.
+    pub fn want_meta(&mut self, hit: &yt_client::SongHit) {
+        if hit.album_id.is_some() {
+            return;
+        }
+        if !self.wanted_meta.iter().any(|seen| seen.video_id == hit.video_id) {
+            self.wanted_meta.push(hit.clone());
         }
     }
 

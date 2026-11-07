@@ -151,13 +151,22 @@ pub fn parse_album(browse_id: &str, root: &Value) -> AlbumPage {
         page.title = text_field(header, "title").unwrap_or_default();
         page.thumbnail = thumbnail_of(header);
         // The artist is the link in the header's subtitle; the rest of the subtitle, and the
-        // second subtitle (songs and length), make up the meta line.
-        let artist = ["straplineTextOne", "subtitle"]
+        // second subtitle (songs and length), make up the meta line. A header that names the
+        // artist without linking it still names them: fall back to a plain credit there.
+        let header_runs: Vec<&Value> = ["straplineTextOne", "subtitle"]
             .iter()
             .flat_map(|key| runs_of(header.get(*key)))
+            .collect();
+        let artist = header_runs
+            .iter()
             .find_map(|run| match run_page(run) {
                 Some((kind, id)) if is_artist_kind(kind) => Some((text_of_run(run), id)),
                 _ => None,
+            })
+            .or_else(|| {
+                header_runs
+                    .iter()
+                    .find_map(|run| plain_artist_run(run).map(|name| (name, None)))
             });
         if let Some((name, id)) = artist {
             page.artist = name;
@@ -166,6 +175,8 @@ pub fn parse_album(browse_id: &str, root: &Value) -> AlbumPage {
         let mut parts = Vec::new();
         meta_parts(header.get("subtitle"), &mut parts);
         meta_parts(header.get("secondSubtitle"), &mut parts);
+        // An unlinked artist stays in the subtitle's runs; it is the artist line already.
+        parts.retain(|part| part != &page.artist);
         page.meta = parts.join(META_SEP);
     }
 
@@ -291,6 +302,23 @@ fn run_page(run: &Value) -> Option<(&str, Option<&str>)> {
 
 fn is_artist_kind(kind: &str) -> bool {
     matches!(kind, "MUSIC_PAGE_TYPE_ARTIST" | "MUSIC_PAGE_TYPE_USER_CHANNEL")
+}
+
+/// A run that names an artist without linking to their page, when it is not the album's kind or
+/// year. Header subtitles put the artist between those, either linked or as plain text.
+fn plain_artist_run(run: &Value) -> Option<String> {
+    if run_page(run).is_some() {
+        return None;
+    }
+    let text = text_of_run(run);
+    if text.is_empty()
+        || !text.chars().any(char::is_alphanumeric)
+        || matches!(text.to_ascii_lowercase().as_str(), "album" | "single" | "ep" | "compilation")
+        || text.chars().all(|c| c.is_ascii_digit() || c == '-')
+    {
+        return None;
+    }
+    Some(text)
 }
 
 /// The text of one run, trimmed.
@@ -497,6 +525,61 @@ mod tests {
         assert_eq!(page.thumbnail.as_deref(), Some("https://x/cover"));
         assert_eq!(page.tracks.len(), 1);
         assert_eq!(page.tracks[0].artists, vec!["Daft Punk".to_owned()]);
+    }
+
+    #[test]
+    fn an_album_header_with_an_unlinked_artist_still_names_it() {
+        let root = json!({
+          "header": { "musicResponsiveHeaderRenderer": {
+              "title": { "runs": [ { "text": "Homework" } ] },
+              // No navigationEndpoint: the artist is plain text, as some responses give it.
+              "straplineTextOne": { "runs": [ { "text": "Daft Punk" } ] },
+              "subtitle": { "runs": [ { "text": "Album" }, { "text": " • " }, { "text": "1996" } ] },
+              "secondSubtitle": { "runs": [ { "text": "16 songs" } ] }
+          } },
+          "contents": { "singleColumnBrowseResultsRenderer": { "tabs": [ { "tabRenderer": { "content": {
+            "sectionListRenderer": { "contents": [
+              { "musicShelfRenderer": { "contents": [
+                  { "musicResponsiveListItemRenderer": {
+                      "playlistItemData": { "videoId": "t1" },
+                      "overlay": crate::endpoints::play_overlay("MUSIC_VIDEO_TYPE_ATV"),
+                      "flexColumns": [ { "musicResponsiveListItemFlexColumnRenderer": { "text": {
+                        "runs": [ { "text": "Teachers" } ] } } } ] } }
+              ] } }
+            ] }
+          } } } ] } }
+        });
+        let page = parse_album("MPREb_homework", &root);
+        assert_eq!(page.artist, "Daft Punk");
+        assert_eq!(page.artist_id, None);
+        assert_eq!(page.meta, "Album  ·  1996  ·  16 songs");
+        assert_eq!(page.tracks[0].artists, vec!["Daft Punk".to_owned()]);
+    }
+
+    #[test]
+    fn an_album_without_any_artist_is_not_given_a_separator() {
+        let root = json!({
+          "header": { "musicDetailHeaderRenderer": {
+              "title": { "runs": [ { "text": "An Untitled Album" } ] },
+              "subtitle": { "runs": [
+                  { "text": "Album" }, { "text": " • " }, { "text": "1997" } ] }
+          } },
+          "contents": { "singleColumnBrowseResultsRenderer": { "tabs": [ { "tabRenderer": { "content": {
+            "sectionListRenderer": { "contents": [
+              { "musicShelfRenderer": { "contents": [
+                  { "musicResponsiveListItemRenderer": {
+                      "playlistItemData": { "videoId": "t1" },
+                      "overlay": crate::endpoints::play_overlay("MUSIC_VIDEO_TYPE_ATV"),
+                      "flexColumns": [ { "musicResponsiveListItemFlexColumnRenderer": { "text": {
+                        "runs": [ { "text": "Track" } ] } } } ] } }
+              ] } }
+            ] }
+          } } } ] } }
+        });
+        let page = parse_album("MPREb_x", &root);
+        assert_eq!(page.artist, "");
+        assert_eq!(page.meta, "Album  ·  1997");
+        assert!(page.tracks[0].artists.is_empty());
     }
 
     #[test]

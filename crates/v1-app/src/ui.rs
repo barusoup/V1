@@ -206,6 +206,12 @@ fn loaded<T>(result: Result<T, String>) -> Loaded<T> {
 /// How many times a song's length is asked for before giving up on it for the session.
 const LENGTH_TRIES: u32 = 4;
 
+/// How many times a song's missing metadata (its album and its link) is looked up. A lookup that
+/// finds nothing is tried again later, a little less eagerly each time.
+const META_TRIES: u32 = 4;
+const META_FIRST_RETRY: Duration = Duration::from_secs(30);
+const META_MAX_RETRY: Duration = Duration::from_secs(600);
+
 /// How many artist or album pages are kept fetched at once. Each is a few tens of kilobytes.
 const PAGE_CACHE: usize = 48;
 
@@ -265,6 +271,12 @@ pub struct Now {
     pub norm: f32,
     /// The player has been paused for good, so the pause is not repeated every frame.
     pub held: bool,
+    /// The equalizer badge should be showing. It is latched: a level crossing above the on threshold
+    /// sets it, and only a sustained quiet spell clears it, so a volume change or a quiet passage
+    /// cannot make the badge flicker.
+    audible: bool,
+    /// When the output first fell below the off threshold while `audible` was set.
+    quiet_since: Option<Instant>,
 }
 
 /// The factor that brings a track to YouTube's reference loudness. A positive `loudness_db` means
@@ -280,6 +292,37 @@ fn normalisation(loudness_db: Option<f64>) -> f32 {
 /// How long a pause or a start takes to fade. Brief enough to feel immediate, long enough to
 /// avoid a click.
 const FADE_SECS: f32 = 0.15;
+
+/// The equalizer badge over a playing song's cover: it comes on once the output rises above the
+/// first level, and only goes away after the output has stayed below the second for a while. The
+/// gap and the hold are what keep a volume change, or a quiet passage in the music, from blinking
+/// the badge in and out.
+const BADGE_ON_LEVEL: f32 = 0.02;
+const BADGE_OFF_LEVEL: f32 = 0.004;
+const BADGE_QUIET_HOLD: Duration = Duration::from_millis(800);
+
+/// Move the equalizer badge's latch for one frame. Returns whether it is showing.
+///
+/// It comes on the first time the output is clearly audible and goes off only after a sustained
+/// quiet spell (below the lower threshold for the hold), so the badge cannot be blinked by the
+/// meter's release, a volume drag, or the gaps between songs in an album.
+fn advance_badge(audible: bool, quiet_since: &mut Option<Instant>, levels: [f32; 3], now: Instant) -> bool {
+    if levels.iter().any(|level| *level > BADGE_ON_LEVEL) {
+        *quiet_since = None;
+        return true;
+    }
+    if !audible {
+        return false;
+    }
+    let quiet = *quiet_since.get_or_insert(now);
+    if now.duration_since(quiet) >= BADGE_QUIET_HOLD
+        && levels.iter().all(|level| *level < BADGE_OFF_LEVEL)
+    {
+        *quiet_since = None;
+        return false;
+    }
+    true
+}
 
 /// How many upcoming songs are resolved ahead of time, so skipping to them starts at once.
 const PRELOAD_AHEAD: usize = 3;
@@ -437,7 +480,6 @@ pub struct State {
     spectrum: Spectrum,
     spectrum_live: bool,
     volume_before_mute: Option<f32>,
-    cover_requested: HashSet<String>,
     /// Covers asked for whose answer (a picture, or a failure) has not come back yet. The host keeps
     /// polling only while this is not empty, so a cover that can never arrive cannot hold it awake.
     cover_inflight: HashSet<String>,
@@ -452,6 +494,10 @@ pub struct State {
     length_requested: HashSet<String>,
     /// Length lookups that came back empty: how many times, and when to try again.
     length_failures: HashMap<String, (u32, Instant)>,
+    /// Songs whose metadata lookup has been sent and not answered yet.
+    meta_requested: HashSet<String>,
+    /// Metadata lookups that found nothing: how many times, and when to try again.
+    meta_failures: HashMap<String, (u32, Instant)>,
     /// Upcoming songs already asked to be resolved, so each is asked for once.
     preloaded: HashSet<String>,
     /// When the fade last moved, so each frame steps by its own length.
@@ -488,6 +534,9 @@ struct TrackView {
     loading: bool,
     /// Low, mid and high band levels of the sound being output, 0 to 1.
     levels: [f32; 3],
+    /// Whether the equalizer badge over this song's cover is showing. Latched with hysteresis, so
+    /// a quiet moment (or a volume change) does not flicker it in and out (see [`Now::audible`]).
+    audible: bool,
 }
 
 /// One row of a track list. It borrows from the song it shows: rows are rebuilt every frame, and
@@ -559,6 +608,31 @@ impl<'a> Row<'a> {
     }
 }
 
+/// What a press on a track row should do, given what is already playing or loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackPress {
+    /// Nothing is playing this song: start it.
+    Start,
+    /// This song is already loading: leave that load alone.
+    Ignore,
+    /// This song is the one playing: pause or resume it.
+    Toggle,
+}
+
+fn same_track_press(current: Option<&str>, loading: Option<&str>, pressed: &str) -> TrackPress {
+    if loading == Some(pressed) {
+        TrackPress::Ignore
+    } else if loading.is_some() {
+        // The song that was playing is already fading out for another load; a press on it starts
+        // it again, which cancels that load, rather than pausing a song on its way out.
+        TrackPress::Start
+    } else if current == Some(pressed) {
+        TrackPress::Toggle
+    } else {
+        TrackPress::Start
+    }
+}
+
 impl State {
     /// A state with an empty collection. The host opens the real one on another thread, while the
     /// window and the GPU come up, and hands it over with [`State::attach_library`] before the
@@ -623,7 +697,6 @@ impl State {
             artists: HashMap::new(),
             albums: HashMap::new(),
             volume_before_mute: None,
-            cover_requested: HashSet::new(),
             cover_inflight: HashSet::new(),
             cover_retry: HashMap::new(),
             last_search: String::new(),
@@ -631,6 +704,8 @@ impl State {
             lengths: HashMap::new(),
             length_requested: HashSet::new(),
             length_failures: HashMap::new(),
+            meta_requested: HashSet::new(),
+            meta_failures: HashMap::new(),
             preloaded: HashSet::new(),
             tick_at: now,
             fading: false,
@@ -655,20 +730,14 @@ impl State {
 
     /// Drain backend events. Called once per frame, before the build.
     pub fn pump(&mut self) {
-        // Covers are a few hundred KB each on the GPU. Past a few hundred, start over: frames in
-        // flight hold their own references, and whatever is on screen is simply fetched again.
-        if self.gpu.covers.len() > 400 {
-            self.gpu.covers.clear();
-            // Covers still on their way are kept: their answers will arrive and are uploaded as
-            // usual, and asking for them again would only fetch them twice.
-            self.cover_requested.clone_from(&self.cover_inflight);
-            self.cover_retry.clear();
-        }
         if self.artists.len() > PAGE_CACHE || self.albums.len() > PAGE_CACHE {
             self.trim_pages();
         }
         if self.preloaded.len() > 512 {
             self.preloaded.clear();
+        }
+        if self.meta_failures.len() > 512 {
+            self.meta_failures.clear();
         }
         let mut heard = false;
         while let Ok(event) = self.backend.events.try_recv() {
@@ -741,7 +810,6 @@ impl State {
                     // every frame. Asking again after the wait is how it recovers from a network
                     // that was down.
                     self.cover_inflight.remove(&url);
-                    self.cover_requested.remove(&url);
                     self.cover_retry.insert(url, Instant::now() + COVER_RETRY);
                 }
                 // Only the answer for the track on screen counts; an older one is dropped.
@@ -797,6 +865,22 @@ impl State {
                         self.length_failures.insert(video_id, (tries, Instant::now() + wait));
                     }
                 },
+                Event::SongMeta { video_id, hit } => {
+                    self.meta_requested.remove(&video_id);
+                    let found_album = hit.as_ref().is_some_and(|hit| hit.album_id.is_some());
+                    if let Some(updated) = hit {
+                        self.learn(std::slice::from_ref(&updated));
+                    }
+                    if found_album {
+                        self.meta_failures.remove(&video_id);
+                    } else {
+                        // Nothing more to find this time: try again later, a little less often.
+                        let tries = self.meta_failures.get(&video_id).map_or(0, |(n, _)| *n) + 1;
+                        let wait = (META_FIRST_RETRY * 2u32.saturating_pow(tries.min(5)))
+                            .min(META_MAX_RETRY);
+                        self.meta_failures.insert(video_id, (tries, Instant::now() + wait));
+                    }
+                }
                 Event::Downloaded { video_id, loudness_db, duration_secs } => {
                     self.library.downloaded(&video_id, loudness_db, duration_secs);
                 }
@@ -885,6 +969,36 @@ impl State {
                 }
             }
         }
+        // The lists on screen are rebuilt from their own copies: fill those too, so a link that
+        // arrived after the results were drawn becomes live without another search.
+        for song in &mut self.results {
+            for other in hits {
+                crate::library::fill_gaps(song, other);
+            }
+        }
+        if let Some(TopResult::Song(song)) = &mut self.top {
+            for other in hits {
+                crate::library::fill_gaps(song, other);
+            }
+        }
+        for entry in self.artists.values_mut() {
+            if let Loaded::Ready(page) = entry {
+                for song in &mut page.songs {
+                    for other in hits {
+                        crate::library::fill_gaps(song, other);
+                    }
+                }
+            }
+        }
+        for entry in self.albums.values_mut() {
+            if let Loaded::Ready(page) = entry {
+                for song in &mut page.tracks {
+                    for other in hits {
+                        crate::library::fill_gaps(song, other);
+                    }
+                }
+            }
+        }
     }
 
     /// Ask for the length of every track on screen that has none yet, once each. Covers the
@@ -964,6 +1078,17 @@ impl State {
                 track.held = true;
             }
             track.paused = !track.want_playing;
+            // Latch the equalizer badge: on as soon as the output is clearly audible, off only
+            // after it has been quiet for a while. A slider drag changes the gain in steps and the
+            // meters follow with their own ballistics; a plain threshold would cross both ways
+            // between frames and blink the badge.
+            let levels = track.player.levels();
+            track.audible = advance_badge(
+                track.audible,
+                &mut track.quiet_since,
+                levels,
+                now,
+            );
         }
         if let Some(message) = failed {
             self.status = message;
@@ -983,6 +1108,84 @@ impl State {
 
     pub fn is_playing(&self) -> bool {
         self.now.as_ref().is_some_and(|track| !track.paused)
+    }
+
+    /// What the Windows media controls should show, or `None` when nothing is loaded. Borrows the
+    /// current track rather than cloning it: this runs every frame.
+    pub fn media_info(&self) -> Option<crate::media::MediaInfo<'_>> {
+        if let Some(hit) = self.playlist.loading_song() {
+            return Some(crate::media::MediaInfo {
+                title: &hit.title,
+                artist: hit.artists.first().map_or("", String::as_str),
+                album: hit.album.as_deref(),
+                position: 0.0,
+                duration: self.known_length(hit) as f64,
+                playing: false,
+            });
+        }
+        if let Some(track) = &self.now {
+            return Some(crate::media::MediaInfo {
+                title: &track.title,
+                artist: &track.artist,
+                album: track.hit.album.as_deref(),
+                position: track.position as f64,
+                duration: track.duration as f64,
+                playing: !track.paused,
+            });
+        }
+        self.demo_track.as_ref().map(|track| crate::media::MediaInfo {
+            title: &track.title,
+            artist: &track.artist,
+            album: track.hit.as_ref().and_then(|hit| hit.album.as_deref()),
+            position: track.position as f64,
+            duration: track.duration as f64,
+            playing: !track.paused,
+        })
+    }
+
+    /// Apply a transport button from the OS (earbuds, media keys, or the Windows flyout).
+    pub fn media_command(&mut self, command: crate::media::Command) {
+        use crate::media::Command;
+        match command {
+            Command::Play => self.set_playing(true),
+            Command::Pause => self.set_playing(false),
+            Command::Toggle => self.toggle_playback(),
+            Command::Next => self.next(),
+            Command::Previous => self.back(),
+            Command::Stop => self.set_playing(false),
+            Command::Seek(seconds) => {
+                if let Some(track) = self.now.as_mut() {
+                    let upper = if track.duration > 0.0 {
+                        track.duration as f64
+                    } else {
+                        seconds.max(0.0)
+                    };
+                    let seconds = seconds.clamp(0.0, upper);
+                    track.player.seek((seconds * 1000.0).round() as i64);
+                    track.position = seconds as f32;
+                }
+            }
+        }
+        // The frame that is due should show the result even if no input asked for one.
+        self.animating = true;
+    }
+
+    /// Start or pause the loaded song, as an explicit Play or Pause asks. Unlike a toggle, a
+    /// repeated Play or Pause is a no-op.
+    fn set_playing(&mut self, play: bool) {
+        // Held while a song loads: the transport is disabled until it starts.
+        let loading = self.playlist.is_loading();
+        let now = Instant::now();
+        if let Some(track) = self.now.as_mut().filter(|_| !loading) {
+            if track.want_playing != play {
+                track.want_playing = play;
+                track.paused = !play;
+                if play {
+                    track.held = false;
+                    track.player.play(now);
+                }
+            }
+        }
     }
 
     /// Play the first search result automatically; used by the screenshot harness.
@@ -1087,7 +1290,6 @@ impl State {
                     height: 64,
                     rgba,
                 });
-                self.cover_requested.insert(format!("demo://{index}"));
             }
         }
         // The search's top result and the artists and albums it matched, invented to match the songs.
@@ -1131,6 +1333,7 @@ impl State {
                 paused: std::env::var_os("V1_SHOT_PAUSED").is_some(),
                 loading: false,
                 levels: [0.8, 0.95, 0.6],
+                audible: true,
             });
         }
         if std::env::var_os("V1_SHOT_COLLAPSED").is_some() {
@@ -1267,6 +1470,7 @@ impl State {
                 paused: true,
                 loading: true,
                 levels: [0.0; 3],
+                audible: false,
             });
         }
         match &self.now {
@@ -1282,6 +1486,7 @@ impl State {
                 paused: track.paused,
                 loading: false,
                 levels: track.player.levels(),
+                audible: track.audible,
             }),
             None => self.demo_track.clone(),
         }
@@ -1309,9 +1514,13 @@ impl State {
         (position / duration).clamp(0.0, 1.0)
     }
 
-    /// Play a song picked from the search results. Only that song plays; the queue is left alone.
+    /// Play a song picked from the search results. If it is already the song that is playing,
+    /// pause or resume it instead of loading it again from the start.
     fn play_index(&mut self, index: usize) {
         if let Some(hit) = self.results.get(index).cloned() {
+            if self.clicked_current(&hit.video_id) {
+                return;
+            }
             let hit = self.playlist.play_one(hit);
             self.send_play(hit);
         }
@@ -1322,8 +1531,44 @@ impl State {
         let Some(TopResult::Song(hit)) = self.top.clone() else {
             return;
         };
+        if self.clicked_current(&hit.video_id) {
+            return;
+        }
         let hit = self.playlist.play_one(hit);
         self.send_play(hit);
+    }
+
+    /// A press on the song that is already up: pause or resume it, rather than starting it over.
+    /// A press on the song that is still loading is ignored, as its own load is already under way.
+    /// Returns whether the press was taken care of here.
+    fn clicked_current(&mut self, video_id: &str) -> bool {
+        let current = self.now.as_ref().map(|track| track.video_id.as_str());
+        match same_track_press(current, self.playlist.loading_id(), video_id) {
+            TrackPress::Toggle => {
+                self.toggle_playback();
+                true
+            }
+            TrackPress::Ignore => true,
+            TrackPress::Start => false,
+        }
+    }
+
+    /// Pause the song that is playing, or resume it. A pause is applied by `tick`, once the fade
+    /// has taken the sound to silence.
+    fn toggle_playback(&mut self) {
+        // Held while a song loads: the button is disabled, so the audible song is left alone.
+        let loading = self.playlist.is_loading();
+        let now = Instant::now();
+        if let Some(track) = self.now.as_mut().filter(|_| !loading) {
+            track.want_playing = !track.want_playing;
+            track.paused = !track.want_playing;
+            if track.want_playing {
+                // Resume at once; the gain fades back up from wherever it is.
+                track.held = false;
+                track.player.play(now);
+            }
+            // A pause is applied by `tick`, once the fade has taken the sound to silence.
+        }
     }
 
     fn send_play(&mut self, hit: yt_client::SongHit) {
@@ -1465,6 +1710,8 @@ impl State {
                     gain: 0.0,
                     norm: normalisation(ready.loudness_db),
                     held: false,
+                    audible: false,
+                    quiet_since: None,
                     player,
                 });
             }
@@ -1613,18 +1860,34 @@ impl State {
     }
 
     fn request_cover(&mut self, url: String) {
-        if self.gpu.covers.contains_key(&url) {
+        if self.gpu.covers.contains_key(&url) || self.cover_inflight.contains(&url) {
             return;
         }
         if self.cover_retry.get(&url).is_some_and(|retry_at| Instant::now() < *retry_at) {
             return;
         }
-        if !self.cover_requested.insert(url.clone()) {
-            return;
-        }
         self.cover_retry.remove(&url);
         self.cover_inflight.insert(url.clone());
         let _ = self.backend.commands.send(Command::Cover(url));
+    }
+
+    /// Look up what a row left out (its album, and the album's link), unless a lookup is already on
+    /// its way or the last few found nothing. A row is redrawn every frame, so this is the guard
+    /// that keeps a song with no findable album from turning into a search every frame.
+    fn request_metadata(&mut self, hit: yt_client::SongHit) {
+        if hit.album_id.is_some() || self.meta_requested.contains(&hit.video_id) {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .meta_failures
+            .get(&hit.video_id)
+            .is_some_and(|(tries, retry_at)| *tries >= META_TRIES || now < *retry_at)
+        {
+            return;
+        }
+        self.meta_requested.insert(hit.video_id.clone());
+        let _ = self.backend.commands.send(Command::SongMeta(hit));
     }
 
     fn apply(&mut self, action: Action) {
@@ -1657,25 +1920,16 @@ impl State {
             }
             Action::Play(index) => self.play_index(index),
             Action::PlayQueued(index) => {
+                if let Some(hit) = self.playlist.queue.get(index).cloned() {
+                    if self.clicked_current(&hit.video_id) {
+                        return;
+                    }
+                }
                 if let Some(hit) = self.playlist.skip_to(index) {
                     self.send_play(hit);
                 }
             }
-            Action::Toggle => {
-                // Held while a song loads: the button is disabled, so the audible song is left alone.
-                let loading = self.playlist.is_loading();
-                let now = Instant::now();
-                if let Some(track) = self.now.as_mut().filter(|_| !loading) {
-                    track.want_playing = !track.want_playing;
-                    track.paused = !track.want_playing;
-                    if track.want_playing {
-                        // Resume at once; the gain fades back up from wherever it is.
-                        track.held = false;
-                        track.player.play(now);
-                    }
-                    // A pause is applied by `tick`, once the fade has taken the sound to silence.
-                }
-            }
+            Action::Toggle => self.toggle_playback(),
             Action::Seek(fraction) => {
                 if let Some(track) = self.now.as_mut() {
                     let ms = (fraction as f64 * track.duration as f64 * 1000.0) as i64;
@@ -1692,6 +1946,11 @@ impl State {
             Action::PageBack => self.page_back(),
             Action::PlayDetail(index) => {
                 let tracks = self.detail_tracks();
+                if let Some(hit) = tracks.get(index) {
+                    if self.clicked_current(&hit.video_id) {
+                        return;
+                    }
+                }
                 if let Some(hit) = self.playlist.play_from(&tracks, index) {
                     self.send_play(hit);
                 }
@@ -1729,6 +1988,11 @@ impl State {
                 let ids: Vec<String> = self.library.song_list(&self.ghosts).to_vec();
                 let hits: Vec<yt_client::SongHit> =
                     ids.iter().filter_map(|id| self.library.song_hit(id).cloned()).collect();
+                if let Some(hit) = hits.get(index) {
+                    if self.clicked_current(&hit.video_id) {
+                        return;
+                    }
+                }
                 if let Some(hit) = self.playlist.play_from(&hits, index) {
                     self.send_play(hit);
                 }
@@ -1834,8 +2098,40 @@ fn clock(seconds: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::clock;
-    use super::{SEARCH_CLOSE_RATE, SEARCH_OPEN_RATE};
+    use super::{advance_badge, BADGE_QUIET_HOLD, SEARCH_CLOSE_RATE, SEARCH_OPEN_RATE};
     use crate::anim::Anims;
+    use std::time::{Duration, Instant};
+
+    /// The badge over a playing cover must not blink while the volume slider moves the meters
+    /// across the threshold. It latches on, tolerates short dips, and only clears after a pause.
+    #[test]
+    fn the_cover_equalizer_badge_latches_through_a_volume_change() {
+        let start = Instant::now();
+        let mut quiet = None;
+        // Silence before playback: no badge.
+        assert!(!advance_badge(false, &mut quiet, [0.0; 3], start));
+        // The first clearly audible block turns it on.
+        assert!(advance_badge(false, &mut quiet, [0.09, 0.2, 0.1], start));
+        // Meter readings dipping under the on-level for a few frames do not blink it.
+        for frame in 0..12 {
+            assert!(advance_badge(
+                true,
+                &mut quiet,
+                [0.018, 0.012, 0.015],
+                start + Duration::from_millis(16 * frame)
+            ));
+        }
+        // Nor does a drag whose readings cross the on-level back and forth.
+        for (frame, level) in [0.021, 0.019, 0.03, 0.012, 0.025, 0.01].into_iter().enumerate() {
+            let now = start + Duration::from_millis(300 + 16 * frame as u64);
+            assert!(advance_badge(true, &mut quiet, [level; 3], now));
+        }
+        // A long quiet spell clears it.
+        let quiet_at = start + Duration::from_secs(1);
+        let after = quiet_at + BADGE_QUIET_HOLD + Duration::from_millis(1);
+        assert!(advance_badge(true, &mut quiet, [0.001; 3], quiet_at), "the hold starts now");
+        assert!(!advance_badge(true, &mut quiet, [0.001; 3], after));
+    }
 
     /// The search bar's reveal is a spring, so how quick it feels is entirely its two rates. These
     /// pin them to 60 Hz frames, so a softer rate cannot creep back in unnoticed: eight frames is
@@ -1867,6 +2163,18 @@ mod tests {
             .collect();
         assert!(closing[7] < 0.05, "close too slow: {}", closing[7]);
         assert_eq!(*closing.last().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn pressing_the_song_that_is_already_playing_toggles_it() {
+        use super::{same_track_press, TrackPress};
+        assert_eq!(same_track_press(Some("a"), None, "a"), TrackPress::Toggle);
+        assert_eq!(same_track_press(Some("a"), None, "b"), TrackPress::Start);
+        // A second press while it is still loading must not start it over.
+        assert_eq!(same_track_press(None, Some("a"), "a"), TrackPress::Ignore);
+        assert_eq!(same_track_press(Some("a"), Some("a"), "a"), TrackPress::Ignore);
+        // Pressing the fading song while another loads starts it again.
+        assert_eq!(same_track_press(Some("a"), Some("b"), "a"), TrackPress::Start);
     }
 
     #[test]
@@ -2147,6 +2455,7 @@ pub fn build(
         queue_drag: state.queue_drag,
         wanted_icons: Vec::new(),
         wanted_covers: Vec::new(),
+        wanted_meta: Vec::new(),
         touched: std::cell::Cell::new(false),
         covering: true,
         covers,
@@ -2193,6 +2502,7 @@ pub fn build(
     state.queue_drag = cx.queue_drag;
     let wanted_icons = std::mem::take(&mut cx.wanted_icons);
     let wanted_covers = std::mem::take(&mut cx.wanted_covers);
+    let wanted_meta = std::mem::take(&mut cx.wanted_meta);
     // A scroll glide in flight (the lyric page centring on its line) keeps the host presenting too.
     let scrolling = ui.animating();
     let frame = ui.end();
@@ -2219,6 +2529,9 @@ pub fn build(
     state.gpu.wanted_icons.extend(wanted_icons);
     for url in wanted_covers {
         state.request_cover(url);
+    }
+    for hit in wanted_meta {
+        state.request_metadata(hit);
     }
 
     for action in actions {
@@ -3296,6 +3609,11 @@ fn track_rows(
         let hv = cx.anims.toggle("row", key, hovered, rate::SNAP);
         let press = cx.anims.toggle("row_press", key, hovered && cx.pointer.down, rate::SNAP);
         let playing = !queued && playing_id == Some(row.video_id);
+        // A row from a list that does not carry the album's link can still fill it in later; a
+        // row on an album page already knows its album from the page itself.
+        if row.page.is_none() {
+            cx.want_meta(row.hit);
+        }
 
         // The playing row keeps a resting fill that brightens under the pointer.
         let wash = if playing {
@@ -4160,11 +4478,11 @@ fn cover_overlay(
     hv: f32,
 ) {
     // The visualizer exists only while sound is audibly coming out; otherwise the cover shows
-    // no dim and no bars, as if it were not playing at all.
-    const SILENT_LEVEL: f32 = 0.02;
+    // no dim and no bars, as if it were not playing at all. `audible` is latched by `State::tick`,
+    // so this is not re-decided from a momentary meter reading here.
     let paused = track.is_none_or(|track| track.paused);
     let levels = track.map_or([0.0; 3], |track| track.levels);
-    let audible = playing && !paused && levels.iter().any(|level| *level > SILENT_LEVEL);
+    let audible = playing && !paused && track.is_some_and(|track| track.audible);
     // The song being loaded shows the spinner, over its cover, as the bar does.
     let loading = track.is_some_and(|track| track.loading && track.video_id == video_id);
     let dim = if audible || loading {
@@ -4598,7 +4916,11 @@ fn draw_bar(
         None => ("Nothing playing", "", theme::MUTED),
     };
     cx.clip(Rect::new(tile_left + 56.0 + text_gap, bar.y, text_w + 4.0, bar.h));
-    // The title names the track's album: a press on it opens the album.
+    // The title names the track's album: a press on it opens the album. When the song row did not
+    // carry the album's link, ask for it so the link appears once it is found.
+    if let Some(hit) = track.and_then(|track| track.hit.as_ref()) {
+        cx.want_meta(hit);
+    }
     let album_link = track
         .and_then(|track| track.hit.as_ref())
         .and_then(|hit| hit.album_id.clone())
