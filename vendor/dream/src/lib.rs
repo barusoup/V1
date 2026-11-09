@@ -6,6 +6,7 @@ pub mod fsr3;
 pub mod gfx;
 pub mod impostor;
 pub mod lighting;
+pub mod memory;
 pub mod model;
 pub mod png;
 pub mod settings;

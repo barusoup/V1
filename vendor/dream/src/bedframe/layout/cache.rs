@@ -3,7 +3,6 @@
 //! the previous output is still valid and steps 1–3 are skipped.
 
 use super::{Leaf, Rect, Size, Style};
-use std::hash::{Hash, Hasher};
 
 #[derive(Default)]
 pub(crate) struct SolveHash {
@@ -128,12 +127,4 @@ impl SolveHash {
     pub fn value(&self) -> u64 {
         self.h
     }
-}
-
-// Silence unused warnings for Hash infra kept minimal.
-#[allow(dead_code)]
-fn _hash<T: Hash>(t: &T) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    t.hash(&mut h);
-    h.finish()
 }

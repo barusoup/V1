@@ -378,6 +378,11 @@ impl Renderer {
         self.acquire.respawn();
     }
 
+    /// Rebuild the swapchain and every size-dependent target for the surface's current extent. Call after `render*` returned [`super::SurfaceError::Outdated`]; the surface reports its real extent, so the size passed through is only a fallback.
+    pub fn recreate_swapchain(&mut self) {
+        self.resize(PhysicalSize::new(self.display_size.0, self.display_size.1));
+    }
+
     /// Wall-clock bound on the frame-start wait for the frame's swapchain
     /// image (slot fence + acquire, resolved on the acquire-ahead worker).
     /// `None` -- the default -- waits as long as the presentation engine
@@ -538,6 +543,37 @@ impl Renderer {
         self.write_sets();
     }
 
+    /// Whether the scene targets (and with them the FSR upscaler, when enabled)
+    /// are currently allocated. False on a UI-only renderer and after
+    /// [`Self::release_scene_resources`].
+    pub fn scene_resources_loaded(&self) -> bool {
+        self.targets_ready
+    }
+
+    /// Free the scene targets, the FSR 3.1 upscaler and the thumbnail pass, returning the renderer to its UI-only footprint. They are rebuilt on demand the next time a frame records scene draws or a scene readback/thumbnail is requested, so releasing costs a one-off re-creation when the scene is shown again. Returns `false` and releases nothing when no scene resources exist or a thumbnail capture is queued, in flight or waiting to be taken.
+    pub fn release_scene_resources(&mut self) -> bool {
+        if !self.targets_ready {
+            return false;
+        }
+        if self.thumb.as_ref().is_some_and(|thumb| thumb.busy()) {
+            return false;
+        }
+        // Nothing in flight may touch the targets once they are freed.
+        unsafe { self.ctx.device().device_wait_idle() }.expect("wait idle on scene release");
+        // Fsr3's Drop waits idle and destroys its own resources.
+        self.fsr = None;
+        if let Some(thumb) = self.thumb.take() {
+            thumb.destroy(self.ctx.device());
+        }
+        self.targets = build_targets(&self.ctx, (1, 1));
+        self.targets_ready = false;
+        self.history_valid = false;
+        self.jitter.reset();
+        // The blit set must stop pointing at the freed views.
+        self.write_sets();
+        true
+    }
+
     /// Drop accumulated temporal history (scene/object changes between
     /// captures) without toggling the pipeline.
     pub fn reset_temporal_history(&mut self) {
@@ -582,7 +618,6 @@ impl Renderer {
                 prev_view_projection: prev_vp.to_cols_array_2d(),
             }),
         );
-        let _ = self.sharpness;
     }
 }
 

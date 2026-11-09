@@ -173,27 +173,27 @@ impl UiRenderer {
             full_barrier(&device, cmd);
             // Two-step downsample: display -> half -> quarter. Each linear blit averages 2x2 texels, so
             // nothing aliases; one 4x blit would sample only four texels per output pixel.
-            let blit = |from: vk::Image, from_size: (u32, u32), to: vk::Image, to_size: (u32, u32)| {
-                let region = vk::ImageBlit::default()
-                    .src_subresource(layers)
-                    .src_offsets([
-                        vk::Offset3D { x: 0, y: 0, z: 0 },
-                        vk::Offset3D {
-                            x: from_size.0 as i32,
-                            y: from_size.1 as i32,
-                            z: 1,
-                        },
-                    ])
-                    .dst_subresource(layers)
-                    .dst_offsets([
-                        vk::Offset3D { x: 0, y: 0, z: 0 },
-                        vk::Offset3D {
-                            x: to_size.0 as i32,
-                            y: to_size.1 as i32,
-                            z: 1,
-                        },
-                    ]);
-                unsafe {
+            let blit =
+                |from: vk::Image, from_size: (u32, u32), to: vk::Image, to_size: (u32, u32)| {
+                    let region = vk::ImageBlit::default()
+                        .src_subresource(layers)
+                        .src_offsets([
+                            vk::Offset3D { x: 0, y: 0, z: 0 },
+                            vk::Offset3D {
+                                x: from_size.0 as i32,
+                                y: from_size.1 as i32,
+                                z: 1,
+                            },
+                        ])
+                        .dst_subresource(layers)
+                        .dst_offsets([
+                            vk::Offset3D { x: 0, y: 0, z: 0 },
+                            vk::Offset3D {
+                                x: to_size.0 as i32,
+                                y: to_size.1 as i32,
+                                z: 1,
+                            },
+                        ]);
                     device.cmd_blit_image(
                         cmd,
                         from,
@@ -203,8 +203,7 @@ impl UiRenderer {
                         &[region],
                         vk::Filter::LINEAR,
                     );
-                }
-            };
+                };
             blit(target, extent, mid.image(), mid.size());
             full_barrier(&device, cmd);
             blit(mid.image(), mid.size(), source.image(), source.size());

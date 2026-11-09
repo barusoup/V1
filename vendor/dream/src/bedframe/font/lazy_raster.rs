@@ -5,6 +5,7 @@
 //! a few dozen characters), this module compiles each glyph outline on demand
 //! the first time it is rasterized and caches the compiled segments by glyph id.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
@@ -457,7 +458,9 @@ fn rasterize_compiled(glyph: &CompiledGlyph, scale: f32) -> (fontdue::Metrics, V
 /// On-demand TTF font face: stores the raw font bytes + header metrics, and
 /// only compiles glyph outlines for glyphs that actually get rasterized.
 pub(crate) struct LazyFont {
-    data: Vec<u8>,
+    /// Font file bytes. Borrowed for `'static` data (the bundled fonts live in
+    /// the executable image), owned otherwise.
+    data: Cow<'static, [u8]>,
     units_per_em: f32,
     line_metrics_unscaled: fontdue::LineMetrics,
     ascii_glyphs: [u16; 128],
@@ -466,12 +469,21 @@ pub(crate) struct LazyFont {
     has_legacy_kern: bool,
     gpos_first_glyphs: Vec<u64>,
     kern_cache: Mutex<HashMap<u32, i16>>,
+    /// Non-ASCII `char` -> `(glyph_id, advance_units)`; glyph 0 when unmapped.
+    glyph_cache: Mutex<HashMap<char, (u16, u16)>>,
     compiled: Mutex<HashMap<u16, Arc<CompiledGlyph>>>,
 }
 
 impl LazyFont {
+    /// Parse a font from a borrowed slice, copying it into the font.
     pub fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
-        let face = Face::parse(data, 0).map_err(|_| "failed to parse TTF/OTF face")?;
+        Self::from_cow(Cow::Owned(data.to_vec()))
+    }
+
+    /// Parse a font from `data`, keeping it as-is: a `Cow::Borrowed` font
+    /// reads straight from the caller's `'static` bytes without a copy.
+    pub fn from_cow(data: Cow<'static, [u8]>) -> Result<Self, &'static str> {
+        let face = Face::parse(&data, 0).map_err(|_| "failed to parse TTF/OTF face")?;
         let units_per_em = f32::from(face.units_per_em().max(1));
         let asc = i32::from(face.ascender());
         let desc = i32::from(face.descender());
@@ -523,7 +535,7 @@ impl LazyFont {
             }
         }
         Ok(Self {
-            data: data.to_vec(),
+            data,
             units_per_em,
             line_metrics_unscaled,
             ascii_glyphs,
@@ -532,6 +544,7 @@ impl LazyFont {
             has_legacy_kern,
             gpos_first_glyphs,
             kern_cache: Mutex::new(HashMap::new()),
+            glyph_cache: Mutex::new(HashMap::new()),
             compiled: Mutex::new(HashMap::new()),
         })
     }
@@ -547,16 +560,37 @@ impl LazyFont {
         }
     }
 
+    /// `(glyph_id, advance_units)` for a non-ASCII `ch`, memoized per font.
+    /// A face that fails to re-parse yields `(0, 0)` and is not cached.
+    fn non_ascii_glyph(&self, ch: char) -> (u16, u16) {
+        let hit = self.glyph_cache.lock().unwrap().get(&ch).copied();
+        if let Some(entry) = hit {
+            return entry;
+        }
+        // Parse outside the lock: a full table parse is the slow part.
+        let Ok(face) = Face::parse(&self.data, 0) else {
+            return (0, 0);
+        };
+        let gid = face.glyph_index(ch).map_or(0, |g| g.0);
+        let advance = face
+            .glyph_hor_advance(GlyphId(gid))
+            .unwrap_or(self.default_advance);
+        let entry = (gid, advance);
+        let mut cache = self.glyph_cache.lock().unwrap();
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(ch, entry);
+        entry
+    }
+
     #[inline]
     fn glyph_index(&self, ch: char) -> u16 {
         let code = ch as u32;
         if code < 128 {
             return self.ascii_glyphs[code as usize];
         }
-        Face::parse(&self.data, 0)
-            .ok()
-            .and_then(|face| face.glyph_index(ch))
-            .map_or(0, |g| g.0)
+        self.non_ascii_glyph(ch).0
     }
 
     pub fn has_glyph(&self, ch: char) -> bool {
@@ -568,14 +602,7 @@ impl LazyFont {
         let adv = if code < 128 {
             f32::from(self.ascii_advances[code as usize])
         } else {
-            let Ok(face) = Face::parse(&self.data, 0) else {
-                return 0.0;
-            };
-            let gid = face
-                .glyph_index(ch)
-                .filter(|g| g.0 != 0)
-                .unwrap_or(GlyphId(0));
-            f32::from(face.glyph_hor_advance(gid).unwrap_or(self.default_advance))
+            f32::from(self.non_ascii_glyph(ch).1)
         };
         (adv * (px / self.units_per_em)).round()
     }
@@ -662,5 +689,59 @@ impl LazyFont {
         };
         let scale = px / self.units_per_em;
         rasterize_compiled(&compiled, scale)
+    }
+
+    /// Address of the font's byte storage, so tests can tell borrowed from owned.
+    #[cfg(test)]
+    pub(crate) fn data_ptr(&self) -> *const u8 {
+        self.data.as_ptr()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static INTER: &[u8] = include_bytes!("../../../assets/fonts/inter/Inter-Regular.ttf");
+
+    #[test]
+    fn lazy_font_borrows_static_data() {
+        let font = LazyFont::from_cow(Cow::Borrowed(INTER)).expect("Inter must parse");
+        assert_eq!(
+            font.data_ptr(),
+            INTER.as_ptr(),
+            "static bytes must not be copied"
+        );
+        let copied = LazyFont::from_bytes(INTER).expect("Inter must parse");
+        assert_ne!(copied.data_ptr(), INTER.as_ptr(), "from_bytes owns a copy");
+    }
+
+    #[test]
+    fn lazy_font_non_ascii_lookup_matches_the_face_and_caches() {
+        let font = LazyFont::from_cow(Cow::Borrowed(INTER)).expect("Inter must parse");
+        let face = Face::parse(INTER, 0).expect("Inter must parse");
+        let units_per_em = f32::from(face.units_per_em().max(1));
+        let default_advance = face.glyph_hor_advance(GlyphId(0)).unwrap_or(0);
+        // 中 is not in Inter, so it exercises the unmapped (glyph 0) path.
+        for ch in ['é', 'ß', '→', '€', '中'] {
+            let gid = face.glyph_index(ch).map_or(0, |g| g.0);
+            let units = face
+                .glyph_hor_advance(GlyphId(gid))
+                .unwrap_or(default_advance);
+            let expected_adv = (f32::from(units) * (16.0 / units_per_em)).round();
+            // Twice: the first call fills the cache, the second reads it.
+            for pass in 0..2 {
+                assert_eq!(
+                    font.has_glyph(ch),
+                    gid != 0,
+                    "{ch:?} has_glyph, pass {pass}"
+                );
+                assert_eq!(
+                    font.advance(ch, 16.0),
+                    expected_adv,
+                    "{ch:?} advance, pass {pass}"
+                );
+            }
+        }
     }
 }

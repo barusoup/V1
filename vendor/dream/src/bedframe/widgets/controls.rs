@@ -481,62 +481,6 @@ impl Ui {
         resp
     }
 
-    /// Draw a switch (pill track with a sliding circular knob) at `rect`,
-    /// left-aligned, returning the track's right edge. The knob animates on a
-    /// key scoped by the caller so retargeting eases from wherever it is.
-    #[allow(dead_code)]
-    fn draw_switch(
-        &mut self,
-        key: &str,
-        rect: Rect,
-        on: bool,
-        style: ButtonStyle,
-        hover: f32,
-    ) -> f32 {
-        let control = self
-            .theme
-            .tokens
-            .control(crate::ui::tokens::ControlSize::for_height(rect.h));
-        let track_h = control.icon + 2.0;
-        let track = Rect::new(
-            rect.x,
-            rect.center().1 - track_h * 0.5,
-            (track_h * 1.9).round().min(rect.w),
-            track_h,
-        );
-        let on_t = self.anim_f32_seeded(
-            key,
-            if on { 1.0 } else { 0.0 },
-            self.theme.tokens.motion.toggle,
-            Ease::CubicOut,
-        );
-        let track_color = mix_color(
-            mix_color(style.normal, style.hover, hover),
-            style.accent,
-            on_t,
-        );
-        self.draw.round_rect(track, track_h * 0.5, track_color);
-        if on_t < 0.99 && style.normal.a > 0 {
-            let ring = mix_color(style.normal, style.hover, 0.65).fade(1.0 - on_t);
-            self.draw.round_ring(
-                track,
-                track_h * 0.5,
-                crate::ui::layout::hairline(self.scale),
-                ring,
-            );
-        }
-        let knob_d = track_h - 4.0;
-        let knob = Rect::new(
-            track.x + 2.0 + (track.w - knob_d - 4.0) * on_t,
-            track.center().1 - knob_d * 0.5,
-            knob_d,
-            knob_d,
-        );
-        let knob_color = mix_color(style.text_disabled, style.on_icon, on_t);
-        self.draw.round_rect(knob, knob_d * 0.5, knob_color);
-        track.max().0
-    }
-
     /// Horizontal slider over `range`. Drag with the pointer; `nav.left`/
     /// `nav.right` nudge it in tenths while focused.
     pub fn slider(

@@ -109,30 +109,59 @@ impl std::fmt::Debug for Font {
 }
 
 impl Font {
-    /// Parse a TTF/OTF font from bytes. `name` is diagnostic only.
+    /// Parse a TTF/OTF font from bytes, copying them. `name` is diagnostic only.
     pub fn from_bytes(name: impl Into<String>, data: &[u8]) -> Result<Self, String> {
         let name = name.into();
         let metrics = metrics::FaceMetrics::parse(data);
         #[cfg(target_os = "macos")]
-        {
-            let face = native::NativeFace::from_bytes(data)
-                .map_err(|err| format!("{name}: parse font: {err}"))?;
-            Ok(Self {
-                name,
-                metrics,
-                face: Face::Native(std::sync::Arc::new(face)),
-            })
-        }
+        let face =
+            native::NativeFace::from_bytes(data).map(|f| Face::Native(std::sync::Arc::new(f)));
         #[cfg(not(target_os = "macos"))]
-        {
-            let font = lazy_raster::LazyFont::from_bytes(data)
-                .map_err(|err| format!("{name}: parse font: {err}"))?;
-            Ok(Self {
-                name,
-                metrics,
-                face: Face::Portable(font),
-            })
-        }
+        let face = lazy_raster::LazyFont::from_bytes(data).map(Face::Portable);
+        Self::assemble(name, metrics, face)
+    }
+
+    /// Parse a TTF/OTF font from `'static` bytes, such as `include_bytes!`
+    /// data, without copying them on the portable path (the font reads the
+    /// bytes in place). The macOS path copies inside CoreText either way.
+    /// `name` is diagnostic only.
+    pub fn from_static(name: impl Into<String>, data: &'static [u8]) -> Result<Self, String> {
+        let name = name.into();
+        let metrics = metrics::FaceMetrics::parse(data);
+        #[cfg(target_os = "macos")]
+        let face =
+            native::NativeFace::from_bytes(data).map(|f| Face::Native(std::sync::Arc::new(f)));
+        #[cfg(not(target_os = "macos"))]
+        let face =
+            lazy_raster::LazyFont::from_cow(std::borrow::Cow::Borrowed(data)).map(Face::Portable);
+        Self::assemble(name, metrics, face)
+    }
+
+    /// Parse a TTF/OTF font from an owned buffer, keeping it without a second copy.
+    fn from_vec(name: String, data: Vec<u8>) -> Result<Self, String> {
+        let metrics = metrics::FaceMetrics::parse(&data);
+        #[cfg(target_os = "macos")]
+        let face =
+            native::NativeFace::from_bytes(&data).map(|f| Face::Native(std::sync::Arc::new(f)));
+        #[cfg(not(target_os = "macos"))]
+        let face =
+            lazy_raster::LazyFont::from_cow(std::borrow::Cow::Owned(data)).map(Face::Portable);
+        Self::assemble(name, metrics, face)
+    }
+
+    /// Shared tail of every constructor: attaches the parsed backend and maps
+    /// a parse failure to the registry's `"{name}: parse font: {err}"` text.
+    fn assemble<E: std::fmt::Display>(
+        name: String,
+        metrics: metrics::FaceMetrics,
+        face: Result<Face, E>,
+    ) -> Result<Self, String> {
+        let face = face.map_err(|err| format!("{name}: parse font: {err}"))?;
+        Ok(Self {
+            name,
+            metrics,
+            face,
+        })
     }
 
     /// Load a TTF/OTF font from disk.
@@ -143,7 +172,7 @@ impl Font {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        Self::from_bytes(name, &bytes)
+        Self::from_vec(name, bytes)
     }
 
     pub fn name(&self) -> &str {
@@ -317,25 +346,25 @@ impl Fonts {
     pub fn bundled() -> Fonts {
         let mut fonts = Fonts::new();
         let regular = fonts
-            .load_bytes(
+            .load_static(
                 "Inter-Regular",
                 include_bytes!("../../assets/fonts/inter/Inter-Regular.ttf"),
             )
             .expect("bundled Inter-Regular.ttf must load");
         let medium = fonts
-            .load_bytes(
+            .load_static(
                 "Inter-Medium",
                 include_bytes!("../../assets/fonts/inter/Inter-Medium.ttf"),
             )
             .expect("bundled Inter-Medium.ttf must load");
         let semibold = fonts
-            .load_bytes(
+            .load_static(
                 "Inter-SemiBold",
                 include_bytes!("../../assets/fonts/inter/Inter-SemiBold.ttf"),
             )
             .expect("bundled Inter-SemiBold.ttf must load");
         let mono = fonts
-            .load_bytes(
+            .load_static(
                 "JetBrainsMono-Regular",
                 include_bytes!("../../assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf"),
             )
@@ -444,6 +473,14 @@ impl Fonts {
         Ok(FontId(self.fonts.len() as u32 - 1))
     }
 
+    /// Load a font from `'static` bytes (such as `include_bytes!`), reading
+    /// them in place on the portable path. Errors if the data does not parse.
+    pub fn load_static(&mut self, name: &str, data: &'static [u8]) -> Result<FontId, String> {
+        let font = Font::from_static(name, data)?;
+        self.fonts.push(font);
+        Ok(FontId(self.fonts.len() as u32 - 1))
+    }
+
     /// Load a font from disk.
     pub fn load_file(&mut self, path: impl AsRef<std::path::Path>) -> Result<FontId, String> {
         let path = path.as_ref();
@@ -452,7 +489,9 @@ impl Fonts {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        self.load_bytes(&name, &bytes)
+        let font = Font::from_vec(name, bytes)?;
+        self.fonts.push(font);
+        Ok(FontId(self.fonts.len() as u32 - 1))
     }
 
     pub fn get(&self, id: FontId) -> &Font {
@@ -1289,6 +1328,21 @@ mod tests {
     fn font_rejects_garbage() {
         let err = Font::from_bytes("bad", b"not a font").expect_err("garbage must fail");
         assert!(err.contains("parse font"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn font_load_static_registers_a_usable_face() {
+        let mut fonts = Fonts::new();
+        let id = fonts
+            .load_static(
+                "Inter",
+                include_bytes!("../../assets/fonts/inter/Inter-Regular.ttf"),
+            )
+            .expect("bundled Inter-Regular.ttf must load");
+        assert_eq!(id, FontId(0));
+        let font = fonts.get(id);
+        assert_eq!(font.name(), "Inter");
+        assert!(font.advance('A', 16.0) > 0.0, "'A' must have an advance");
     }
 
     #[test]

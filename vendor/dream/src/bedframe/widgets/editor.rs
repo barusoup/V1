@@ -12,7 +12,7 @@ use crate::ui::tween::Anim;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Byte stops a caret may occupy: `0`, every grapheme boundary, `len`.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn caret_stops(text: &str) -> Vec<usize> {
     let mut stops = vec![0usize];
     stops.extend(

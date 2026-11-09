@@ -20,6 +20,13 @@ cargo test --all-targets
 
 Runtime media (FFmpeg stills, video and audio) lives in the separate [`dream-media`](https://github.com/barusoup/dream-media) crate; Dream does not depend on it.
 
+## V1 vendoring
+
+V1 vendors this crate from [`barusoup/Dream`](https://github.com/barusoup/dream) at commit
+`146d8f0` (2026-11-09). The V1-specific frosted-glass backdrop patch lives in
+`src/bedframe/render/backdrop.rs` and `src/bedframe/draw.rs`; upstream demo binaries and docs are
+omitted.
+
 ## License
 
 AGPL-3.0 with additional attribution and commercial-license terms. See [`LICENSE`](LICENSE). Third-party assets: [`NOTICE`](NOTICE).

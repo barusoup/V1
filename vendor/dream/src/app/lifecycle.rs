@@ -114,6 +114,7 @@ impl App {
             keys: KeyFeed::default(),
             quit: false,
             hidden: false,
+            memory: crate::memory::IdleTrim::new(),
         }
     }
 
@@ -263,6 +264,15 @@ impl App {
         self.hidden = hidden;
         if !hidden {
             self.dirty = true;
+        } else {
+            // A hidden window renders nothing, so its cold pages go back to the
+            // OS now. The warm-up restarts when the window shows again.
+            // A hidden window shows nothing, so the scene's targets and upscaler
+            // go back to the driver; they return on the first frame that shows
+            // the viewport.
+            self.renderer.release_scene_resources();
+            crate::memory::trim_working_set();
+            self.memory = crate::memory::IdleTrim::new();
         }
     }
 
@@ -348,6 +358,24 @@ impl App {
                 .flatten(),
             self.ui_wake,
         )
+    }
+
+    /// Returns the process working set to the OS when a trim is due: once after
+    /// warm-up and once after each quiet period. Host loops call this from
+    /// `about_to_wait`. Returns `true` when a trim ran.
+    pub fn idle_maintenance(&mut self, now: Instant) -> bool {
+        self.memory.trim_if_due(now)
+    }
+
+    /// When the host loop should next wake: the earlier of the next frame and
+    /// the next pending memory trim. A hidden window parks for frames only,
+    /// so it never wakes for a trim.
+    pub fn next_wake_at(&self, now: Instant) -> Option<Instant> {
+        let frame = self.next_frame_at(now);
+        if self.hidden {
+            return frame;
+        }
+        earliest_instant(frame, self.memory.next_deadline())
     }
 
     /// Build one UI frame from current state (no GPU work). `dt` is the
@@ -437,7 +465,7 @@ impl App {
             camera,
             ..
         } = self;
-        if need_scene {
+        let presented = if need_scene {
             renderer
                 .render_ui(
                     camera,
@@ -448,15 +476,34 @@ impl App {
                     },
                     Some(&frame),
                 )
-                .expect("render frame");
+                .map(|_| ())
         } else {
-            renderer.render_ui_only(Some(&frame)).expect("render frame");
-        }
+            renderer.render_ui_only(Some(&frame))
+        };
         // The submitted geometry's buffers go straight back to the next
         // frame's draw list instead of the allocator.
         self.ui.recycle_frame(frame);
+        if let Err(err) = presented {
+            match classify_frame_failure(err) {
+                // A timed-out or stale frame is dropped; the next loop pass
+                // builds a fresh one. Nothing was presented, so no
+                // thumbnail capture or frame count.
+                FrameFailure::Retry => {
+                    self.dirty = true;
+                    return;
+                }
+                FrameFailure::Recreate => {
+                    self.renderer.recreate_swapchain();
+                    self.refresh_screen();
+                    self.dirty = true;
+                    return;
+                }
+                FrameFailure::Fatal => panic!("render frame: {err:?}"),
+            }
+        }
         self.capture_pending_thumbnail();
         self.frames_rendered += 1;
+        self.memory.activity(now);
         // Input is consumed by the frame it was rendered in; self-
         // sustaining motion re-arms through `animating` / the spin
         // setting, paced by `needs_render`. A queued thumbnail is read back
@@ -498,10 +545,81 @@ pub(crate) fn earliest_frame_deadline(
     }
 }
 
+/// The earlier of two optional instants; `None` only when both are `None`.
+pub(crate) fn earliest_instant(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// What the app does when presenting a frame failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameFailure {
+    /// Drop this frame and build another on the next loop pass.
+    Retry,
+    /// Rebuild the swapchain, then build another frame.
+    Recreate,
+    /// Nothing the app can do.
+    Fatal,
+}
+
+/// Map a presentation error onto the app's recovery action.
+pub(crate) fn classify_frame_failure(err: crate::gfx::SurfaceError) -> FrameFailure {
+    use crate::gfx::SurfaceError;
+    match err {
+        SurfaceError::Timeout => FrameFailure::Retry,
+        SurfaceError::Outdated => FrameFailure::Recreate,
+        SurfaceError::Lost | SurfaceError::OutOfMemory | SurfaceError::Other => FrameFailure::Fatal,
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::{FrameFailure, classify_frame_failure};
+    use crate::gfx::SurfaceError;
+
+    #[test]
+    fn app_frame_failure_classification() {
+        assert_eq!(
+            classify_frame_failure(SurfaceError::Timeout),
+            FrameFailure::Retry
+        );
+        assert_eq!(
+            classify_frame_failure(SurfaceError::Outdated),
+            FrameFailure::Recreate
+        );
+        assert_eq!(
+            classify_frame_failure(SurfaceError::Lost),
+            FrameFailure::Fatal
+        );
+        assert_eq!(
+            classify_frame_failure(SurfaceError::OutOfMemory),
+            FrameFailure::Fatal
+        );
+        assert_eq!(
+            classify_frame_failure(SurfaceError::Other),
+            FrameFailure::Fatal
+        );
+    }
+}
+
 #[cfg(test)]
 mod deadline_tests {
-    use super::earliest_frame_deadline;
+    use super::{earliest_frame_deadline, earliest_instant};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn app_next_wake_picks_earliest_or_none() {
+        let now = Instant::now();
+        let a = now + Duration::from_millis(30);
+        let b = now + Duration::from_millis(80);
+        assert_eq!(earliest_instant(None, None), None);
+        assert_eq!(earliest_instant(Some(a), None), Some(a));
+        assert_eq!(earliest_instant(None, Some(b)), Some(b));
+        assert_eq!(earliest_instant(Some(b), Some(a)), Some(a));
+        assert_eq!(earliest_instant(Some(a), Some(b)), Some(a));
+    }
 
     #[test]
     fn deadline_picks_earliest_or_parks() {

@@ -2,7 +2,7 @@
 use super::SamplerDesc;
 
 use super::TextureOptions;
-use super::decode::{DecodedTexture, decode_rgba8};
+use super::decode::decode_rgba8;
 use super::gpu::GpuTexture;
 use crate::gfx::vulkan::GpuContext;
 use std::collections::HashMap;
@@ -76,7 +76,16 @@ impl TextureManager {
         }
         let bytes = std::fs::read(&path).map_err(|err| format!("{}: {err}", path.display()))?;
         let decoded = decode_rgba8(&bytes)?;
-        let texture = self.create_decoded(&path.display().to_string(), &decoded, options);
+        // The encoded file is no longer needed; free it before the GPU upload.
+        drop(bytes);
+        let texture = self.create_decoded(
+            &path.display().to_string(),
+            &decoded.pixels,
+            decoded.width,
+            decoded.height,
+            options,
+        );
+        drop(decoded);
         let id = self.insert(texture.clone());
         self.by_path.insert(path, id);
         Ok(texture)
@@ -92,15 +101,7 @@ impl TextureManager {
         height: u32,
         options: TextureOptions,
     ) -> (TextureId, Arc<GpuTexture>) {
-        let texture = self.create_decoded(
-            label,
-            &DecodedTexture {
-                pixels: pixels.to_vec(),
-                width,
-                height,
-            },
-            options,
-        );
+        let texture = self.create_decoded(label, pixels, width, height, options);
         let id = self.insert(texture.clone());
         (id, texture)
     }
@@ -180,16 +181,13 @@ impl TextureManager {
     fn create_decoded(
         &self,
         label: &str,
-        decoded: &DecodedTexture,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
         options: TextureOptions,
     ) -> Arc<GpuTexture> {
         Arc::new(GpuTexture::from_rgba8(
-            &self.ctx,
-            label,
-            &decoded.pixels,
-            decoded.width,
-            decoded.height,
-            options,
+            &self.ctx, label, pixels, width, height, options,
         ))
     }
 }

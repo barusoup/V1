@@ -237,76 +237,6 @@ fn rgba_at(pixels: &[u8], width: u32, at: (f32, f32)) -> (u8, u8, u8) {
     (pixels[i], pixels[i + 1], pixels[i + 2])
 }
 
-/// Resident set size in bytes (leak check in the selfcheck soak).
-#[allow(clippy::needless_return)] // cfg'd tail blocks need explicit returns
-fn rss_bytes() -> u64 {
-    #[cfg(windows)]
-    {
-        #[repr(C)]
-        struct ProcessMemoryCounters {
-            cb: u32,
-            page_fault_count: u32,
-            peak_working_set_size: usize,
-            working_set_size: usize,
-            quota_peak_paged_pool_usage: usize,
-            quota_paged_pool_usage: usize,
-            quota_peak_non_paged_pool_usage: usize,
-            quota_non_paged_pool_usage: usize,
-            pagefile_usage: usize,
-            peak_pagefile_usage: usize,
-        }
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetCurrentProcess() -> *mut core::ffi::c_void;
-            fn K32GetProcessMemoryInfo(
-                process: *mut core::ffi::c_void,
-                counters: *mut ProcessMemoryCounters,
-                cb: u32,
-            ) -> i32;
-        }
-        let mut counters = unsafe { core::mem::zeroed::<ProcessMemoryCounters>() };
-        counters.cb = core::mem::size_of::<ProcessMemoryCounters>() as u32;
-        let ok =
-            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
-        if ok != 0 {
-            return counters.working_set_size as u64;
-        }
-        0
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // `ps` reports resident bytes directly (KiB); /proc does not exist
-        // on macOS so the Linux path would silently read 0.
-        let pid = std::process::id();
-        let output = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &pid.to_string()])
-            .output()
-            .ok();
-        return output
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .and_then(|text| text.trim().parse::<u64>().ok())
-            .map(|kib| kib * 1024)
-            .unwrap_or(0);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // statm field 2 is RESIDENT pages; field 1 is total virtual size.
-        std::fs::read_to_string("/proc/self/statm")
-            .ok()
-            .and_then(|text| {
-                text.split_whitespace()
-                    .nth(1)
-                    .and_then(|pages| pages.parse::<u64>().ok())
-            })
-            .map(|pages| pages * 4096)
-            .unwrap_or(0)
-    }
-    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-    {
-        0
-    }
-}
-
 /// Scripted screenshot states for `--selfcheck`.
 #[derive(Clone, Debug)]
 pub enum SelfCheckShot {
@@ -383,6 +313,8 @@ pub struct App {
     /// other windows (where the platform reports either). No frame is built
     /// or presented while it is; showing the window again repaints at once.
     pub hidden: bool,
+    /// Decides when the process working set is returned to the OS (idle / after warm-up).
+    memory: crate::memory::IdleTrim,
     pub dirty: bool,
     pub last_input: Instant,
     pub last_frame: Instant,
@@ -564,7 +496,7 @@ impl App {
         self.drive();
 
         // Soak phase 1 (busy): drive input, drags, theme flips and renders.
-        let rss = rss_bytes;
+        let rss = crate::memory::resident_bytes;
         let rss_before = rss();
         let gpu_before = self.renderer.context().gpu_allocation_stats();
         println!(

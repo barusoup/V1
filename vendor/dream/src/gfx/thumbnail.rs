@@ -136,6 +136,13 @@ impl ThumbnailPass {
         write_sets(ctx, &[image_write(self.set, 0, &info)]);
     }
 
+    /// Whether a capture is queued, recorded into a frame still in flight, or
+    /// finished and waiting to be taken. Nothing may release the pass or the
+    /// scene targets it reads while this is true.
+    pub(super) fn busy(&self) -> bool {
+        self.job.is_some() || self.ready.is_some() || self.slot.is_some()
+    }
+
     pub(super) fn destroy(&self, device: &ash::Device) {
         unsafe {
             device.destroy_pipeline(self.pipeline, None);

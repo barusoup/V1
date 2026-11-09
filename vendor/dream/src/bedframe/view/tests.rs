@@ -249,11 +249,11 @@ fn view_scroll_thumb_drag() {
     let content_h = 200.0f32;
     let max_offset = content_h - vp.h;
     let bar = u.scrollbar;
-    let track_h = vp.h - 2.0;
+    let track_h = vp.h - bar.inset * 2.0;
     let thumb_h = (vp.h / content_h * track_h).max(bar.min_thumb).min(track_h);
     let travel = (track_h - thumb_h).max(1.0);
-    // Grab the thumb's start y and drag +10.
-    let grab_y = vp.y + 1.0 + 1.0;
+    // Grab the thumb near its start y and drag +10.
+    let grab_y = vp.y + bar.inset + 1.0;
     frame(
         &mut u,
         UiInput {

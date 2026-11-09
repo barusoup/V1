@@ -245,3 +245,17 @@ fn hooks_and_presence_public_paths() {
     assert_eq!(presence.phase, PresencePhase::Hidden);
     ui.end();
 }
+
+#[test]
+fn memory_paths_are_public() {
+    let _ = dream::memory::trim_working_set;
+    let _ = dream::memory::resident_bytes;
+    let _ = dream::memory::IdleTrim::new();
+}
+
+#[test]
+fn font_static_loading_paths_are_public() {
+    let _ = dream::ui::font::Fonts::load_static;
+    let _: fn(&'static str, &'static [u8]) -> Result<dream::ui::font::Font, String> =
+        dream::ui::font::Font::from_static;
+}

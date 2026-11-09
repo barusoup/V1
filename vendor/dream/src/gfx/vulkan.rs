@@ -17,6 +17,7 @@ use winit::window::Window;
 mod barriers;
 mod mesh;
 mod resources;
+mod shared;
 mod submission;
 mod swapchain;
 
@@ -24,6 +25,7 @@ pub use barriers::{
     buffer_barrier, image_barrier, image_barrier_full, image_barrier_mips, is_depth, is_srgb,
 };
 pub use mesh::{DynamicBuffers, PulledMesh};
+pub use shared::TextureObjectStats;
 pub use swapchain::Swapchain;
 
 /// Frames the CPU may have in flight at once. Three slots give the loop
@@ -83,6 +85,9 @@ pub struct GpuContext {
     timestamp_valid_bits: u32,
     /// Limits used for clamping arena pages/descriptor ranges.
     max_storage_buffer_range: u32,
+    /// Samplers, texture set layouts and descriptor pool chunks shared by all
+    /// textures of this context (see the `shared` module).
+    shared_textures: Mutex<shared::SharedTextureObjects>,
 }
 
 struct AsyncSlot {
@@ -227,11 +232,15 @@ impl GpuContext {
         })
         .expect("create GPU allocator");
 
+        // RESET_COMMAND_BUFFER is required because submit_async resets buffers allocated here.
         let transient_pool = unsafe {
             device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
                     .queue_family_index(queue_family)
-                    .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                    .flags(
+                        vk::CommandPoolCreateFlags::TRANSIENT
+                            | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                    ),
                 None,
             )
         }
@@ -269,6 +278,7 @@ impl GpuContext {
             queue_flags: family_props.queue_flags,
             timestamp_valid_bits: family_props.timestamp_valid_bits,
             max_storage_buffer_range: limits.max_storage_buffer_range,
+            shared_textures: Default::default(),
         });
         ctx.print_adapter();
         ctx
@@ -431,6 +441,7 @@ impl Drop for GpuContext {
                 self.device.destroy_fence(slot.fence, None);
             }
             self.device.destroy_command_pool(self.transient_pool, None);
+            self.destroy_shared_texture_objects();
             // The allocator must release its blocks before the device goes away.
             drop(self.allocator.get_mut().expect("allocator lock").take());
             self.device.destroy_device(None);
