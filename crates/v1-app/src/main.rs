@@ -16,6 +16,7 @@ mod backend;
 mod clock;
 mod gpu;
 mod icons;
+mod identity;
 mod instance;
 mod library;
 mod media;
@@ -242,7 +243,7 @@ impl ApplicationHandler<UserEvent> for Host {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("v1")
+                        .with_title("V1")
                         .with_window_icon(app_icon())
                         .with_taskbar_icon(taskbar_icon())
                         .with_theme(Some(winit::window::Theme::Dark))
@@ -427,7 +428,7 @@ impl ApplicationHandler<UserEvent> for Host {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Media(command) => {
-                self.state.media_command(command);
+                self.apply_media_command(command);
                 // The next frame shows the change, even when the window is hidden (the player
                 // state still has to be applied); the hidden tick will present nothing.
                 self.redraw_request();
@@ -443,7 +444,10 @@ impl ApplicationHandler<UserEvent> for Host {
         // and then so the queue still advances, but do not build, animate or present frames: doing
         // that is what replayed the sidebar's opening when the window came back.
         if hidden {
-            if self.state.is_playing() || self.state.busy() || self.state.awaiting_covers() {
+            if self.state.fading() {
+                // A transport fade survives the window being hidden; finish it without drawing.
+                self.pace(event_loop, self.frame_period());
+            } else if self.state.is_playing() || self.state.busy() || self.state.awaiting_covers() {
                 self.pace(event_loop, HIDDEN_TICK);
             } else {
                 event_loop.set_control_flow(ControlFlow::Wait);
@@ -613,6 +617,15 @@ impl Host {
         }
     }
 
+    /// Apply a transport command from SMTC or the fallback media keys. A hidden window cannot run
+    /// the gain fade (it builds no frames), so there the change lands at once; the status is also
+    /// pushed immediately so the flyout's next button press is based on the new state.
+    fn apply_media_command(&mut self, command: media::Command) {
+        let immediate = self.hidden();
+        self.state.media_command(command, immediate);
+        self.update_media();
+    }
+
     /// Device pixels per UI unit: the display's scale times the window zoom.
     fn ui_scale(&self) -> f32 {
         self.scale * self.zoom
@@ -668,19 +681,19 @@ impl Host {
             // through SMTC instead, and when an SMTC session exists the OS may deliver the key both
             // ways; guarding on SMTC avoids toggling the song twice for one press.
             WinitKey::Named(NamedKey::MediaPlayPause) if self.media.is_none() => {
-                self.state.media_command(media::Command::Toggle);
+                self.apply_media_command(media::Command::Toggle);
                 true
             }
             WinitKey::Named(NamedKey::MediaTrackNext) if self.media.is_none() => {
-                self.state.media_command(media::Command::Next);
+                self.apply_media_command(media::Command::Next);
                 true
             }
             WinitKey::Named(NamedKey::MediaTrackPrevious) if self.media.is_none() => {
-                self.state.media_command(media::Command::Previous);
+                self.apply_media_command(media::Command::Previous);
                 true
             }
             WinitKey::Named(NamedKey::MediaStop) if self.media.is_none() => {
-                self.state.media_command(media::Command::Stop);
+                self.apply_media_command(media::Command::Stop);
                 true
             }
             _ => false,
@@ -965,12 +978,6 @@ fn app_icon() -> Option<winit::window::Icon> {
 }
 
 #[cfg(windows)]
-#[link(name = "shell32")]
-extern "system" {
-    fn SetCurrentProcessExplicitAppUserModelID(app_id: *const u16) -> i32;
-}
-
-#[cfg(windows)]
 #[repr(C)]
 struct NativePoint {
     x: i32,
@@ -1016,21 +1023,10 @@ fn any_mouse_button_down() -> bool {
     false
 }
 
-/// Gives the process its own taskbar identity. Without one, Windows groups the window under a
-/// shell-derived identity that can keep a generic icon even when the window provides its own.
-#[cfg(windows)]
-fn set_taskbar_identity() {
-    let id: Vec<u16> = "dev.barus.v1\0".encode_utf16().collect();
-    // SAFETY: `id` is a NUL-terminated UTF-16 string that outlives the call.
-    unsafe {
-        SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
-    }
-}
-
 fn main() {
     boot_mark("main");
     #[cfg(windows)]
-    set_taskbar_identity();
+    identity::apply();
     let arguments: Vec<String> = std::env::args().collect();
     let smoke_mode = arguments.iter().any(|argument| argument == "--smoke");
     let shot_mode = arguments.iter().any(|argument| argument == "--shot");

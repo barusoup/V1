@@ -1110,6 +1110,11 @@ impl State {
         self.now.as_ref().is_some_and(|track| !track.paused)
     }
 
+    /// True while a play/pause fade is still moving the gain, so the host keeps ticking.
+    pub fn fading(&self) -> bool {
+        self.fading
+    }
+
     /// What the Windows media controls should show, or `None` when nothing is loaded. Borrows the
     /// current track rather than cloning it: this runs every frame.
     pub fn media_info(&self) -> Option<crate::media::MediaInfo<'_>> {
@@ -1144,8 +1149,14 @@ impl State {
     }
 
     /// Apply a transport button from the OS (earbuds, media keys, or the Windows flyout).
-    pub fn media_command(&mut self, command: crate::media::Command) {
+    /// `immediate` skips the gain fade: a hidden window builds no frames, and a fade part-way
+    /// through would leave the output quiet but not paused until the window is shown again.
+    pub fn media_command(&mut self, command: crate::media::Command, immediate: bool) {
         use crate::media::Command;
+        let transport = matches!(
+            command,
+            Command::Play | Command::Pause | Command::Stop | Command::Toggle
+        );
         match command {
             Command::Play => self.set_playing(true),
             Command::Pause => self.set_playing(false),
@@ -1166,8 +1177,28 @@ impl State {
                 }
             }
         }
+        if immediate && transport {
+            self.settle_transport();
+        }
         // The frame that is due should show the result even if no input asked for one.
         self.animating = true;
+    }
+
+    /// Make the current play/pause request take effect now, without waiting for fade frames.
+    fn settle_transport(&mut self) {
+        let now = Instant::now();
+        let Some(track) = self.now.as_mut() else { return };
+        let goal = if track.want_playing { 1.0 } else { 0.0 };
+        track.gain = goal;
+        track.player.set_volume(self.volume * goal * track.norm);
+        if track.want_playing {
+            track.held = false;
+        } else if !track.held {
+            track.player.pause(now);
+            track.held = true;
+        }
+        track.paused = !track.want_playing;
+        self.fading = false;
     }
 
     /// Start or pause the loaded song, as an explicit Play or Pause asks. Unlike a toggle, a

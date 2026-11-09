@@ -147,7 +147,7 @@ pub fn check_in_background() {
 }
 
 /// The folder the app is installed in, or `None` for a build run from anywhere else.
-fn installed_dir() -> Option<PathBuf> {
+pub(crate) fn installed_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.to_path_buf();
     dir.join("uninstall.exe").is_file().then_some(dir)

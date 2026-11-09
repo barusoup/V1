@@ -8,7 +8,15 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         winres::WindowsResource::new()
             .set_icon("assets/icon/app.ico")
+            // Explorer, Task Manager and the media flyout read these. Without them the crate name
+            // ("v1-app") is shown instead of the product name.
+            .set("ProductName", "V1")
+            .set("FileDescription", "V1")
+            .set("CompanyName", "Barusoup")
+            .set("LegalCopyright", "Copyright (c) 2026 Hunter Lehr (Barusoup)")
+            .set("OriginalFilename", "v1.exe")
+            .set("InternalName", "V1")
             .compile()
-            .expect("embed the app icon");
+            .expect("embed the app icon and version information");
     }
 }
