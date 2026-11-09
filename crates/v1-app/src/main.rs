@@ -16,6 +16,7 @@ mod backend;
 mod clock;
 mod gpu;
 mod icons;
+mod instance;
 mod library;
 mod media;
 mod playlist;
@@ -53,6 +54,12 @@ pub fn boot_mark(label: &str) {
     if let Some(start) = start {
         eprintln!("boot {:>7.1} ms  {label}", start.elapsed().as_secs_f64() * 1000.0);
     }
+}
+
+/// `V1_MEM=1` prints GPU allocations and working-set trims, to see the app's footprint.
+fn mem_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("V1_MEM").is_some())
 }
 
 /// `V1_FPS=1` prints how many frames were presented each second, to see what the pacing costs.
@@ -129,6 +136,10 @@ struct Host {
     /// The window is occluded (another window covers it fully) or minimized. Nothing visible needs
     /// drawing then, and drawing would only animate panels the user cannot see.
     occluded: bool,
+    /// Working-set trim schedule: once after warm-up, then after each quiet period.
+    memory: dream::memory::IdleTrim,
+    /// The hidden state last acted on, so hiding/showing trims and re-arms the timer only once.
+    hidden_applied: bool,
     /// Wakes the event loop when a background callback has work for the UI (SMTC buttons).
     proxy: EventLoopProxy<UserEvent>,
     /// The Windows media-controls session, once the window exists.
@@ -262,7 +273,7 @@ impl ApplicationHandler<UserEvent> for Host {
         boot_mark("renderer ready");
         // `V1_MEM=1` prints the UI renderer's own GPU allocations, to keep an eye on the app-side
         // share of the process footprint (the Vulkan driver's own allocations are not visible here).
-        if std::env::var_os("V1_MEM").is_some() {
+        if mem_trace() {
             let ui: u64 = renderer.ui_allocation_sizes().iter().map(|(_, bytes)| *bytes).sum();
             eprintln!("ui gpu allocations {:.1} MB", ui as f64 / (1024.0 * 1024.0));
         }
@@ -425,10 +436,13 @@ impl ApplicationHandler<UserEvent> for Host {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        let hidden = self.hidden();
+        self.apply_hidden(hidden);
         // Nothing in the window can be seen while it is minimized or covered. Tick the player now
         // and then so the queue still advances, but do not build, animate or present frames: doing
         // that is what replayed the sidebar's opening when the window came back.
-        if self.hidden() {
+        if hidden {
             if self.state.is_playing() || self.state.busy() || self.state.awaiting_covers() {
                 self.pace(event_loop, HIDDEN_TICK);
             } else {
@@ -440,11 +454,14 @@ impl ApplicationHandler<UserEvent> for Host {
             self.display_hz = monitor_hz(window);
         }
         if let (Some(path), Some(at)) = (self.shot.clone(), self.shoot_at) {
-            if Instant::now() >= at {
+            if now >= at {
                 self.shot_frame(event_loop, &path);
                 return;
             }
         }
+        // Return the working set to the OS when the warm-up or a quiet period has elapsed. Run it
+        // before choosing the wait so the deadline below is the next pending trim, not this one.
+        self.idle_maintenance(now);
         // Motion (a transition, a spring, a window drag) is drawn at the monitor's refresh rate, up
         // to a cap, so it follows the pointer and the animations without a lag while a high-refresh
         // display does not make the app render hundreds of frames a second.
@@ -456,24 +473,27 @@ impl ApplicationHandler<UserEvent> for Host {
             self.pace(event_loop, self.playback_period());
         } else if self.state.busy() || self.state.awaiting_covers() {
             self.pace(event_loop, WAITING_FRAME);
-        } else if let Some(at) = self
-            .state
-            .lyrics_resume_at()
-            .into_iter()
-            .chain(self.shoot_at)
-            .chain(self.state.library_wake_at())
-            .min()
-        {
-            // The lyric page is waiting out a reader's scroll (wake when it should take its place
-            // back), or the collection has a file to clear or a download to retry.
-            if at <= Instant::now() {
+        } else {
+            // The lyric page may be waiting out a reader's scroll, the collection may have a file
+            // to clear or a download to retry, or a working-set trim may be pending. Wake for the
+            // earliest of them; only the first two need a frame.
+            let frame_wake = self
+                .state
+                .lyrics_resume_at()
+                .into_iter()
+                .chain(self.shoot_at)
+                .chain(self.state.library_wake_at())
+                .min();
+            if frame_wake.is_some_and(|at| at <= now) {
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            let wake = frame_wake.into_iter().chain(self.memory.next_deadline()).min();
+            match wake {
+                Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+                None => event_loop.set_control_flow(ControlFlow::Wait),
+            }
         }
     }
 }
@@ -531,6 +551,47 @@ impl Host {
                 .as_ref()
                 .and_then(|window| window.is_minimized())
                 .unwrap_or(false)
+    }
+
+    /// Return the process working set to the OS, logging the change under `V1_MEM`.
+    fn trim_memory(&self, label: &str) {
+        let before = mem_trace().then(dream::memory::resident_bytes);
+        dream::memory::trim_working_set();
+        if let Some(before) = before {
+            let after = dream::memory::resident_bytes();
+            eprintln!(
+                "memory {label} trim {:.1} -> {:.1} MB",
+                before as f64 / (1024.0 * 1024.0),
+                after as f64 / (1024.0 * 1024.0),
+            );
+        }
+    }
+
+    /// Act on a hide/show transition once. A hidden window shows nothing, so its cold pages go
+    /// back to the OS now and the warm-up restarts when it shows again.
+    fn apply_hidden(&mut self, hidden: bool) {
+        if self.hidden_applied == hidden {
+            return;
+        }
+        self.hidden_applied = hidden;
+        if hidden {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.release_scene_resources();
+            }
+            self.trim_memory("hidden");
+            self.memory = dream::memory::IdleTrim::new();
+        } else {
+            self.memory.activity(Instant::now());
+            self.redraw_request();
+        }
+    }
+
+    /// Run a scheduled working-set trim when one is due. The loop calls this as it parks, and
+    /// schedules its next wake from `self.memory.next_deadline()`.
+    fn idle_maintenance(&mut self, now: Instant) {
+        if self.memory.trim_if_due(now) {
+            self.trim_memory("idle");
+        }
     }
 
     /// Ask for the next frame once `interval` has passed since the last began, and otherwise sleep
@@ -792,11 +853,24 @@ impl Host {
         };
         let frame = make_frame(ui, renderer, &mut self.state, input, pointer, (width, height), scale);
         if let Err(error) = renderer.render_ui_only(Some(&frame)) {
-            eprintln!("render failed: {error:?}");
+            match error {
+                // A stale swapchain is normal after minimize/restore or a display change. Rebuild
+                // it and ask for one more frame; a timed-out frame is simply dropped.
+                dream::gfx::SurfaceError::Outdated => {
+                    renderer.recreate_swapchain();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                dream::gfx::SurfaceError::Timeout => {}
+                error => eprintln!("render failed: {error:?}"),
+            }
         }
         fps_tick();
         ui.recycle_frame(frame);
         ui.flush_clipboard();
+        // A frame counts as activity: the working set is only trimmed once the screen goes quiet.
+        self.memory.activity(Instant::now());
 
         self.pressed = false;
         self.released = false;
@@ -958,14 +1032,33 @@ fn main() {
     #[cfg(windows)]
     set_taskbar_identity();
     let arguments: Vec<String> = std::env::args().collect();
-    if arguments.iter().any(|argument| argument == "--smoke") {
+    let smoke_mode = arguments.iter().any(|argument| argument == "--smoke");
+    let shot_mode = arguments.iter().any(|argument| argument == "--shot");
+    let updated = arguments.iter().any(|argument| argument == update::UPDATED_FLAG);
+    if smoke_mode {
         smoke();
+        return;
+    }
+    // One running copy per session. A second launch exits silently. `--shot` builds one frame and
+    // exits by itself, so it stays outside the guard and can be used for screenshots.
+    let _instance = if shot_mode {
+        None
+    } else {
+        match instance::acquire() {
+            instance::Acquire::First(guard) => Some(guard),
+            instance::Acquire::AlreadyRunning => return,
+            instance::Acquire::Unavailable => None,
+        }
+    };
+    // A handoff marker covers the gap while the installer replaces this build. Launches of the old
+    // build exit silently; the installer's `--updated` launch claims the handoff and continues.
+    if !shot_mode && update::blocked_by_update(updated) {
         return;
     }
     // An available update is installed and the app restarts, so the user never sees the old
     // version. `--shot` renders a frame, so it skips it. The check runs on its own thread: a slow
     // release lookup must not delay the window opening.
-    if !arguments.iter().any(|argument| argument == "--shot") {
+    if !shot_mode {
         update::check_in_background();
     }
     let shot = arguments
@@ -1020,6 +1113,8 @@ fn main() {
         display_hz: None,
         hand_cursor: false,
         occluded: false,
+        memory: dream::memory::IdleTrim::new(),
+        hidden_applied: false,
         proxy,
         media: None,
         drag: None,

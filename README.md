@@ -23,6 +23,9 @@ Lyrics are synced line by line from Boidu (the Better Lyrics API), with
 On Windows, download `V1-Setup-<version>.exe` from the [Releases](https://github.com/barusoup/V1/releases) page.
 V1 checks for a newer release every time it starts and installs it before the window opens.
 
+Only one copy runs at a time. While a self-update replaces the app, launches made before the updated
+copy starts exit silently, so the new instance opens cleanly.
+
 ## Running
 
 ```

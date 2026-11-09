@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -25,6 +25,13 @@ const RETRY_PAUSE: Duration = Duration::from_millis(300);
 const CHECK_BUDGET: Duration = Duration::from_secs(6);
 /// The installer download may take this long. Past it, the update waits for the next launch.
 const DOWNLOAD_BUDGET: Duration = Duration::from_secs(90);
+/// Set by the installer, which starts the updated copy after replacing the old one.
+pub(crate) const UPDATED_FLAG: &str = "--updated";
+/// Marker covering the gap between the old process exiting and the installer starting the new one.
+const HANDOFF_FILE: &str = "update-in-progress";
+/// A marker older than this is treated as a crashed update, so a broken install cannot lock the app
+/// out for long. The helper script waits up to two minutes before it gives up.
+const HANDOFF_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(u64, u64, u64);
@@ -117,9 +124,16 @@ pub fn run_at_startup() {
         return;
     };
 
+    if begin_handoff(release.version).is_err() {
+        // Without the marker another launch could race the installer into the old build, so leave
+        // the update for the next start rather than take that chance.
+        let _ = std::fs::remove_file(&installer);
+        return;
+    }
     if restart_into_update(&installer, &install_dir).is_ok() {
         std::process::exit(0);
     }
+    clear_handoff();
     let _ = std::fs::remove_file(&installer);
 }
 
@@ -137,6 +151,54 @@ fn installed_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.to_path_buf();
     dir.join("uninstall.exe").is_file().then_some(dir)
+}
+
+fn handoff_path() -> PathBuf {
+    crate::data_dir().join(HANDOFF_FILE)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_secs()).unwrap_or(0)
+}
+
+/// Record that this process is about to exit for an installer. The marker covers the gap until the
+/// updated copy starts with [`UPDATED_FLAG`] and clears it.
+fn begin_handoff(version: Version) -> std::io::Result<()> {
+    let dir = crate::data_dir();
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(handoff_path(), format!("{version}\n{}\n", unix_now()))
+}
+
+fn clear_handoff() {
+    let _ = std::fs::remove_file(handoff_path());
+}
+
+fn parse_handoff(text: &str) -> Option<(Version, u64)> {
+    let mut lines = text.lines();
+    let version = Version::parse(lines.next()?.trim())?;
+    let written = lines.next()?.trim().parse().ok()?;
+    Some((version, written))
+}
+
+fn handoff_pending(text: &str, now: u64) -> bool {
+    let Some((_, written)) = parse_handoff(text) else { return false };
+    // A clock that moved backwards still counts as fresh; a crashed update ages out.
+    written > now || now.saturating_sub(written) <= HANDOFF_TTL.as_secs()
+}
+
+/// Whether this launch must exit because an update is being installed. The installer starts the
+/// updated copy with [`UPDATED_FLAG`]; that launch clears the marker and continues.
+pub fn blocked_by_update(from_installer: bool) -> bool {
+    if from_installer {
+        clear_handoff();
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(handoff_path()) else { return false };
+    let pending = handoff_pending(&text, unix_now());
+    if !pending {
+        clear_handoff();
+    }
+    pending
 }
 
 async fn newer_release(client: &reqwest::Client) -> Option<Release> {
@@ -186,22 +248,16 @@ async fn get(client: &reqwest::Client, url: &str, timeout: Duration) -> Option<V
     None
 }
 
-/// Writes a script that waits for this process to exit, runs the installer silently into
-/// `install_dir`, and starts the app again. The script runs detached, so it outlives this process.
+/// About two minutes of waiting, then the update is dropped instead of hanging.
 #[cfg(windows)]
-fn restart_into_update(installer: &Path, install_dir: &Path) -> std::io::Result<()> {
-    use std::os::windows::process::CommandExt;
-    // CREATE_NO_WINDOW gives the script and the tools it runs a hidden console. Do not add
-    // DETACHED_PROCESS: Windows then ignores CREATE_NO_WINDOW, every tool gets a visible window,
-    // and the tasklist check stops seeing its output, so the installer could run over a live app.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    /// About two minutes of waiting, then the update is dropped instead of hanging.
-    const WAIT_TRIES: u32 = 120;
+const WAIT_TRIES: u32 = 120;
 
-    let pid = std::process::id();
-    let script = installer.with_file_name("v1-update.cmd");
-    let body = format!(
+/// The detached script that waits for this process to exit, installs silently, and starts the
+/// updated copy with [`UPDATED_FLAG`]. On any abort it also removes the handoff marker so a failed
+/// install cannot lock the app out.
+#[cfg(windows)]
+fn update_script(pid: u32, installer: &Path, install_dir: &Path, handoff: &Path) -> String {
+    format!(
         "@echo off\r\n\
          set /a tries=0\r\n\
          :wait\r\n\
@@ -213,13 +269,35 @@ fn restart_into_update(installer: &Path, install_dir: &Path) -> std::io::Result<
          goto wait\r\n\
          :install\r\n\
          \"{installer}\" /S /D={dir}\r\n\
-         start \"\" \"{dir}\\v1.exe\"\r\n\
+         if errorlevel 1 goto abort\r\n\
+         start \"\" \"{dir}\\v1.exe\" {updated}\r\n\
+         goto cleanup\r\n\
          :abort\r\n\
+         del \"{handoff}\" >nul 2>&1\r\n\
+         :cleanup\r\n\
          del \"{installer}\" >nul 2>&1\r\n\
          (goto) 2>nul & del \"%~f0\"\r\n",
         installer = installer.display(),
         dir = install_dir.display(),
-    );
+        handoff = handoff.display(),
+        updated = UPDATED_FLAG,
+    )
+}
+
+/// Writes a script that waits for this process to exit, runs the installer silently into
+/// `install_dir`, and starts the app again. The script runs detached, so it outlives this process.
+#[cfg(windows)]
+fn restart_into_update(installer: &Path, install_dir: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW gives the script and the tools it runs a hidden console. Do not add
+    // DETACHED_PROCESS: Windows then ignores CREATE_NO_WINDOW, every tool gets a visible window,
+    // and the tasklist check stops seeing its output, so the installer could run over a live app.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    let pid = std::process::id();
+    let script = installer.with_file_name("v1-update.cmd");
+    let body = update_script(pid, installer, install_dir, &handoff_path());
     std::fs::write(&script, body)?;
     std::process::Command::new("cmd")
         .arg("/C")
@@ -289,5 +367,41 @@ mod tests {
         assert_eq!(expected_hash(&sums, "V1-Setup-0.2.0.exe"), Some(hash));
         assert_eq!(expected_hash(&sums, "missing.exe"), None);
         assert_eq!(expected_hash("short  V1-Setup-0.2.0.exe", "V1-Setup-0.2.0.exe"), None);
+    }
+
+    #[test]
+    fn update_handoff_expires_after_its_ttl() {
+        let now = 1_700_000_000;
+        let text = format!("0.1.7\n{now}\n");
+        assert!(handoff_pending(&text, now));
+        assert!(handoff_pending(&text, now + HANDOFF_TTL.as_secs()));
+        assert!(!handoff_pending(&text, now + HANDOFF_TTL.as_secs() + 1));
+        // A clock that moved backwards must not make a live handoff look stale.
+        assert!(handoff_pending(&text, now - 10));
+    }
+
+    #[test]
+    fn malformed_update_handoffs_do_not_block_startup() {
+        let now = 1_700_000_000;
+        assert!(!handoff_pending("", now));
+        assert!(!handoff_pending("0.1.7", now));
+        assert!(!handoff_pending("nightly\n1700000000\n", now));
+        assert!(!handoff_pending("0.1.7\nnot-a-time\n", now));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_update_script_claims_the_handoff_and_clears_it_on_abort() {
+        let script = update_script(
+            42,
+            Path::new(r"C:\Temp\V1-Setup-0.1.7.exe"),
+            Path::new(r"C:\Apps\V1"),
+            Path::new(r"C:\Data\update-in-progress"),
+        );
+        assert!(script.contains(r#"tasklist /FI "PID eq 42""#));
+        assert!(script.contains(r#""C:\Temp\V1-Setup-0.1.7.exe" /S /D=C:\Apps\V1"#));
+        assert!(script.contains(r#"if errorlevel 1 goto abort"#));
+        assert!(script.contains(r#"start "" "C:\Apps\V1\v1.exe" --updated"#));
+        assert!(script.contains(r#"del "C:\Data\update-in-progress" >nul 2>&1"#));
     }
 }
