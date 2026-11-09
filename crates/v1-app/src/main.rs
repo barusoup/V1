@@ -581,6 +581,9 @@ impl Host {
         if hidden {
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.release_scene_resources();
+                // The UI's upload buffers and glass backdrop textures go back too; the next
+                // visible frame makes what it needs again.
+                renderer.trim_memory();
             }
             self.trim_memory("hidden");
             self.memory = dream::memory::IdleTrim::new();
@@ -714,6 +717,9 @@ impl Host {
             event_loop.exit();
             return;
         };
+        // Frames are composed straight into the swapchain unless capture is on, and a shot reads
+        // the frame back, so keep them.
+        renderer.set_frame_capture(true);
         let (physical_w, physical_h) = renderer.display_size();
         let width = physical_w as f32 / scale;
         let height = physical_h as f32 / scale;

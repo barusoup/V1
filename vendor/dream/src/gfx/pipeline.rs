@@ -75,9 +75,20 @@ pub(super) fn attachment(
     load: vk::AttachmentLoadOp,
     clear: [f32; 4],
 ) -> vk::RenderingAttachmentInfo<'static> {
+    attachment_in(view, vk::ImageLayout::GENERAL, load, clear)
+}
+
+/// [`attachment`] for an image held in `layout` (the swapchain image in
+/// direct composition is `COLOR_ATTACHMENT_OPTIMAL`).
+pub(super) fn attachment_in(
+    view: vk::ImageView,
+    layout: vk::ImageLayout,
+    load: vk::AttachmentLoadOp,
+    clear: [f32; 4],
+) -> vk::RenderingAttachmentInfo<'static> {
     vk::RenderingAttachmentInfo::default()
         .image_view(view)
-        .image_layout(vk::ImageLayout::GENERAL)
+        .image_layout(layout)
         .load_op(load)
         .store_op(vk::AttachmentStoreOp::STORE)
         .clear_value(vk::ClearValue {
@@ -420,6 +431,34 @@ pub(super) fn display_format(
     }
 }
 
+/// Whether a frame can be composed straight into the swapchain image: the
+/// blit writes it, the UI draws over it and no present pass runs. That needs
+/// nothing the composed display image provides — no crosshair (the present
+/// pass draws it), no CPU capture (reads the display image), and no format
+/// change (the display image would hold different bytes than the swapchain).
+pub(super) fn composes_direct(
+    show_crosshair: bool,
+    frame_capture: bool,
+    swapchain: vk::Format,
+    blend: crate::ui::render::UiBlend,
+) -> bool {
+    !show_crosshair && !frame_capture && display_format(swapchain, blend) == swapchain
+}
+
+/// The present pass' fragment entry. Only a gamma-blended display image in
+/// an sRGB swapchain holds encoded values that must be decoded before the
+/// swapchain re-encodes them; a UNORM swapchain already stores them as-is.
+pub(super) fn present_fragment_entry(
+    blend: crate::ui::render::UiBlend,
+    swapchain: vk::Format,
+) -> &'static std::ffi::CStr {
+    if blend == crate::ui::render::UiBlend::Gamma && vulkan::is_srgb(swapchain) {
+        c"fs_gamma"
+    } else {
+        c"fs_main"
+    }
+}
+
 /// The composed display image: swapchain format, screen-row order.
 pub(super) fn build_display(
     ctx: &Arc<GpuContext>,
@@ -532,6 +571,58 @@ mod tests {
         assert_eq!(
             map_surface_error(vk::Result::ERROR_UNKNOWN),
             SurfaceError::Other
+        );
+    }
+
+    use crate::ui::render::UiBlend;
+
+    #[test]
+    fn composition_direct_only_without_crosshair_or_capture() {
+        let srgb = vk::Format::B8G8R8A8_SRGB;
+        assert!(composes_direct(false, false, srgb, UiBlend::Linear));
+        assert!(!composes_direct(true, false, srgb, UiBlend::Linear));
+        assert!(!composes_direct(false, true, srgb, UiBlend::Linear));
+        assert!(!composes_direct(true, true, srgb, UiBlend::Linear));
+    }
+
+    #[test]
+    fn composition_direct_gamma_needs_unorm_swapchain() {
+        // An sRGB swapchain under the gamma blend needs the UNORM display
+        // image plus a decoding present pass: not direct.
+        assert!(!composes_direct(
+            false,
+            false,
+            vk::Format::B8G8R8A8_SRGB,
+            UiBlend::Gamma
+        ));
+        // A UNORM swapchain already holds the encoded values: direct.
+        assert!(composes_direct(
+            false,
+            false,
+            vk::Format::B8G8R8A8_UNORM,
+            UiBlend::Gamma
+        ));
+        assert!(composes_direct(
+            false,
+            false,
+            vk::Format::R8G8B8A8_UNORM,
+            UiBlend::Gamma
+        ));
+    }
+
+    #[test]
+    fn composition_present_entry_decodes_only_gamma_into_srgb() {
+        assert_eq!(
+            present_fragment_entry(UiBlend::Gamma, vk::Format::B8G8R8A8_SRGB),
+            c"fs_gamma"
+        );
+        assert_eq!(
+            present_fragment_entry(UiBlend::Gamma, vk::Format::B8G8R8A8_UNORM),
+            c"fs_main"
+        );
+        assert_eq!(
+            present_fragment_entry(UiBlend::Linear, vk::Format::B8G8R8A8_SRGB),
+            c"fs_main"
         );
     }
 }

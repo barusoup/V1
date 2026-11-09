@@ -313,6 +313,19 @@ impl Mixer {
             .count()
     }
 
+    /// True when [`Self::mix_into`] would add nothing: no voice is playing or
+    /// fading out. A running fade-out counts as sound, so its tail is never
+    /// cut short; paused voices produce nothing and do not count. Cheap
+    /// enough for the audio callback to ask before mixing.
+    pub fn is_silent(&self) -> bool {
+        !self.voices.iter().any(|voice| {
+            matches!(
+                voice.state,
+                VoiceState::Playing | VoiceState::Stopping { .. }
+            )
+        })
+    }
+
     pub fn stolen_voices(&self) -> u64 {
         self.stolen
     }
@@ -695,6 +708,22 @@ mod tests {
             out[0],
             out[40]
         );
+    }
+
+    #[test]
+    fn is_silent_keeps_fading_voices_audible() {
+        let mut m = mixer();
+        assert!(m.is_silent(), "empty mixer is silent");
+        let handle = m.play(clip(48_000, 48_000, 1.0), PlayParams::default());
+        assert!(!m.is_silent(), "playing voice is audible");
+        m.stop(handle, Some(0.01)); // 480 frames of fade
+        let mut out = vec![0.0; 64 * 2];
+        m.mix_into(&mut out);
+        assert!(!m.is_silent(), "fade tail still audible mid-ramp");
+        assert_eq!(m.active_voices(), 1);
+        let mut out = vec![0.0; 1024 * 2];
+        m.mix_into(&mut out);
+        assert!(m.is_silent(), "silent once the fade has finished");
     }
 
     #[test]

@@ -4,11 +4,12 @@
 
 use super::Ui;
 use super::headless;
+use super::paint as wpaint;
 use crate::ui::font::FontId;
 use crate::ui::icons::Icon;
 use crate::ui::layout::Style;
 use crate::ui::tokens::{ControlSize, TypeRole};
-use crate::ui::view::{Intrinsic, MeasureCx, PaintOp, Widget};
+use crate::ui::view::{Intrinsic, MeasureCx, PaintOp, ShapeOp, Widget};
 use crate::ui::widgets::Response;
 use crate::ui::{Color, Rect};
 
@@ -492,6 +493,221 @@ impl Widget for Progress {
     }
     fn layout_style(&self) -> Style {
         Style::default().fill_w()
+    }
+}
+
+/// A geometric leaf: a rectangle, rounded rectangle, pill, circle, ring or
+/// arc with an exact size. Use it for dots, avatars, progress rings and
+/// status chips instead of a container with a magic radius.
+///
+/// ```ignore
+/// ui.add(Shape::circle(24.0).fill(status_green));                // status dot
+/// ui.add(Shape::ring(32.0, 3.0));                                // accent ring
+/// ui.add(Shape::arc(32.0, 3.0, -FRAC_PI_2, 0.75 * TAU));         // progress ring
+/// ui.add(Shape::pill(64.0, 20.0).fill(chip_bg));                 // chip background
+/// ```
+///
+/// Sizing:
+/// - The size is fixed (`size_px`), so a row or column never stretches it on
+///   the cross axis. That stretch is the usual reason a sized box in a row
+///   turns into a pill.
+/// - Circle, ring and arc paint the largest centred square of their solved
+///   box, so they stay round even if a style gives the box another aspect.
+/// - Overriding one axis with [`Ui::add_styled`] keeps the other axis from the
+///   constructor. The circle is then the shorter side, centred in the box.
+///
+/// Colours: with neither [`fill`](Self::fill) nor [`stroke`](Self::stroke) set,
+/// the shape is filled with the theme accent. A ring or arc is painted in its
+/// fill colour (or the accent), and [`stroke`](Self::stroke) sets its
+/// thickness and colour. The shape has no behaviour, so it never responds to
+/// input.
+#[derive(Clone, Copy, Debug)]
+pub struct Shape {
+    kind: ShapeKind,
+    w: f32,
+    h: f32,
+    radius: f32,
+    fill: Option<Color>,
+    stroke: Option<(f32, Color)>,
+}
+
+/// What a [`Shape`] draws. Ring and arc keep their band thickness here.
+#[derive(Clone, Copy, Debug)]
+enum ShapeKind {
+    /// Rectangle, rounded rectangle or pill; corner radius in `Shape::radius`.
+    Box,
+    /// Disc, or a bordered disc when given a stroke but no fill.
+    Circle,
+    /// Circular band `thickness` wide, running inward from the edge.
+    Ring { thickness: f32 },
+    /// A band of `thickness` swept from `start` by `sweep` radians.
+    Arc {
+        thickness: f32,
+        start: f32,
+        sweep: f32,
+    },
+}
+
+impl Shape {
+    fn sized(kind: ShapeKind, w: f32, h: f32, radius: f32) -> Self {
+        Self {
+            kind,
+            w: w.max(0.0),
+            h: h.max(0.0),
+            radius,
+            fill: None,
+            stroke: None,
+        }
+    }
+
+    /// A disc of `diameter`: `Shape::circle(24.0)`. Always round.
+    pub fn circle(diameter: f32) -> Self {
+        Self::sized(ShapeKind::Circle, diameter, diameter, diameter * 0.5)
+    }
+
+    /// A sharp rectangle: `Shape::rect(120.0, 8.0)`.
+    pub fn rect(w: f32, h: f32) -> Self {
+        Self::sized(ShapeKind::Box, w, h, 0.0)
+    }
+
+    /// A rectangle with corner `radius`: `Shape::rounded(120.0, 40.0, 8.0)`.
+    /// The radius is clamped to half the short side when painted.
+    pub fn rounded(w: f32, h: f32, radius: f32) -> Self {
+        Self::sized(ShapeKind::Box, w, h, radius)
+    }
+
+    /// A stadium whose ends are half circles: `Shape::pill(64.0, 20.0)`.
+    /// [`radius`](Self::radius) can still override its corners.
+    pub fn pill(w: f32, h: f32) -> Self {
+        Self::sized(ShapeKind::Box, w, h, w.min(h) * 0.5)
+    }
+
+    /// A circular outline `diameter` across, `thickness` wide:
+    /// `Shape::ring(32.0, 3.0)`. Painted in the fill colour, or the accent.
+    pub fn ring(diameter: f32, thickness: f32) -> Self {
+        Self::sized(
+            ShapeKind::Ring {
+                thickness: thickness.max(0.0),
+            },
+            diameter,
+            diameter,
+            diameter * 0.5,
+        )
+    }
+
+    /// A band of an outlined circle, from `start` sweeping `sweep` radians
+    /// clockwise on screen. Angles match [`crate::ui::draw::DrawList::ring_arc`]:
+    /// `0` is `+x` and `-FRAC_PI_2` is the top, so
+    /// `Shape::arc(32.0, 3.0, -FRAC_PI_2, progress * TAU)` is a progress ring.
+    pub fn arc(diameter: f32, thickness: f32, start: f32, sweep: f32) -> Self {
+        Self::sized(
+            ShapeKind::Arc {
+                thickness: thickness.max(0.0),
+                start,
+                sweep,
+            },
+            diameter,
+            diameter,
+            diameter * 0.5,
+        )
+    }
+
+    /// Fill colour: `shape.fill(Color::WHITE)`. For a ring or arc this is the
+    /// band colour.
+    pub fn fill(mut self, c: Color) -> Self {
+        self.fill = Some(c);
+        self
+    }
+
+    /// Border of `width` drawn inside the edge, like CSS `border`:
+    /// `Shape::circle(24.0).fill(bg).stroke(2.0, ring_color)`. For a ring or
+    /// arc, `width` is the band thickness and `c` its colour.
+    pub fn stroke(mut self, width: f32, c: Color) -> Self {
+        match &mut self.kind {
+            ShapeKind::Ring { thickness } | ShapeKind::Arc { thickness, .. } => {
+                *thickness = width.max(0.0);
+                self.fill = Some(c);
+            }
+            ShapeKind::Box | ShapeKind::Circle => self.stroke = Some((width.max(0.0), c)),
+        }
+        self
+    }
+
+    /// Corner radius of a rectangle or pill: `Shape::rect(w, h).radius(6.0)`.
+    /// Ignored by circle, ring and arc, which are always round.
+    pub fn radius(mut self, r: f32) -> Self {
+        if let ShapeKind::Box = self.kind {
+            self.radius = r;
+        }
+        self
+    }
+
+    /// Resolve the colours against the theme accent into paint data.
+    fn resolve(&self, accent: Color) -> ShapeOp {
+        match self.kind {
+            ShapeKind::Box | ShapeKind::Circle => {
+                let fill = match (self.fill, self.stroke) {
+                    (None, None) => Some(accent),
+                    (fill, _) => fill,
+                };
+                ShapeOp {
+                    round: matches!(self.kind, ShapeKind::Circle),
+                    radius: self.radius,
+                    fill,
+                    stroke: self.stroke.filter(|s| s.0 > 0.0),
+                    arc: None,
+                }
+            }
+            ShapeKind::Ring { thickness } => ShapeOp {
+                round: true,
+                radius: self.radius,
+                fill: None,
+                stroke: band(thickness, self.fill.unwrap_or(accent)),
+                arc: None,
+            },
+            ShapeKind::Arc {
+                thickness,
+                start,
+                sweep,
+            } => ShapeOp {
+                round: true,
+                radius: self.radius,
+                fill: None,
+                stroke: band(thickness, self.fill.unwrap_or(accent)),
+                arc: Some((start, sweep)),
+            },
+        }
+    }
+}
+
+/// A ring or arc band, or nothing when it has no thickness.
+fn band(thickness: f32, c: Color) -> Option<(f32, Color)> {
+    (thickness > 0.0).then_some((thickness, c))
+}
+
+impl Widget for Shape {
+    fn measure(&self, _cx: &mut MeasureCx<'_>) -> Intrinsic {
+        Intrinsic {
+            w: self.w,
+            h: self.h,
+            baseline: None,
+            wrap: None,
+        }
+    }
+    fn ui(self, ui: &mut Ui, rect: Rect) -> Response {
+        let op = self.resolve(ui.theme().accent);
+        wpaint::shape(ui, rect, &op);
+        Response::plain(rect, ui, u64::MAX, false)
+    }
+    fn interact(self, ui: &mut Ui, _rect: Rect) -> (Response, PaintOp) {
+        let op = self.resolve(ui.theme().accent);
+        (
+            Response::plain(Rect::new(0.0, 0.0, 0.0, 0.0), ui, u64::MAX, false),
+            PaintOp(crate::ui::view::NodeOp::Shape(op)),
+        )
+    }
+    fn layout_style(&self) -> Style {
+        Style::default().size_px(self.w, self.h)
     }
 }
 

@@ -70,6 +70,10 @@ struct Item {
     stretchable: bool,
     /// Cross `Size::Fill`: fills the cross like stretch, still aligned.
     fill_cross: bool,
+    /// `Style::aspect` ratio (width / height) of an item whose cross size is
+    /// `Fit`: its cross size then follows its resolved main size through the
+    /// ratio instead of being stretched or measured on its own.
+    aspect: Option<f32>,
 }
 
 /// Lay out `id`'s (non-absolute) children inside `content`.
@@ -113,7 +117,15 @@ pub(super) fn layout_flex(tree: &mut LayoutTree, id: u32, content: Rect, host: &
             ST::Percent(p) if inner_cross.is_finite() => inner_cross * p / 100.0,
             _ => cross_of(dir, iw, ih),
         };
-        let stretchable = matches!(size_cross, ST::Fit | ST::Fill);
+        // An aspect-ratio item with an auto cross keeps its ratio-derived
+        // cross size rather than stretching to the line (CSS); `Fill` still
+        // fills.
+        let aspect = match (&size_cross, s.aspect_ratio) {
+            (ST::Fit, Some(r)) if r.is_finite() && r > 0.0 => Some(r),
+            _ => None,
+        };
+        let stretchable =
+            matches!(size_cross, ST::Fill) || (matches!(size_cross, ST::Fit) && aspect.is_none());
         items.push(Item {
             id: c,
             hypo: clamp(hypo, min_main(&s, dir), max_main(&s, dir)),
@@ -129,6 +141,7 @@ pub(super) fn layout_flex(tree: &mut LayoutTree, id: u32, content: Rect, host: &
             align: s.align_self.unwrap_or(style.align_items),
             stretchable,
             fill_cross: matches!(size_cross, ST::Fill),
+            aspect,
         });
         let last = items.len() - 1;
         items[last].main = items[last].hypo;
@@ -288,6 +301,20 @@ pub(super) fn layout_flex(tree: &mut LayoutTree, id: u32, content: Rect, host: &
                 let m = tree.measured(c, host, Some(w));
                 items[i].main = m.h;
                 items[i].hypo = m.h;
+            }
+        }
+
+        // Aspect items take their cross size from the main size they resolved
+        // to: width / ratio in a row, height * ratio in a column (clamped by
+        // the cross min/max like every other cross size).
+        for &i in line {
+            if let Some(r) = items[i].aspect {
+                let s = tree.node(items[i].id).style;
+                let cross = match dir {
+                    Direction::Row => items[i].main / r,
+                    Direction::Column => items[i].main * r,
+                };
+                items[i].cross = clamp(cross, min_cross(&s, dir), max_cross(&s, dir));
             }
         }
 

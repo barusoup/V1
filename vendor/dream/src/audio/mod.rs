@@ -150,15 +150,18 @@ impl Audio {
 
         let mixer = Arc::new(Mutex::new(Mixer::new(sample_rate)));
         let stream_mixer = Arc::clone(&mixer);
+        // Owned by the callback: grows to the largest period seen, then is
+        // reused, so the real-time thread does not allocate per callback.
+        let mut scratch: Vec<f32> = Vec::new();
         let stream = match sample_format {
             cpal::SampleFormat::F32 => build_stream(&device, &config, move |out| {
-                fill::<f32>(out, channels, &stream_mixer)
+                fill::<f32>(out, channels, &stream_mixer, &mut scratch)
             }),
             cpal::SampleFormat::I16 => build_stream(&device, &config, move |out| {
-                fill::<i16>(out, channels, &stream_mixer)
+                fill::<i16>(out, channels, &stream_mixer, &mut scratch)
             }),
             cpal::SampleFormat::U16 => build_stream(&device, &config, move |out| {
-                fill::<u16>(out, channels, &stream_mixer)
+                fill::<u16>(out, channels, &stream_mixer, &mut scratch)
             }),
             format => return Err(format!("unsupported output sample format {format:?}")),
         }?;
@@ -239,21 +242,45 @@ where
 }
 
 /// Convert mixed f32 stereo into the device's buffer shape.
-fn fill<T>(out: &mut [T], channels: usize, mixer: &Arc<Mutex<Mixer>>)
+///
+/// `scratch` is the callback's reusable stereo buffer: it grows when a
+/// larger period arrives and is never shrunk. When the mixer has nothing
+/// audible, the output is written as silence and the mix is skipped.
+fn fill<T>(out: &mut [T], channels: usize, mixer: &Arc<Mutex<Mixer>>, scratch: &mut Vec<f32>)
 where
     f32: cpal::FromSample<T> + cpal::SizedSample,
     T: cpal::Sample + cpal::FromSample<f32>,
 {
-    let frames = out.len() / channels.max(1);
-    let mut scratch = vec![0.0f32; frames * 2];
-    mixer.lock().unwrap().mix_into(&mut scratch);
+    let channels = channels.max(1);
+    let frames = out.len() / channels;
+    let needed = frames * 2;
+    let audible = {
+        let mut mixer = mixer.lock().unwrap();
+        if mixer.is_silent() {
+            false
+        } else {
+            if scratch.len() < needed {
+                scratch.resize(needed, 0.0);
+            }
+            let mixed = &mut scratch[..needed];
+            // mix_into is additive, so the reused buffer must start clear.
+            mixed.fill(0.0);
+            mixer.mix_into(mixed);
+            true
+        }
+    };
+    if !audible {
+        out.fill(T::EQUILIBRIUM);
+        return;
+    }
+    let mixed = &scratch[..needed];
     for (frame, chunk) in out.chunks_mut(channels).enumerate() {
         for (channel, sample) in chunk.iter_mut().enumerate() {
             let value = match channel {
-                0 => scratch[frame * 2],
-                1 => scratch[frame * 2 + 1],
+                0 => mixed[frame * 2],
+                1 => mixed[frame * 2 + 1],
                 // Extra device channels get the left signal (harmless downmix).
-                _ => scratch[frame * 2],
+                _ => mixed[frame * 2],
             };
             *sample = T::from_sample(value.clamp(-1.0, 1.0));
         }
@@ -327,10 +354,57 @@ mod tests {
             PlayParams::default(),
         );
         let mut out = vec![0.0f32; 8];
-        fill::<f32>(&mut out, 2, &mixer);
+        let mut scratch = Vec::new();
+        fill::<f32>(&mut out, 2, &mixer, &mut scratch);
         assert!(
             out.iter().all(|s| (-1.0..=1.0).contains(s)),
             "clamped: {out:?}"
         );
+    }
+
+    #[test]
+    fn silent_mixer_fills_zeros() {
+        let mixer = Arc::new(Mutex::new(Mixer::new(48_000)));
+        // Pre-dirty the output: silence must overwrite it, not leave it.
+        let mut out = vec![0.5f32; 64];
+        let mut scratch = Vec::new();
+        fill::<f32>(&mut out, 2, &mixer, &mut scratch);
+        assert!(out.iter().all(|s| *s == 0.0), "silent output: {out:?}");
+        assert!(scratch.is_empty(), "silent path skips the mix buffer");
+
+        // A paused voice produces nothing and must not force a mix either.
+        let handle = mixer.lock().unwrap().play(
+            Arc::new(AudioData {
+                samples: vec![0.5; 256],
+                sample_rate: 48_000,
+                duration: 128.0 / 48_000.0,
+            }),
+            PlayParams::default(),
+        );
+        mixer.lock().unwrap().pause(handle);
+        fill::<f32>(&mut out, 2, &mixer, &mut scratch);
+        assert!(out.iter().all(|s| *s == 0.0), "paused voice is silent");
+        assert!(scratch.is_empty());
+    }
+
+    #[test]
+    fn audible_mixer_reuses_scratch_without_shrinking() {
+        let mixer = Arc::new(Mutex::new(Mixer::new(48_000)));
+        mixer.lock().unwrap().play(
+            Arc::new(AudioData {
+                samples: vec![0.25; 2048],
+                sample_rate: 48_000,
+                duration: 1024.0 / 48_000.0,
+            }),
+            PlayParams::default(),
+        );
+        let mut scratch = Vec::new();
+        let mut big = vec![0.0f32; 512];
+        fill::<f32>(&mut big, 2, &mixer, &mut scratch);
+        assert_eq!(scratch.len(), 512);
+        let mut small = vec![0.0f32; 64];
+        fill::<f32>(&mut small, 2, &mixer, &mut scratch);
+        assert_eq!(scratch.len(), 512, "a smaller period never shrinks it");
+        assert!(small.iter().any(|s| *s != 0.0), "still audible");
     }
 }

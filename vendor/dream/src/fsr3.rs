@@ -6,9 +6,8 @@
 //! `fsr3_common.wgsl` for the porting notes and deviations.
 //!
 //! Pass order matches `ffx_fsr3upscaler.cpp`:
-//!   prepare inputs -> farthest-depth mip -> shading-change pyramid ->
-//!   shading change -> prepare reactivity -> luma instability -> accumulate ->
-//!   RCAS.
+//!   prepare inputs -> shading-change pyramid -> shading change ->
+//!   prepare reactivity -> luma instability -> accumulate -> RCAS.
 //!
 //! The single-pass downsampler is replaced by a plain 2x2 box pyramid (its
 //! reduction is the same box average) and auto exposure is not used: this
@@ -107,7 +106,6 @@ struct Pipelines {
     shading_change: vk::Pipeline,
     downsample_mip1: vk::Pipeline,
     downsample_mip2: vk::Pipeline,
-    downsample_farthest: vk::Pipeline,
     shading_change_pass: vk::Pipeline,
     prepare_reactivity: vk::Pipeline,
     luma_instability: vk::Pipeline,
@@ -230,7 +228,6 @@ impl Fsr3 {
             shading_change,
             downsample_mip1,
             downsample_mip2,
-            downsample_farthest,
             shading_change_pass,
             prepare_reactivity,
             luma_instability,
@@ -243,7 +240,6 @@ impl Fsr3 {
                 (m_shading, c"main"),
                 (m_downsample, c"downsample_mip1"),
                 (m_downsample, c"downsample_mip2"),
-                (m_downsample, c"downsample_farthest"),
                 (m_shading_pass, c"main"),
                 (m_reactivity, c"main"),
                 (m_instability, c"main"),
@@ -257,7 +253,6 @@ impl Fsr3 {
             shading_change,
             downsample_mip1,
             downsample_mip2,
-            downsample_farthest,
             shading_change_pass,
             prepare_reactivity,
             luma_instability,
@@ -486,7 +481,6 @@ impl Fsr3 {
             sampled(self.targets.internal_upscaled_color[read].view),
             sampled(self.targets.new_locks.view),
             sampled(self.targets.internal_upscaled_color[write].view), // 28 rcas input
-            sampled(self.targets.farthest_depth.view),                 // 60 downsample src depth
         ];
         let write_info = [
             sampled(self.targets.dilated_motion_vectors.view),
@@ -561,7 +555,23 @@ impl Fsr3 {
         let groups = |w: u32, h: u32| (w.div_ceil(8), h.div_ceil(8));
 
         // Reconstructed depth is a min-accumulator: start it at +infinity.
+        // The buffer is shared by every frame slot, so the fill must wait
+        // for the previous frame's shader reads of it. A barrier's first
+        // scope covers all earlier commands on the queue, earlier
+        // submissions included, so this orders it without per-slot copies.
         unsafe {
+            let after_reads = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[after_reads],
+                &[],
+                &[],
+            );
             device.cmd_fill_buffer(
                 cmd,
                 self.reconstructed.buffer,
@@ -642,11 +652,6 @@ impl Fsr3 {
         }
         pass(self.pipelines.prepare_inputs, rw, rh);
         pass(
-            self.pipelines.downsample_farthest,
-            rw.div_ceil(2),
-            rh.div_ceil(2),
-        );
-        pass(
             self.pipelines.shading_change,
             rw.div_ceil(2),
             rh.div_ceil(2),
@@ -685,7 +690,6 @@ impl Drop for Fsr3 {
                 self.pipelines.shading_change,
                 self.pipelines.downsample_mip1,
                 self.pipelines.downsample_mip2,
-                self.pipelines.downsample_farthest,
                 self.pipelines.shading_change_pass,
                 self.pipelines.prepare_reactivity,
                 self.pipelines.luma_instability,

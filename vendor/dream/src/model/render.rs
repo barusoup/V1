@@ -336,6 +336,13 @@ impl ModelRenderer {
             unsafe { ctx.device().create_pipeline_layout(&info, None) }
                 .expect("model pipeline layout")
         };
+        // A pipeline layout does not keep its set layouts alive, and nothing
+        // else uses the camera set layout: destroy it here, or it leaks past
+        // vkDestroyDevice (VUID-vkDestroyDevice-device-05137).
+        unsafe {
+            ctx.device()
+                .destroy_descriptor_set_layout(camera_layout, None)
+        };
 
         let shader = ctx.compile_shader(include_str!("model.wgsl"), "model");
         let pipeline_static = create_model_pipeline(
@@ -405,9 +412,13 @@ impl ModelRenderer {
                 .min_storage_buffer_offset_alignment
                 .max(16)
         };
+        // Every joint/draw ring is bound as STORAGE_BUFFER_DYNAMIC, so it must
+        // be created with STORAGE_BUFFER usage (VUID-VkWriteDescriptorSet-descriptorType-00331).
+        // `create_host_buffer` is UNIFORM-only, so all ring (re)allocations use
+        // `create_host_storage_buffer`.
         let rings = (0..ctx.max_frames_in_flight())
             .map(|_| JointRing {
-                buffer: ctx.create_host_buffer("model joint ring", 256 * 1024),
+                buffer: ctx.create_host_storage_buffer("model joint ring", 256 * 1024),
                 capacity: 256 * 1024,
                 used: 0,
                 retired: Vec::new(),
@@ -533,9 +544,10 @@ impl ModelRenderer {
                 let ring = &mut self.rings[ring_index];
                 let offset = align_up(ring.used, self.joint_align);
                 if offset + block_size as u64 > ring.capacity {
-                    let grown = self
-                        .ctx
-                        .create_host_buffer("model joint ring", (offset + block_size as u64) * 2);
+                    let grown = self.ctx.create_host_storage_buffer(
+                        "model joint ring",
+                        (offset + block_size as u64) * 2,
+                    );
                     // Keep the old buffer: draws already recorded this frame
                     // still reference it. Freed when the slot recycles.
                     ring.retired
@@ -716,7 +728,7 @@ impl ModelRenderer {
                 if offset + block_size > ring.capacity {
                     let grown = self
                         .ctx
-                        .create_host_buffer("model joint ring", (offset + block_size) * 2);
+                        .create_host_storage_buffer("model joint ring", (offset + block_size) * 2);
                     ring.retired
                         .push(std::mem::replace(&mut ring.buffer, grown));
                     ring.capacity = (offset + block_size) * 2;

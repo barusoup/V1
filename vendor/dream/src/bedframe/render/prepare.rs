@@ -201,6 +201,7 @@ fn same_texture(a: &CmdTexture, b: &CmdTexture) -> bool {
         (CmdTexture::White, CmdTexture::White) => true,
         (CmdTexture::AtlasPage(p), CmdTexture::AtlasPage(q)) => p == q,
         (CmdTexture::Custom(t), CmdTexture::Custom(u)) => std::sync::Arc::ptr_eq(t, u),
+        (CmdTexture::Backdrop, CmdTexture::Backdrop) => true,
         _ => false,
     }
 }

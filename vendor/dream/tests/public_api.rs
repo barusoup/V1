@@ -259,3 +259,79 @@ fn font_static_loading_paths_are_public() {
     let _: fn(&'static str, &'static [u8]) -> Result<dream::ui::font::Font, String> =
         dream::ui::font::Font::from_static;
 }
+
+#[test]
+fn presentation_and_capture_paths_are_public() {
+    use dream::gfx::{PresentMode, Renderer};
+    let _ = size_of::<PresentMode>();
+    let _ = dream::gfx::vulkan::SwapchainOptions::default();
+    let _: dream::gfx::vulkan::PresentMode = PresentMode::Mailbox;
+    let _: fn(&mut Renderer, PresentMode) = Renderer::set_present_mode;
+    let _: fn(&Renderer) -> PresentMode = Renderer::present_mode;
+    let _: fn(&mut Renderer, bool) = Renderer::set_frame_capture;
+    let _: fn(&Renderer) -> bool = Renderer::frame_capture;
+    let _: fn(&mut Renderer) = Renderer::trim_memory;
+    let _: fn(
+        &Arc<GpuContext>,
+        u32,
+        u32,
+        ash::vk::SwapchainKHR,
+        dream::gfx::vulkan::SwapchainOptions,
+    ) -> Swapchain = Swapchain::new_with;
+}
+
+#[test]
+fn shape_and_radius_full_paths_are_public() {
+    use dream::bedframe::view::Paint;
+    use dream::bedframe::widgets::adapters::Shape;
+    let _ = Shape::circle(24.0)
+        .fill(dream::ui::Color::WHITE)
+        .stroke(2.0, dream::ui::Color::BLACK);
+    let _ = Shape::rect(8.0, 8.0);
+    let _ = Shape::rounded(8.0, 8.0, 2.0);
+    let _ = Shape::pill(64.0, 20.0).radius(4.0);
+    let _ = Shape::ring(32.0, 3.0);
+    let _ = Shape::arc(32.0, 3.0, 0.0, 1.0);
+    let _: Paint = Paint::new().radius_full();
+}
+
+#[test]
+fn app_runner_paths_are_public() {
+    use dream::ui::app::{AppContext, AppOptions, RunError, ThemeMode, UiApp, run};
+    use dream::ui::widgets::Ui;
+
+    struct Noop;
+    impl UiApp for Noop {
+        fn view(&mut self, _ui: &mut Ui, _cx: &mut AppContext<'_>) {}
+    }
+    let _: fn(AppOptions, Noop) -> Result<(), RunError> = run::<Noop>;
+    let _ = |cx: &AppContext<'_>| -> dream::ui::app::AppWaker { cx.waker() };
+    let _: fn(&dream::ui::app::AppWaker) = dream::ui::app::AppWaker::wake;
+    fn assert_handle<T: Send + Sync + Clone>() {}
+    assert_handle::<dream::ui::app::AppWaker>();
+    let options = AppOptions::new("paths").size(320.0, 200.0);
+    assert_eq!(options.size, (320.0, 200.0));
+    assert!(matches!(options.theme, ThemeMode::System));
+    let theme = dream::ui::theme::Theme::light();
+    assert!(matches!(ThemeMode::Custom(theme), ThemeMode::Custom(_)));
+    assert_eq!(
+        RunError::EventLoop(String::from("boom")).to_string(),
+        "event loop error: boom"
+    );
+}
+
+#[test]
+fn backdrop_paths_are_public() {
+    use dream::ui::draw::{CmdTexture, DrawList};
+
+    let mut list = DrawList::new();
+    list.begin((64.0, 64.0));
+    list.backdrop_rounded(
+        dream::ui::Rect::new(4.0, 4.0, 24.0, 24.0),
+        dream::ui::Color::WHITE,
+        6.0,
+    );
+    let frame = list.finish((64.0, 64.0));
+    assert!(matches!(frame.cmds[0].texture, CmdTexture::Backdrop));
+    let _: fn(&mut DrawList, dream::ui::Rect, dream::ui::Color, f32) = DrawList::backdrop_rounded;
+}

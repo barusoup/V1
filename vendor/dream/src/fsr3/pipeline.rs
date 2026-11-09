@@ -20,14 +20,14 @@ pub(super) fn descriptor_bindings() -> Vec<vk::DescriptorSetLayoutBinding<'stati
     for i in 0..19u32 {
         add(image_binding(i), vk::DescriptorType::SAMPLED_IMAGE);
     }
-    add(60, vk::DescriptorType::SAMPLED_IMAGE); // downsample source depth
     add(30, vk::DescriptorType::STORAGE_BUFFER);
     add(31, vk::DescriptorType::STORAGE_BUFFER);
     for i in 0..16u32 {
         add(40 + i, vk::DescriptorType::STORAGE_IMAGE);
     }
-    add(63, vk::DescriptorType::STORAGE_IMAGE); // unused r16f downsample target
-    add(62, vk::DescriptorType::STORAGE_IMAGE); // unused rg16f downsample target
+    // Bindings 60-63 (the farthest-depth downsample pass) are gone: that pass
+    // had no consumer and its layout entries were never all written, so the
+    // layout now declares exactly the resources the remaining entry points use.
     bindings
 }
 

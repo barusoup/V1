@@ -217,6 +217,28 @@ pub struct ImpostorBaker {
     post: PostPipes,
 }
 
+/// Destroys the capture and post-bake pipelines and their layouts. Without
+/// this they leak past `vkDestroyDevice` (VUID-vkDestroyDevice-device-05137).
+impl Drop for ImpostorBaker {
+    fn drop(&mut self) {
+        unsafe {
+            let device = self.ctx.device();
+            // Bakes are blocking one-shot work, but a caller can still hold a
+            // submission that refers to these pipelines; idle first.
+            let _ = device.device_wait_idle();
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_descriptor_set_layout(self.material_dsl, None);
+            device.destroy_descriptor_set_layout(self.base_dsl, None);
+            for (pipeline, layout, dsl) in self.post.stages() {
+                device.destroy_pipeline(pipeline, None);
+                device.destroy_pipeline_layout(layout, None);
+                device.destroy_descriptor_set_layout(dsl, None);
+            }
+        }
+    }
+}
+
 impl ImpostorBaker {
     /// Bake the model into an [`ImpostorAsset`], or say why it cannot be one.
     /// This is the whole-model convenience wrapper: every mesh and material in
@@ -473,6 +495,18 @@ struct PostPipes {
     pack: vk::Pipeline,
     pack_layout: vk::PipelineLayout,
     pack_dsl: vk::DescriptorSetLayout,
+}
+
+impl PostPipes {
+    /// Every `(pipeline, layout, set layout)` triple, for teardown.
+    fn stages(&self) -> [(vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout); 4] {
+        [
+            (self.down, self.down_layout, self.down_dsl),
+            (self.dilate, self.dilate_layout, self.dilate_dsl),
+            (self.mip, self.mip_layout, self.mip_dsl),
+            (self.pack, self.pack_layout, self.pack_dsl),
+        ]
+    }
 }
 
 #[cfg(test)]

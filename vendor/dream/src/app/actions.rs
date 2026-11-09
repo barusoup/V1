@@ -29,12 +29,15 @@ impl App {
         self.captures += 1;
         let dir = std::path::Path::new("target/dream-app");
         if std::fs::create_dir_all(dir).is_ok() {
-            let path = dir.join(format!("capture-{}.png", self.captures));
-            // A failed capture has no notification surface any more, so it
-            // goes to stderr rather than being swallowed.
-            if let Err(err) = self.renderer.save_png(&path) {
-                eprintln!("[capture] failed to write {}: {err}", path.display());
+            // Frames are composed straight into the swapchain unless capture
+            // is on, so the screenshot is taken from the next presented frame
+            // (see `render`), which is retained for it.
+            if self.capture_restore.is_none() {
+                self.capture_restore = Some(self.renderer.frame_capture());
             }
+            self.renderer.set_frame_capture(true);
+            self.pending_captures
+                .push(dir.join(format!("capture-{}.png", self.captures)));
         }
         self.dirty = true;
     }

@@ -90,7 +90,11 @@ pub(crate) fn paint_tree(ui: &mut Ui, tree: &mut LayoutTree) {
                     ui.register_scroll_view(ui.view.node_ids[nid.0 as usize], rect);
                 }
                 if clipped {
-                    ui.draw.push_clip(rect);
+                    if matches!(tree.style(nid).overflow, Overflow::Scroll { .. }) {
+                        ui.draw.push_clip(rect);
+                    } else {
+                        push_padding_clip(ui, rect, &p);
+                    }
                 }
                 clip_stack.push((nid.0, clipped));
             }
@@ -223,6 +227,7 @@ fn paint_op(ui: &mut Ui, arena: &str, seg_items: &[super::SegItem], rect: Rect, 
         NodeOp::Separator { color, .. } => {
             ui.draw.rect(rect, color);
         }
+        NodeOp::Shape(op) => wpaint::shape(ui, rect, &op),
         NodeOp::Progress { fill, value } => {
             ui.progress(rect, value, fill);
         }
@@ -259,6 +264,35 @@ fn scroll_thumb(ui: &mut Ui, tree: &LayoutTree, node: NodeId) {
     ui.draw_scrollbar(wid, rect, offset, ch);
 }
 
+/// The border width a container actually paints with: a request for 1.0
+/// becomes one device pixel ([`hairline`](crate::ui::layout::hairline)),
+/// anything else is used as given. Painting and the padding-box clip both
+/// read it, so the children stop exactly where the border's inner edge is.
+fn effective_border(scale: f32, w: f32) -> f32 {
+    if w == 1.0 {
+        crate::ui::layout::hairline(scale)
+    } else {
+        w
+    }
+}
+
+/// Clip a container's children to its padding box (the rect inside its
+/// border). A rounded container also clips them to its inner corner: the
+/// outer radius less the border width, so the children follow the border's
+/// inner curve instead of poking out over it.
+fn push_padding_clip(ui: &mut Ui, rect: Rect, p: &Paint) {
+    let bw = p
+        .border
+        .map_or(0.0, |(w, _)| effective_border(ui.scale(), w));
+    let inner = rect.inset_xy(bw, bw);
+    let radius = (p.radius - bw).max(0.0);
+    if radius > 0.0 {
+        ui.draw.push_clip_rounded(inner, radius);
+    } else {
+        ui.draw.push_clip(inner);
+    }
+}
+
 /// Paint container chrome (called when a container opens).
 fn paint_container(ui: &mut Ui, rect: Rect, p: &Paint) {
     if p.elevation != Elevation::Flat {
@@ -266,15 +300,12 @@ fn paint_container(ui: &mut Ui, rect: Rect, p: &Paint) {
     }
     match (p.bg, p.border) {
         (Some(bg), Some((w, c))) => {
-            let w = if w == 1.0 {
-                crate::ui::layout::hairline(ui.scale())
-            } else {
-                w
-            };
+            let w = effective_border(ui.scale(), w);
             ui.draw.rounded_frame(rect, p.radius, w, bg, c);
         }
         (Some(bg), None) => ui.draw.round_rect(rect, p.radius, bg),
         (None, Some((w, c))) => {
+            let w = effective_border(ui.scale(), w);
             ui.draw.round_ring(rect, p.radius, w, c);
         }
         (None, None) => {}

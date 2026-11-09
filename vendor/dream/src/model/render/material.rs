@@ -306,9 +306,10 @@ impl PbrState {
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(144);
+        let camera_layout = scene_set_layout(ctx);
         let layout = {
             let set_layouts = [
-                scene_set_layout(ctx),
+                camera_layout,
                 dsl_joints,
                 dsl_material,
                 lighting.set_layout(),
@@ -322,6 +323,12 @@ impl PbrState {
                 )
             }
             .expect("pbr pipeline layout")
+        };
+        // Consumed by the pipeline layout above and not kept: destroy it so it
+        // does not leak past vkDestroyDevice (VUID-vkDestroyDevice-device-05137).
+        unsafe {
+            ctx.device()
+                .destroy_descriptor_set_layout(camera_layout, None)
         };
         let shader = ctx.compile_shader(
             &format!(

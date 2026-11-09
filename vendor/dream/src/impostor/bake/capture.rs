@@ -421,8 +421,11 @@ impl ImpostorBaker {
             .collect();
 
         ctx.one_shot(|cmd| unsafe {
+            // The colour targets are `VIEW_COUNT`-layer arrays. The barrier must
+            // cover every layer: a layer left UNDEFINED is read by the bake-post
+            // dispatch as GENERAL (VUID-vkCmdDraw-None-09600 / vkCmdBeginRendering-09592).
             for image in images.iter().map(|i| i.image) {
-                vulkan::image_barrier(
+                vulkan::image_barrier_full(
                     &device,
                     cmd,
                     image,
@@ -433,6 +436,8 @@ impl ImpostorBaker {
                     vk::AccessFlags::empty(),
                     vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
                     vk::ImageAspectFlags::COLOR,
+                    1,
+                    VIEW_COUNT as u32,
                 );
             }
             for d in &depth {

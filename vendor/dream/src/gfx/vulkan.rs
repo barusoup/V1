@@ -26,7 +26,7 @@ pub use barriers::{
 };
 pub use mesh::{DynamicBuffers, PulledMesh};
 pub use shared::TextureObjectStats;
-pub use swapchain::Swapchain;
+pub use swapchain::{PresentMode, Swapchain, SwapchainOptions};
 
 /// Frames the CPU may have in flight at once. Three slots give the loop
 /// enough slack to ride out a presentation-engine hiccup (an older frame's
@@ -88,6 +88,19 @@ pub struct GpuContext {
     /// Samplers, texture set layouts and descriptor pool chunks shared by all
     /// textures of this context (see the `shared` module).
     shared_textures: Mutex<shared::SharedTextureObjects>,
+    /// Buffers dropped while submitted work might still use them. Destroyed
+    /// once `completed_serial` reaches the serial recorded at drop; see
+    /// [`GpuContext::retire_buffer`].
+    retired_buffers: Mutex<Vec<RetiredBuffer>>,
+}
+
+/// A dropped buffer waiting for the submissions that may reference it.
+struct RetiredBuffer {
+    /// Last submission serial at drop time; the buffer is free to destroy
+    /// once `GpuContext::submission_complete(serial)` holds.
+    serial: u64,
+    buffer: vk::Buffer,
+    allocation: Option<Allocation>,
 }
 
 struct AsyncSlot {
@@ -279,6 +292,7 @@ impl GpuContext {
             timestamp_valid_bits: family_props.timestamp_valid_bits,
             max_storage_buffer_range: limits.max_storage_buffer_range,
             shared_textures: Default::default(),
+            retired_buffers: Mutex::new(Vec::new()),
         });
         ctx.print_adapter();
         ctx
@@ -434,6 +448,17 @@ impl Drop for GpuContext {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            // Idle device: every retired buffer's last use has completed, so
+            // they can all go before the allocator and device do.
+            let retired = std::mem::take(self.retired_buffers.get_mut().unwrap());
+            for entry in retired {
+                self.device.destroy_buffer(entry.buffer, None);
+                if let Some(allocation) = entry.allocation
+                    && let Some(allocator) = self.allocator.get_mut().unwrap().as_mut()
+                {
+                    let _ = allocator.free(allocation);
+                }
+            }
             // Async ring slots own their fences; the command pool destroys
             // the buffers, but every slot's fence needs an explicit
             // destroy before the device goes away.

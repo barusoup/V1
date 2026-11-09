@@ -36,8 +36,9 @@ struct Vs_out {
     @location(3) @interpolate(flat) quad_origin_bits: vec2<u32>,
     // This fragment's pixel-space position (interpolated).
     @location(4) pix: vec2<f32>,
-    // Extra shape data (the rounded clip's half extent for mode -1;
-    // zero otherwise). Uniform per quad.
+    // Extra shape data: the rounded clip's half extent for mode -1; the
+    // anti-aliasing pad from the padded quad origin to the shape for modes
+    // 2 and -2; zero otherwise. Uniform per quad.
     @location(5) extra: vec2<f32>,
 }
 
@@ -272,11 +273,13 @@ fn coverage(in: Vs_out, alpha: f32) -> f32 {
             // Rounded texture: params.xy carry the FULL pixel size, uv
             // stays a pure sample coordinate (a crop may span any subrect).
             // The SDF position is recovered from the flat quad origin —
-            // V0 top-left under the provoking-vertex assumption.
+            // V0 top-left under the provoking-vertex assumption. That origin
+            // is the padded quad's corner, so `extra` (the pad) steps back to
+            // the shape's own origin.
             let origin = vec2<f32>(
                 bitcast<f32>(in.quad_origin_bits.x),
                 bitcast<f32>(in.quad_origin_bits.y),
-            );
+            ) + in.extra;
             // params.xy is the FULL rect size; p is relative to the
             // rect's centre, so subtract the half-size.
             p = in.pix - origin - half * 0.5;
@@ -310,7 +313,7 @@ fn radial_t(in: Vs_out) -> f32 {
     let origin = vec2<f32>(
         bitcast<f32>(in.quad_origin_bits.x),
         bitcast<f32>(in.quad_origin_bits.y),
-    );
+    ) + in.extra;
     let half = in.params.xy * 0.5;
     let lenp = length(in.pix - origin - half);
     let outer = max(min(in.params.z, min(half.x, half.y)), 1e-4);
@@ -323,7 +326,7 @@ fn radial_edge(in: Vs_out) -> f32 {
     let origin = vec2<f32>(
         bitcast<f32>(in.quad_origin_bits.x),
         bitcast<f32>(in.quad_origin_bits.y),
-    );
+    ) + in.extra;
     let half = in.params.xy * 0.5;
     let lenp = length(in.pix - origin - half);
     let outer = max(min(in.params.z, min(half.x, half.y)), 1e-4);
@@ -332,7 +335,7 @@ fn radial_edge(in: Vs_out) -> f32 {
 
 @fragment
 fn fs_main(in: Vs_out) -> @location(0) vec4<f32> {
-    return shade(in, false);
+    return shade(in, false, false);
 }
 
 /// Gamma-blend fragment entry ([`UiBlend::Gamma`]): colours stay
@@ -342,16 +345,31 @@ fn fs_main(in: Vs_out) -> @location(0) vec4<f32> {
 /// decode so images keep their stored values.
 @fragment
 fn fs_main_gamma(in: Vs_out) -> @location(0) vec4<f32> {
-    return shade(in, true);
+    return shade(in, true, false);
 }
 
-fn shade(in: Vs_out, gamma: bool) -> vec4<f32> {
+/// Frosted-glass fragment entry ([`UiBlend::Gamma`] only). The backdrop is
+/// a UNORM texture of sRGB-encoded values, which the hardware hands back
+/// undecoded. `shade` re-encodes every sample, so the sample is decoded first
+/// here: the glass then shows exactly the stored values, and the blur averages
+/// encoded values the way the rest of the gamma pipeline does.
+@fragment
+fn fs_backdrop(in: Vs_out) -> @location(0) vec4<f32> {
+    return shade(in, true, true);
+}
+
+/// `raw`: the sample is a UNORM texture of encoded values (see `fs_backdrop`),
+/// so it is decoded before the gamma re-encode below.
+fn shade(in: Vs_out, gamma: bool, raw: bool) -> vec4<f32> {
     // Radial gradients carry their "to" colour and inner radius in the UV
     // channel — not texture coordinates — so the sample point is steered
     // to a safe value for them (mix, no control flow).
     let mask = radial_mask(in);
     let sample_uv = mix(in.uv, vec2<f32>(0.5, 0.5), mask);
     var tex = textureSample(t_tex, s_tex, sample_uv);
+    if (raw) {
+        tex = vec4<f32>(srgb_to_linear(tex.rgb), tex.a);
+    }
     let packed = bitcast<u32>(in.uv.x);
     let t = radial_t(in) * mask;
     var rgb0 = in.color.rgb;

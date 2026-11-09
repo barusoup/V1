@@ -54,6 +54,19 @@ impl Paint {
         self.radius = r;
         self
     }
+    /// Fully rounded corners, the CSS `border-radius: 9999px` idiom: every
+    /// corner's radius is clamped to half the short side when painted, so a
+    /// square container becomes a circle and a wide one a pill. Use it for
+    /// pills, chips and avatars; the children clip to the same curve.
+    ///
+    /// ```ignore
+    /// ui.container(Style::row().size_px(48.0, 48.0).align(Align::Center),
+    ///     Paint::surface(theme).radius_full(), |ui| { /* avatar */ });
+    /// ```
+    pub fn radius_full(mut self) -> Self {
+        self.radius = f32::INFINITY;
+        self
+    }
     pub fn elevation(mut self, e: Elevation) -> Self {
         self.elevation = e;
         self
@@ -246,6 +259,10 @@ pub(crate) enum NodeOp {
     Separator {
         color: Color,
     },
+    /// A [`Shape`](crate::ui::widgets::adapters::Shape) with its colours
+    /// already resolved against the theme. Plain data, so no per-frame
+    /// allocation.
+    Shape(ShapeOp),
     Progress {
         fill: Color,
         value: f32,
@@ -264,6 +281,23 @@ pub(crate) enum NodeOp {
         end: (usize, usize, usize),
         prev: Rect,
     },
+}
+
+/// Resolved paint data for a [`Shape`](crate::ui::widgets::adapters::Shape).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShapeOp {
+    /// Circle-like kinds (circle, ring, arc): paint the largest centred
+    /// square of the solved rect, with radius = half its side, so the shape
+    /// stays round under a distorted box.
+    pub round: bool,
+    /// Corner radius for box kinds; ignored when `round`.
+    pub radius: f32,
+    pub fill: Option<Color>,
+    /// Border width and colour (inside the edge). For an arc, the band
+    /// thickness and colour.
+    pub stroke: Option<(f32, Color)>,
+    /// `(start, sweep)` radians: draws an arc band instead of a disc.
+    pub arc: Option<(f32, f32)>,
 }
 
 #[derive(Clone, Copy)]

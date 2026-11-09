@@ -162,5 +162,6 @@ impl GpuContext {
             self.device.destroy_fence(fence, None);
             self.device.free_command_buffers(self.transient_pool, &cmds);
         }
+        self.collect_retired_buffers();
     }
 }

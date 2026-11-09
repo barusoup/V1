@@ -1,10 +1,9 @@
 use super::vulkan;
 use super::{FrameMetrics, Renderer};
+use crate::ui::render::UiBlend;
 use ash::vk;
 
 impl Renderer {
-    /// Copy the composed frame (display resolution, linear f16 RGBA,
-    /// including the UI overlay) to the CPU.
     /// Whether display-target pixels are stored blue-first (B8G8R8A8).
     fn display_bgra(&self) -> bool {
         matches!(
@@ -13,16 +12,51 @@ impl Renderer {
         )
     }
 
-    /// Whether display-target pixels are sRGB-encoded (the swapchain format).
+    /// Whether display-target pixels are sRGB-encoded. True for an sRGB
+    /// surface, and for the gamma blend, which stores encoded values whatever
+    /// the surface format is.
     fn display_srgb(&self) -> bool {
-        vulkan::is_srgb(self.swapchain.format)
+        vulkan::is_srgb(self.swapchain.format) || self.ui_blend == UiBlend::Gamma
+    }
+
+    /// Whether the composed display image holds a frame that a readback can
+    /// copy. Frames are composed straight into the swapchain unless capture is
+    /// on, so when nothing is retained this turns capture on (the next frame
+    /// is kept), says so once on stderr, and returns `false`: the readback then
+    /// yields an empty frame rather than copying the placeholder or an
+    /// unwritten image.
+    fn display_readable(&mut self) -> bool {
+        if self.display_written {
+            return true;
+        }
+        if self.frame_capture {
+            if !self.capture_notice {
+                eprintln!(
+                    "dream: no frame has been rendered since Renderer::set_frame_capture(true); the readback is empty."
+                );
+                self.capture_notice = true;
+            }
+        } else {
+            self.set_frame_capture(true);
+            if !self.capture_notice {
+                eprintln!(
+                    "dream: Renderer frame capture was off, so the last frame was not retained; enabled it now — call Renderer::set_frame_capture(true) before rendering frames you read back."
+                );
+                self.capture_notice = true;
+            }
+        }
+        false
     }
 
     /// Copy the composed display image to the CPU. The display target is in
     /// the swapchain format — 8-bit BGRA or RGBA, sRGB-encoded when the
-    /// surface is sRGB — not the scene pass's RGBA16F.
+    /// surface is sRGB — not the scene pass's RGBA16F. Without a retained
+    /// frame (see [`Self::display_readable`]) this returns zeroed texels.
     fn read_display_bytes(&mut self) -> Vec<u8> {
         let (w, h) = self.display_size;
+        if !self.display_readable() {
+            return vec![0; (w as usize) * (h as usize) * 4];
+        }
         let bytes = (w as u64) * (h as u64) * 4;
         let buffer = self.ctx.create_readback_buffer("readback", bytes);
         let image = self.display.image;
@@ -257,7 +291,9 @@ impl Renderer {
 
     /// Summarise the last completed frame: mean colour, sky coverage by half and
     /// motion-vector activity. A debug aid for verifying rendering without
-    /// looking at a window; `DREAM_FRAME_STATS` exposes it to the game.
+    /// looking at a window; `DREAM_FRAME_STATS` exposes it to the game. The
+    /// colour part needs the composed frame retained: see
+    /// [`Self::set_frame_capture`].
     pub fn frame_metrics(&mut self) -> FrameMetrics {
         let (w, h) = self.display_size;
         let (rw, rh) = self.render_size;
@@ -353,6 +389,10 @@ impl Renderer {
     /// for [`crate::png::write`]. The display target is in the swapchain
     /// format: sRGB bytes are copied as-is (they are already display-encoded,
     /// so no re-encoding), and channel order is normalized to RGBA.
+    ///
+    /// Reads the frame retained by [`Self::set_frame_capture`]. When capture
+    /// was off, no frame is retained: the result is black and capture is
+    /// switched on for the next frame.
     pub fn capture_rgba8(&mut self) -> (Vec<u8>, u32, u32) {
         let (w, h) = self.display_size;
         let data = self.read_display_bytes();

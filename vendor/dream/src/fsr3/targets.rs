@@ -33,10 +33,13 @@ impl FsrTargets {
         let eighth = (rw.div_ceil(8), rh.div_ceil(8));
 
         // Storage images must also be sampleable (history is read back) and
-        // clearable (history restarts wipe accumulation state).
+        // clearable (history restarts wipe accumulation state). TRANSFER_SRC is
+        // needed by the reactive-mask readback (`gfx::readback`), which copies
+        // `dilated_reactive_masks` to a buffer (VUID-vkCmdCopyImageToBuffer-srcImage-00186).
         let usage = vk::ImageUsageFlags::SAMPLED
             | vk::ImageUsageFlags::STORAGE
-            | vk::ImageUsageFlags::TRANSFER_DST;
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::TRANSFER_SRC;
         let make = |label: &str, (w, h): (u32, u32), format: vk::Format| {
             ctx.create_image(label, w, h, format, usage)
         };

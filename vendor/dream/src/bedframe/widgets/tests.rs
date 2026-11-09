@@ -2365,10 +2365,11 @@ fn scaled_frames_are_physical_but_input_stays_logical() {
         .map(|v| v.pos[0])
         .filter(|x| *x > 0.0)
         .collect();
+    // The SDF quad grows one physical pixel past the rect for anti-aliasing.
     assert!(
-        verts.iter().any(|x| (*x - 20.0).abs() < 0.01)
-            && verts.iter().any(|x| (*x - 220.0).abs() < 0.01),
-        "the quad spans 20..220 physical px, got {verts:?}"
+        verts.iter().any(|x| (*x - 19.0).abs() < 0.01)
+            && verts.iter().any(|x| (*x - 221.0).abs() < 0.01),
+        "the quad spans 19..221 physical px (20..220 plus the AA pad), got {verts:?}"
     );
     // And its clip, had there been one, would be physical too.
     u.begin(UiInput::default(), (800.0, 600.0));

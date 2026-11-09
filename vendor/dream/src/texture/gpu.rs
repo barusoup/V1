@@ -268,9 +268,16 @@ impl GpuTexture {
 
     /// A blank, linearly sampled texture that can also be drawn into and copied
     /// to or from, in the caller's exact Vulkan format. Used for the UI's
-    /// backdrop blur, whose targets must match the display image's format.
+    /// frosted-glass backdrop, whose targets must match the display image's
+    /// format.
+    ///
+    /// The clear to transparent black is recorded into `cmd`, not submitted on
+    /// its own, so creating one never stalls the frame it is made in. The
+    /// texture is defined once `cmd` has been submitted, and it must be used
+    /// only by work submitted after that.
     pub fn render_target(
         ctx: &Arc<GpuContext>,
+        cmd: vk::CommandBuffer,
         label: &str,
         width: u32,
         height: u32,
@@ -281,23 +288,51 @@ impl GpuTexture {
             | vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::COLOR_ATTACHMENT;
         let image = ctx.create_image_mips(label, width, height, format, usage, 1);
-        let device = ctx.device().clone();
+        let device = ctx.device();
         let raw = image.image;
-        ctx.one_shot(|cmd| unsafe {
+        unsafe {
             vulkan::image_barrier(
-                &device,
+                device,
                 cmd,
                 raw,
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::GENERAL,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
                 vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::ImageAspectFlags::COLOR,
+            );
+            device.cmd_clear_color_image(
+                cmd,
+                raw,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 0.0],
+                },
+                &[vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            );
+            vulkan::image_barrier(
+                device,
+                cmd,
+                raw,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::TRANSFER_WRITE,
                 vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
                 vk::ImageAspectFlags::COLOR,
             );
-        });
-        // Linear and clamped: the blur reads neighbours, and the glass is sampled at fractional UVs.
+        }
+        // Linear and clamped: the blur reads neighbours, and the glass is
+        // sampled at fractional UVs.
         let sampler = SamplerDesc {
             filter: super::sampler::Filter::Linear,
             mip: super::sampler::MipFilter::Linear,
@@ -469,6 +504,37 @@ unsafe fn generate_mips(
     height: u32,
     mip_levels: u32,
 ) {
+    // Level 0 was written by the buffer copy. Nothing above orders that write
+    // before the first blit reads it (SYNC-HAZARD-READ-AFTER-WRITE on
+    // vkCmdBlitImage), so make it visible to transfer reads first.
+    if mip_levels > 1 {
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+    }
     let mut src_w = width;
     let mut src_h = height;
     for level in 1..mip_levels {

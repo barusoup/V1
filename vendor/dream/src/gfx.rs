@@ -21,7 +21,7 @@ mod thumbnail;
 mod timing;
 pub mod vulkan;
 
-pub use vulkan::{GpuBuffer, GpuContext, GpuImage, PulledMesh};
+pub use vulkan::{GpuBuffer, GpuContext, GpuImage, PresentMode, PulledMesh};
 
 use crate::fsr3::{Fsr3, JitterSequence};
 use ash::vk;
@@ -184,6 +184,11 @@ pub struct Renderer {
     frame_pool: vk::CommandPool,
     cmd: Vec<vk::CommandBuffer>,
     image_available: Vec<vk::Semaphore>,
+    /// One per SWAPCHAIN IMAGE (indexed by the acquired image index), not per
+    /// frame slot: a presented image's semaphore stays referenced by the
+    /// presentation engine until that image is re-acquired, so reusing one per
+    /// slot violates VUID-vkQueueSubmit-pSignalSemaphores-00067. Rebuilt with
+    /// the swapchain in `Renderer::resize`.
     render_finished: Vec<vk::Semaphore>,
     in_flight: Vec<vk::Fence>,
     /// Serial carried by each slot's fence; confirmed after the wait.
@@ -207,10 +212,25 @@ pub struct Renderer {
     thumb: Option<thumbnail::ThumbnailPass>,
     fsr: Option<Fsr3>,
     fsr_enabled: bool,
-    /// Composed display image (swapchain format, screen-row order): the blit
-    /// writes it, the UI pass draws over it, the present pass copies it to
-    /// the swapchain. Captures read it, so screenshots include the UI.
+    /// Composed display image (swapchain format, screen-row order), used only
+    /// by frames that cannot be composed straight into the swapchain: a
+    /// crosshair, frame capture, or a colour-space change. There the blit
+    /// writes it, the UI pass draws over it and the present pass copies it to
+    /// the swapchain. Otherwise it is a 1x1 placeholder that the present set
+    /// can still sample.
     display: GpuImage,
+    /// Whether `display` is the full-size image rather than the placeholder.
+    display_live: bool,
+    /// Whether a frame has been composed into `display` since it was built:
+    /// the only state in which the display holds something to read back.
+    display_written: bool,
+    /// Keep the composed frame for CPU readbacks (see
+    /// [`Renderer::set_frame_capture`]).
+    frame_capture: bool,
+    /// Requested swapchain present mode (see [`Renderer::set_present_mode`]).
+    present_mode: vulkan::PresentMode,
+    /// Set once a readback has found no retained frame and said so.
+    capture_notice: bool,
     present_pipeline: vk::Pipeline,
     present_layout: vk::PipelineLayout,
     present_set: vk::DescriptorSet,

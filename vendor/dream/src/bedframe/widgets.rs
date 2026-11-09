@@ -1193,6 +1193,23 @@ impl Ui {
         self.draw.round_rect(rect, radius, color);
     }
 
+    /// Draw a filled, anti-aliased circle of `radius` around `center`.
+    pub fn paint_circle(&mut self, center: (f32, f32), radius: f32, color: Color) {
+        self.draw.fill_circle(center, radius, color);
+    }
+
+    /// Draw an anti-aliased circle outline: `radius` to the outer edge, the
+    /// band `thickness` pixels wide running inward.
+    pub fn paint_circle_stroke(
+        &mut self,
+        center: (f32, f32),
+        radius: f32,
+        thickness: f32,
+        color: Color,
+    ) {
+        self.draw.stroke_circle(center, radius, thickness, color);
+    }
+
     /// Draw a rounded rectangle outline `thickness` pixels wide.
     pub fn paint_round_ring(&mut self, rect: Rect, radius: f32, thickness: f32, color: Color) {
         self.draw.round_ring(rect, radius, thickness, color);

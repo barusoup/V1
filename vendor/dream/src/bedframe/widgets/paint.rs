@@ -16,6 +16,39 @@ use crate::ui::font::Align;
 use crate::ui::layout::hairline;
 use crate::ui::tokens::{ControlSize, Radius, Space};
 
+/// A [`Shape`](super::adapters::Shape) at `rect`. Circle-like shapes paint
+/// the largest centred square of `rect`, so they stay round when a style
+/// gives the box a different aspect; box shapes fill `rect`.
+pub(crate) fn shape(ui: &mut Ui, rect: Rect, op: &crate::ui::view::ShapeOp) {
+    let (rect, radius) = if op.round {
+        let side = rect.w.min(rect.h).max(0.0);
+        let sq = Rect::new(
+            rect.x + (rect.w - side) * 0.5,
+            rect.y + (rect.h - side) * 0.5,
+            side,
+            side,
+        );
+        (sq, side * 0.5)
+    } else {
+        (rect, op.radius)
+    };
+    if let Some((start, sweep)) = op.arc {
+        if let Some((thickness, color)) = op.stroke {
+            ui.draw
+                .ring_arc(rect, radius, thickness, start, sweep, color);
+        }
+        return;
+    }
+    match (op.fill, op.stroke) {
+        (Some(fill), Some((width, color))) => {
+            ui.draw.rounded_frame(rect, radius, width, fill, color)
+        }
+        (Some(fill), None) => ui.draw.round_rect(rect, radius, fill),
+        (None, Some((width, color))) => ui.draw.round_ring(rect, radius, width, color),
+        (None, None) => {}
+    }
+}
+
 /// The button chrome (bg, border, centred label) — no interaction.
 pub fn button(ui: &mut Ui, rect: Rect, style: &ButtonStyle, state: State, label: &str) {
     let hover = state.hover;

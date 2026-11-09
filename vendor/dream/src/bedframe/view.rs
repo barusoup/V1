@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 pub use node::{Intrinsic, MeasureCx, Paint, PaintOp, TextWrap, Widget};
 
-pub(crate) use node::{NodeOp, ToggleKind};
+pub(crate) use node::{NodeOp, ShapeOp, ToggleKind};
 
 /// Per-frame view layer state (a field of `Ui`).
 #[derive(Default)]

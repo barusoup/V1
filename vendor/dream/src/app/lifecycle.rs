@@ -85,6 +85,8 @@ impl App {
             frames_skipped: 0,
             frames_immediate: 0,
             captures: 0,
+            pending_captures: Vec::new(),
+            capture_restore: None,
             drag: None,
             drag_start_orbit: None,
             viewport_cursor: None,
@@ -271,6 +273,7 @@ impl App {
             // go back to the driver; they return on the first frame that shows
             // the viewport.
             self.renderer.release_scene_resources();
+            self.renderer.trim_memory();
             crate::memory::trim_working_set();
             self.memory = crate::memory::IdleTrim::new();
         }
@@ -502,6 +505,20 @@ impl App {
             }
         }
         self.capture_pending_thumbnail();
+        if !self.pending_captures.is_empty() {
+            // This frame is the one the screenshots asked for: it was retained
+            // because capture was on. Save it, then restore the capture state
+            // the first request found, so frames go direct again unless
+            // something else still needs them.
+            for path in std::mem::take(&mut self.pending_captures) {
+                if let Err(err) = self.renderer.save_png(&path) {
+                    eprintln!("[capture] failed to write {}: {err}", path.display());
+                }
+            }
+            if let Some(was_on) = self.capture_restore.take() {
+                self.renderer.set_frame_capture(was_on);
+            }
+        }
         self.frames_rendered += 1;
         self.memory.activity(now);
         // Input is consumed by the frame it was rendered in; self-

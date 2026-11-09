@@ -22,10 +22,9 @@ Runtime media (FFmpeg stills, video and audio) lives in the separate [`dream-med
 
 ## V1 vendoring
 
-V1 vendors this crate from [`barusoup/Dream`](https://github.com/barusoup/dream) at commit
-`146d8f0` (2026-11-09). The V1-specific frosted-glass backdrop patch lives in
-`src/bedframe/render/backdrop.rs` and `src/bedframe/draw.rs`; upstream demo binaries and docs are
-omitted.
+V1 vendors this crate unmodified from [`barusoup/Dream`](https://github.com/barusoup/dream) at
+commit `92903b8` (2026-11-09). The frosted-glass backdrop V1 uses is now upstream
+(`DrawList::backdrop_rounded`); upstream demo binaries, examples and docs are omitted.
 
 ## License
 

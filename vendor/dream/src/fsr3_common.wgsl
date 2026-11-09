@@ -87,12 +87,6 @@ struct Fsr3Constants {
 @group(0) @binding(54) var w_new_locks: texture_storage_2d<r8unorm, write>;
 @group(0) @binding(55) var w_upscaled_output: texture_storage_2d<rgba16float, write>;
 
-// Render "downsample" planes (used by the box pyramids) are bound at 60+.
-@group(0) @binding(60) var t_downsample_src: texture_2d<f32>;
-@group(0) @binding(61) var t_downsample_src_depth: texture_2d<f32>;
-@group(0) @binding(62) var w_downsample_dst: texture_storage_2d<rg16float, write>;
-@group(0) @binding(63) var w_downsample_dst_r: texture_storage_2d<r16float, write>;
-
 // ---------------------------------------------------------------------------
 // Constants (ffx_fsr3upscaler_common.h)
 // ---------------------------------------------------------------------------

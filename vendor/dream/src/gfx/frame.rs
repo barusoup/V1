@@ -1,6 +1,7 @@
 use super::acquire::AcquireOutcome;
 use super::pipeline::{
-    attachment, depth_attachment, general_barrier, make_viewport, map_surface_error, scene_region,
+    attachment, attachment_in, depth_attachment, general_barrier, make_viewport, map_surface_error,
+    scene_region,
 };
 use super::timing::elapsed_timestamp_ticks;
 use super::vulkan;
@@ -57,6 +58,12 @@ impl Renderer {
     {
         self.scene_sample = None;
         self.phases = FramePhases::default();
+        // The setters keep the display image in step with `needs_display`;
+        // this guards the invariant so a frame never records through the
+        // 1x1 placeholder.
+        if self.needs_display() && !self.display_live {
+            self.ensure_display();
+        }
         // Frame start. The acquire-ahead worker already waited this slot's
         // fence and reserved its swapchain image, so a ready token means the
         // slot is free and the frame renders without blocking. Within the
@@ -87,6 +94,8 @@ impl Renderer {
         // This slot's fence signalled its serial; the in-order queue makes
         // every earlier submission complete as well.
         self.ctx.confirm_completed(self.frame_serials[frame]);
+        // Buffers dropped while earlier frames were in flight can go now.
+        self.ctx.collect_retired_buffers();
         self.finish_scene_thumbnail(frame);
         if self.frame_serials[frame] > 0
             && self.scene_recorded[frame]
@@ -172,9 +181,6 @@ impl Renderer {
             },
         };
         let swap_viewport = make_viewport(swapchain_extent);
-        // The display pass owns its own extent — it can differ from the
-        // swapchain's when a resize request wasn't fully honored.
-        let display_viewport = make_viewport(display_size);
         let swap_scissor = vk::Rect2D {
             offset: vk::Offset2D::default(),
             extent: vk::Extent2D {
@@ -188,19 +194,46 @@ impl Renderer {
         let swapchain_image = self.swapchain.images[image_index as usize];
         let swapchain_view = self.swapchain.views[image_index as usize];
         unsafe {
+            // The image was acquired by `image_available`, which this submit
+            // waits on at COLOR_ATTACHMENT_OUTPUT. The transition must be ordered
+            // after that wait, so its source stage has to include that stage;
+            // TOP_OF_PIPE runs before the wait (SYNC-HAZARD-WRITE-AFTER-READ vs
+            // vkAcquireNextImageKHR).
             vulkan::image_barrier(
                 &device,
                 cmd,
                 swapchain_image,
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags::empty(),
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
                 vk::ImageAspectFlags::COLOR,
             );
         }
+
+        // Direct composition: the blit and UI passes draw into the swapchain
+        // image itself, and no present pass runs. Otherwise they draw into the
+        // composed display image, which the present pass then copies out.
+        let direct = !self.needs_display();
+        let (target_view, target_size, target_layout) = if direct {
+            (
+                swapchain_view,
+                swapchain_extent,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            )
+        } else {
+            (self.display.view, display_size, vk::ImageLayout::GENERAL)
+        };
+        let target_viewport = make_viewport(target_size);
+        let target_scissor = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D {
+                width: target_size.0,
+                height: target_size.1,
+            },
+        };
 
         // --- Scene pass ---
         if self.ctx.timestamp_valid_bits() > 0 {
@@ -378,29 +411,23 @@ impl Renderer {
             }
         }
 
-        // --- Blit pass (FSR output -> composed display image) ---
+        // --- Blit pass (FSR output -> target: the swapchain image when composing
+        // directly, otherwise the composed display image) ---
         {
             let load = if scene_enabled {
                 vk::AttachmentLoadOp::DONT_CARE
             } else {
                 vk::AttachmentLoadOp::CLEAR
             };
-            let color = attachment(self.display.view, load, [0.0, 0.0, 0.0, 1.0]);
-            let display_scissor = vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent: vk::Extent2D {
-                    width: display_size.0,
-                    height: display_size.1,
-                },
-            };
+            let color = attachment_in(target_view, target_layout, load, [0.0, 0.0, 0.0, 1.0]);
             let info = vk::RenderingInfo::default()
-                .render_area(display_scissor)
+                .render_area(target_scissor)
                 .layer_count(1)
                 .color_attachments(std::slice::from_ref(&color));
             unsafe {
                 device.cmd_begin_rendering(cmd, &info);
-                device.cmd_set_viewport(cmd, 0, &[display_viewport]);
-                device.cmd_set_scissor(cmd, 0, &[display_scissor]);
+                device.cmd_set_viewport(cmd, 0, &[target_viewport]);
+                device.cmd_set_scissor(cmd, 0, &[target_scissor]);
                 if scene_enabled {
                     device.cmd_bind_pipeline(
                         cmd,
@@ -421,36 +448,81 @@ impl Renderer {
             }
         }
 
-        // --- UI overlay (display resolution, over the composed image) ---
+        // --- UI overlay (display resolution, over the target) ---
         if let Some(ui) = ui {
-            self.ui
-                .record(cmd, frame, self.display.image, self.display.view, display_size, ui);
-        }
-
-        // Composed display image becomes readable for the present pass.
-        unsafe {
-            device.cmd_pipeline_barrier(
+            if direct {
+                // The blit wrote the swapchain image that the UI pass loads
+                // in its own rendering scope; order the two explicitly.
+                let barrier = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::COLOR_ATTACHMENT_READ
+                            | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    );
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        vk::DependencyFlags::empty(),
+                        std::slice::from_ref(&barrier),
+                        &[],
+                        &[],
+                    );
+                }
+            }
+            // The glass backdrop copies the target, so hand the UI the image behind the view. A
+            // direct frame whose swapchain cannot be blitted from passes null: the capture is skipped
+            // and glass shows its last backdrop.
+            let target_image = if !direct {
+                self.display.image
+            } else if self.swapchain.supports_transfer_src() {
+                swapchain_image
+            } else {
+                vk::Image::null()
+            };
+            self.ui.record_in_layout(
                 cmd,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[general_barrier(
-                    self.display.image,
-                    vk::ImageAspectFlags::COLOR,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                    vk::AccessFlags::SHADER_READ,
-                )],
+                frame,
+                target_image,
+                target_view,
+                target_size,
+                ui,
+                target_layout,
             );
         }
 
-        // --- Present pass (display image -> swapchain) ---
-        {
-            let color = attachment(
+        if !direct {
+            // The composed display image holds this frame now and becomes
+            // readable for the present pass.
+            self.display_written = true;
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[general_barrier(
+                        self.display.image,
+                        vk::ImageAspectFlags::COLOR,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                        vk::AccessFlags::SHADER_READ,
+                    )],
+                );
+            }
+
+            // --- Present pass (display image -> swapchain) ---
+            // VUID-vkCmdBeginRendering-pRenderingInfo-09592: the attachment
+            // layout must match the layout the image is actually in. The
+            // swapchain image was moved to COLOR_ATTACHMENT_OPTIMAL above, so
+            // declare that here rather than GENERAL.
+            let color = attachment_in(
                 swapchain_view,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::AttachmentLoadOp::DONT_CARE,
                 [0.0, 0.0, 0.0, 1.0],
             );
@@ -509,7 +581,9 @@ impl Renderer {
 
             let wait_semaphores = [self.image_available[frame]];
             let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-            let signal_semaphores = [self.render_finished[frame]];
+            // Keyed by swapchain image, not frame slot: see `Renderer::render_finished`
+            // (VUID-vkQueueSubmit-pSignalSemaphores-00067).
+            let signal_semaphores = [self.render_finished[image_index as usize]];
             let cmds = [cmd];
             let submit = vk::SubmitInfo::default()
                 .wait_semaphores(&wait_semaphores)

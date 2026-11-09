@@ -322,6 +322,13 @@ pub struct App {
     pub frames_skipped: u64,
     pub frames_immediate: u64,
     pub captures: u32,
+    /// Screenshots to write from the next presented frame: `capture_png`
+    /// turns frame capture on, and `render` saves them and restores the
+    /// capture state they found (`capture_restore`).
+    pending_captures: Vec<std::path::PathBuf>,
+    /// Frame-capture state before the first queued screenshot; `None` while
+    /// none is queued.
+    capture_restore: Option<bool>,
     /// Set while the user drags the viewport (camera controls).
     pub drag: Option<ViewportDrag>,
     /// Orbit state before the current viewport drag (undo snapshot).
@@ -404,6 +411,8 @@ impl App {
     pub fn selfcheck(&mut self) {
         let dir = std::path::Path::new("target/dream-app");
         std::fs::create_dir_all(dir).expect("create selfcheck dir");
+        // The run reads composed frames back, so keep them.
+        self.renderer.set_frame_capture(true);
         let states: [(SelfCheckShot, &str); 7] = [
             (SelfCheckShot::Default, "default"),
             (SelfCheckShot::Dark, "dark"),
@@ -473,10 +482,16 @@ impl App {
             let path = dir.join(format!("selfcheck-{name}.png"));
             crate::png::write(&path, width, height, &pixels).expect("write selfcheck png");
             if matches!(&shot, SelfCheckShot::Dark | SelfCheckShot::Light) {
-                Self::assert_themed_ink(&pixels, width as usize, &self.theme, p_inspector);
+                Self::assert_themed_ink(
+                    &pixels,
+                    width as usize,
+                    &self.theme,
+                    p_inspector,
+                    self.scale,
+                );
             }
             if matches!(&shot, SelfCheckShot::Default) {
-                Self::assert_caption_glyphs(&pixels, width as usize, p_titlebar);
+                Self::assert_caption_glyphs(&pixels, width as usize, p_titlebar, self.scale);
             }
             if matches!(&shot, SelfCheckShot::Settings) {
                 Self::assert_theme_selector(&pixels, width as usize, self);
@@ -719,9 +734,11 @@ impl App {
         for _ in 0..20 {
             self.render(Instant::now());
         }
-        let left = self.theme_cells[ThemeChoice::Light.index()];
-        let right = self.theme_cells[ThemeChoice::Dark.index()];
-        self.click(right);
+        // The click is logical; the captured pill span is physical.
+        let right_logical = self.theme_cells[ThemeChoice::Dark.index()];
+        let left = self.physical_rect(self.theme_cells[ThemeChoice::Light.index()]);
+        let right = self.physical_rect(right_logical);
+        self.click(right_logical);
         self.render(Instant::now());
         let (pixels, width, _height) = self.renderer.capture_rgba8();
         let glide = Self::pill_span(
@@ -1132,9 +1149,12 @@ impl App {
         best.filter(|(x0, x1)| (x1 - x0) as f32 > (cells[1].w * 0.5))
     }
 
-    fn assert_themed_ink(pixels: &[u8], width: usize, theme: &Theme, inspector: Rect) {
-        let band_x = inspector.x as usize + 34..inspector.x as usize + 130;
-        let band_y = inspector.y as usize + 8..inspector.y as usize + 30;
+    /// `inspector` is physical; the header band offsets are logical and scale
+    /// with it.
+    fn assert_themed_ink(pixels: &[u8], width: usize, theme: &Theme, inspector: Rect, scale: f32) {
+        let at = |base: f32, logical: f32| (base + logical * scale) as usize;
+        let band_x = at(inspector.x, 34.0)..at(inspector.x, 130.0);
+        let band_y = at(inspector.y, 8.0)..at(inspector.y, 30.0);
         let want = theme.fg.r;
         let mut closest = 255u8;
         for y in band_y {
@@ -1187,10 +1207,14 @@ impl App {
         }
     }
 
-    fn assert_caption_glyphs(pixels: &[u8], width: usize, titlebar: Rect) {
+    /// `titlebar` is in physical pixels (the capture's space), so the
+    /// logical caption width is scaled to match; without it every slot but
+    /// the rightmost lands in the wrong place on a high-density display.
+    fn assert_caption_glyphs(pixels: &[u8], width: usize, titlebar: Rect, scale: f32) {
+        let caption_w = (crate::app::chrome::CAPTION_W * scale).round() as usize;
         let slot = |index: usize| -> (usize, usize) {
-            let right = titlebar.max().0 as usize - index * crate::app::chrome::CAPTION_W as usize;
-            (right - crate::app::chrome::CAPTION_W as usize, right)
+            let right = titlebar.max().0 as usize - index * caption_w;
+            (right - caption_w, right)
         };
         let bar = pixels[(titlebar.y as usize + 4) * width + slot(2).0 - 2];
         let ink = |index: usize| -> (f32, f32, f32, f32) {
@@ -1233,11 +1257,11 @@ impl App {
         // touch smaller than the cross (optical_k 0.9) — close in both
         // axes, not identical.
         assert!(
-            (square_w - close_w).abs() <= 3.0 && (square_h - close_h).abs() <= 3.0,
+            (square_w - close_w).abs() <= 3.0 * scale && (square_h - close_h).abs() <= 3.0 * scale,
             "the maximise square ({square_w}x{square_h}) should read as the close cross ({close_w}x{close_h})"
         );
         assert!(
-            (rule_w - close_w).abs() <= 2.0,
+            (rule_w - close_w).abs() <= 2.0 * scale,
             "the minimise rule ({rule_w}px) and the cross ({close_w}px) should be one width"
         );
         for (name, dx, dy) in [
@@ -1246,7 +1270,7 @@ impl App {
             ("cross", close_dx, close_dy),
         ] {
             assert!(
-                dx.abs() <= 0.75 && dy.abs() <= 0.75,
+                dx.abs() <= 0.75 * scale && dy.abs() <= 0.75 * scale,
                 "the {name} glyph sits off-centre in its button ({dx:+.1}, {dy:+.1})"
             );
         }

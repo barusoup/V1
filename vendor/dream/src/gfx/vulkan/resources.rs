@@ -1,5 +1,5 @@
 use super::barriers::is_depth;
-use super::{GpuBuffer, GpuContext, GpuImage};
+use super::{GpuBuffer, GpuContext, GpuImage, RetiredBuffer};
 use ash::vk;
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
@@ -528,14 +528,71 @@ impl GpuBuffer {
 
 impl Drop for GpuBuffer {
     fn drop(&mut self) {
-        unsafe { self.ctx.device.destroy_buffer(self.buffer, None) };
-        if let Some(allocation) = self.allocation.take() {
-            let mut allocator = self.ctx.allocator.lock().unwrap();
+        self.ctx.retire_buffer(self.buffer, self.allocation.take());
+    }
+}
+
+impl GpuContext {
+    /// Destroy a dropped buffer once no submitted command can still use it.
+    ///
+    /// VUID-vkDestroyBuffer-buffer-00922: a buffer must not be destroyed while
+    /// a submission that refers to it is pending. A dropped buffer may still be
+    /// bound by the frame in flight (the app drops its scene while the last
+    /// frame draws it), so its destruction is keyed to the newest submission
+    /// serial: it is freed by [`Self::collect_retired_buffers`] once that
+    /// serial completes. Buffers with nothing outstanding are freed at once.
+    pub(crate) fn retire_buffer(&self, buffer: vk::Buffer, allocation: Option<Allocation>) {
+        let serial = self.submitted_serial();
+        if self.submission_complete(serial) {
+            self.free_buffer(buffer, allocation);
+        } else {
+            self.retired_buffers.lock().unwrap().push(RetiredBuffer {
+                serial,
+                buffer,
+                allocation,
+            });
+        }
+    }
+
+    /// Free retired buffers whose submission serial has completed. Call where
+    /// serials are confirmed (frame start, one-shot work, quiesce). Frees are
+    /// done outside the retired-list lock.
+    pub(crate) fn collect_retired_buffers(&self) {
+        let completed = self.completed_serial();
+        let done = {
+            let mut list = self.retired_buffers.lock().unwrap();
+            if list.is_empty() {
+                return;
+            }
+            let (done, pending) = split_completed(std::mem::take(&mut *list), completed);
+            *list = pending;
+            done
+        };
+        for entry in done {
+            self.free_buffer(entry.buffer, entry.allocation);
+        }
+    }
+
+    fn free_buffer(&self, buffer: vk::Buffer, allocation: Option<Allocation>) {
+        unsafe { self.device.destroy_buffer(buffer, None) };
+        if let Some(allocation) = allocation {
+            let mut allocator = self.allocator.lock().unwrap();
             if let Some(allocator) = allocator.as_mut() {
                 let _ = allocator.free(allocation);
             }
         }
     }
+}
+
+/// Split retired buffers into those whose serial `completed` has reached (to
+/// free now) and the rest (still possibly in use). Pure, so the policy is
+/// testable without a device.
+fn split_completed(
+    list: Vec<RetiredBuffer>,
+    completed: u64,
+) -> (Vec<RetiredBuffer>, Vec<RetiredBuffer>) {
+    list.into_iter()
+        .partition(|entry| entry.serial <= completed)
 }
 
 impl Drop for GpuImage {
@@ -591,5 +648,38 @@ mod tests {
             host_buffer_usage(HostBufferKind::Index),
             vk::BufferUsageFlags::INDEX_BUFFER
         );
+    }
+
+    fn retired(serial: u64) -> RetiredBuffer {
+        RetiredBuffer {
+            serial,
+            buffer: vk::Buffer::null(),
+            allocation: None,
+        }
+    }
+
+    #[test]
+    fn retired_buffer_frees_only_completed_serials() {
+        // Serials 1..=3 are pending or done depending on `completed`; a
+        // buffer may be freed only once its serial has completed.
+        let (done, pending) = split_completed(vec![retired(1), retired(2), retired(3)], 2);
+        let freed: Vec<u64> = done.iter().map(|e| e.serial).collect();
+        let kept: Vec<u64> = pending.iter().map(|e| e.serial).collect();
+        assert_eq!(freed, [1, 2]);
+        assert_eq!(kept, [3]);
+    }
+
+    #[test]
+    fn retired_buffer_nothing_completed_keeps_everything() {
+        let (done, pending) = split_completed(vec![retired(4), retired(5)], 3);
+        assert!(done.is_empty());
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn retired_buffer_everything_completed_frees_all() {
+        let (done, pending) = split_completed(vec![retired(1), retired(2)], 9);
+        assert_eq!(done.len(), 2);
+        assert!(pending.is_empty());
     }
 }

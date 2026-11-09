@@ -1,5 +1,8 @@
 //! BedFrame: Dream Engine's UI, text, HUD and menus framework.
 //!
+//! See `docs/bedframe-cookbook.md` for task-oriented L3 recipes (toolbar,
+//! inspector form, card grid, settings page, HUD overlay).
+//!
 //! Layers, top to bottom:
 //!
 //! - [`tween`]: easing, tweens and animated values. Standalone; usable for
@@ -72,9 +75,12 @@
 //! renderer.render_ui(&camera, Some(viewport), |draw| { /* scene draws */ 3 }, Some(&frame))?;
 //! ```
 //!
-//! Colours are straight-alpha sRGB bytes, the format artists and CSS use;
-//! the pipeline converts to linear light on the way to the sRGB target.
+//! Colours are straight-alpha sRGB bytes, the format artists and CSS use.
+//! By default ([`UiBlend::Gamma`](render::UiBlend::Gamma)) they blend as
+//! encoded values, as in browsers; [`UiBlend::Linear`](render::UiBlend::Linear)
+//! converts them to linear light on the way to the sRGB target instead.
 
+pub mod app;
 pub mod atlas;
 pub mod clipboard;
 pub mod devtools;

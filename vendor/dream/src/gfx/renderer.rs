@@ -1,10 +1,10 @@
 #[cfg(doc)]
 use super::PulledMesh;
 use super::pipeline::{
-    allocate_sets, binding, build_display, build_targets, create_descriptor_pool, create_dsl,
-    create_graphics_pipeline, create_graphics_pipeline_fs, create_pipeline_layout, display_format,
-    image_write, new_fence, new_semaphore, sampled, sampler_info, sampler_write, scaled_size,
-    uniform_write, write_sets,
+    allocate_sets, binding, build_display, build_targets, composes_direct, create_descriptor_pool,
+    create_dsl, create_graphics_pipeline, create_graphics_pipeline_fs, create_pipeline_layout,
+    display_format, image_write, new_fence, new_semaphore, present_fragment_entry, sampled,
+    sampler_info, sampler_write, scaled_size, uniform_write, write_sets,
 };
 use super::vulkan;
 use super::{
@@ -20,15 +20,38 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::{dpi::PhysicalSize, window::Window};
 
+/// The swapchain options a renderer with these settings creates. Gamma
+/// blending prefers a UNORM surface so its encoded values reach the screen
+/// without a decode/encode round trip, which keeps it on the direct path.
+/// One binary render-finished semaphore per swapchain image. Presentation keeps
+/// a semaphore referenced until its image is re-acquired, so the semaphore
+/// must be keyed by image, not by frame slot (VUID-vkQueueSubmit-pSignalSemaphores-00067).
+fn new_render_finished(ctx: &GpuContext, image_count: usize) -> Vec<vk::Semaphore> {
+    (0..image_count).map(|_| new_semaphore(ctx)).collect()
+}
+
+fn swapchain_options(
+    present_mode: vulkan::PresentMode,
+    blend: UiBlend,
+) -> vulkan::SwapchainOptions {
+    vulkan::SwapchainOptions {
+        present_mode,
+        prefer_unorm: blend == UiBlend::Gamma,
+    }
+}
+
 impl Renderer {
+    /// Build a renderer whose UI blends in [`UiBlend::default()`]
+    /// ([`UiBlend::Gamma`], browser-matching).
     pub fn new(window: Arc<Window>, shader_src: &str, settings: Settings) -> Self {
-        Self::new_inner(window, shader_src, None, settings, UiBlend::Linear)
+        Self::new_inner(window, shader_src, None, settings, UiBlend::default())
     }
 
     /// Like [`Self::new`], with the UI pass blending in `blend`'s colour
-    /// space. [`UiBlend::Gamma`] composites like a web browser (the display
-    /// image becomes UNORM holding sRGB-encoded values); scene output is
-    /// encoded into it by the blit, so 3D content still shows correctly.
+    /// space. [`UiBlend::Gamma`] (the default) composites like a web browser:
+    /// the display image becomes UNORM holding sRGB-encoded values, and scene
+    /// output is encoded into it by the blit, so 3D content still shows
+    /// correctly. [`UiBlend::Linear`] blends in physically linear light.
     pub fn new_with_ui_blend(
         window: Arc<Window>,
         shader_src: &str,
@@ -41,7 +64,8 @@ impl Renderer {
     /// Like [`Self::new`], but additionally compiles `pulling_shader_src` as
     /// a zero-vertex-input pipeline that fetches packed quads from a set-1
     /// storage buffer and takes a 16-byte vertex-stage origin push constant.
-    /// `DrawCtx::draw_pulled*` then draws [`PulledMesh`]es through it.
+    /// `DrawCtx::draw_pulled*` then draws [`PulledMesh`]es through it. The UI
+    /// blends in [`UiBlend::default()`], as with [`Self::new`].
     pub fn new_with_pulling(
         window: Arc<Window>,
         shader_src: &str,
@@ -53,7 +77,7 @@ impl Renderer {
             shader_src,
             Some(pulling_shader_src),
             settings,
-            UiBlend::Linear,
+            UiBlend::default(),
         )
     }
 
@@ -76,11 +100,13 @@ impl Renderer {
         } else {
             1.0
         };
-        let swapchain = vulkan::Swapchain::new(
+        let present_mode = vulkan::PresentMode::default();
+        let swapchain = vulkan::Swapchain::new_with(
             &ctx,
             display_size.0,
             display_size.1,
             vk::SwapchainKHR::null(),
+            swapchain_options(present_mode, ui_blend),
         );
         // The surface may clamp the requested extent — derive display
         // size from the swapchain that was actually created.
@@ -230,7 +256,7 @@ impl Renderer {
         }
         .expect("allocate frame command buffers");
         let image_available = (0..max_frames).map(|_| new_semaphore(&ctx)).collect();
-        let render_finished = (0..max_frames).map(|_| new_semaphore(&ctx)).collect();
+        let render_finished = new_render_finished(&ctx, swapchain.images.len());
         let in_flight = (0..max_frames).map(|_| new_fence(&ctx)).collect();
 
         // Allocate a 1x1 placeholder until a frame actually records 3D scene
@@ -243,7 +269,15 @@ impl Renderer {
         // Composed display image + present pass + UI overlay. The blit writes
         // the display image, UI draws over it, the present pass copies it to
         // the swapchain.
-        let display = build_display(&ctx, display_size, display_fmt);
+        // A fresh renderer has no crosshair and no capture, so the full-size
+        // image is needed only when the colour spaces differ (gamma blend on
+        // an sRGB surface that offers no UNORM format).
+        let display_live = !composes_direct(false, false, swapchain.format, ui_blend);
+        let display = build_display(
+            &ctx,
+            if display_live { display_size } else { (1, 1) },
+            display_fmt,
+        );
         let present_push = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
@@ -259,7 +293,9 @@ impl Renderer {
             present_layout,
             &[swapchain.format],
             None,
-            if gamma { c"fs_gamma" } else { c"fs_main" },
+            // Present samples the display image, which is only encoded when
+            // it is UNORM and the swapchain is sRGB (see `present_fragment_entry`).
+            present_fragment_entry(ui_blend, swapchain.format),
         );
         unsafe { ctx.device().destroy_shader_module(present_shader, None) };
         let ui = crate::ui::render::UiRenderer::new_with_blend(
@@ -312,6 +348,11 @@ impl Renderer {
             fsr,
             fsr_enabled: temporal,
             display,
+            display_live,
+            display_written: false,
+            frame_capture: false,
+            present_mode,
+            capture_notice: false,
             present_pipeline,
             present_layout,
             present_set,
@@ -341,16 +382,29 @@ impl Renderer {
         }
         // Quiesce the acquire-ahead worker before the swapchain goes away: a
         // request in flight would otherwise touch a destroyed swapchain, and
-        // a token it already delivered carries a dead image index. Its slot's
-        // semaphore is signalled (the image was acquired), so wait it out.
-        if let Some(Ok(token)) = self.acquire.shutdown() {
-            self.reclaim_slot(token.slot);
-        }
-        unsafe { self.ctx.device().device_wait_idle() }.expect("wait idle on resize");
+        // a token it already delivered carries a dead image index (see
+        // `quiesce_gpu`).
+        self.quiesce_gpu();
 
         // Hand the retired swapchain back so the driver can reuse the window.
         let old = self.swapchain.swapchain;
-        self.swapchain = vulkan::Swapchain::new(&self.ctx, size.width, size.height, old);
+        self.swapchain = vulkan::Swapchain::new_with(
+            &self.ctx,
+            size.width,
+            size.height,
+            old,
+            swapchain_options(self.present_mode, self.ui_blend),
+        );
+        // The render-finished semaphores track the swapchain's images, so they
+        // follow it. `quiesce_gpu` above has already waited the device idle,
+        // so nothing still waits on the retired set.
+        let retired = std::mem::replace(
+            &mut self.render_finished,
+            new_render_finished(&self.ctx, self.swapchain.images.len()),
+        );
+        for semaphore in retired {
+            unsafe { self.ctx.device().destroy_semaphore(semaphore, None) };
+        }
         // The surface may clamp or refuse the requested extent — every
         // downstream size derives from the extent actually chosen.
         let actual = self.swapchain.extent;
@@ -359,11 +413,7 @@ impl Renderer {
         if self.targets_ready {
             self.targets = build_targets(&self.ctx, self.render_size);
         }
-        self.display = build_display(
-            &self.ctx,
-            self.display_size,
-            display_format(self.swapchain.format, self.ui_blend),
-        );
+        self.rebuild_display(self.needs_display());
         if let Some(fsr) = self.fsr.as_mut() {
             fsr.resize(self.render_size, self.display_size);
             fsr.set_inputs([
@@ -406,9 +456,136 @@ impl Renderer {
     }
 
     /// Show or hide the centred crosshair drawn by the present pass. Off by
-    /// default; apps that want it (a game's aim reticle) turn it on.
+    /// default; apps that want it (a game's aim reticle) turn it on. The
+    /// crosshair is drawn from the composed display image, so turning it on
+    /// switches frames off the direct path until it is turned off again.
     pub fn set_show_crosshair(&mut self, show: bool) {
+        if self.show_crosshair == show {
+            return;
+        }
         self.show_crosshair = show;
+        self.ensure_display();
+    }
+
+    /// Keep the composed frame so [`Self::capture_rgba8`], [`Self::save_png`],
+    /// [`Self::frame_metrics`] and [`Self::readback_stats`] can read it back.
+    ///
+    /// Off by default: frames are then composed straight into the swapchain
+    /// image, and those readbacks have nothing retained. Call this with `true`
+    /// before rendering the frames you want to read; the next frame is then
+    /// composed into the display image. Turning it off frees that image again
+    /// (after the GPU goes idle).
+    pub fn set_frame_capture(&mut self, enabled: bool) {
+        if self.frame_capture == enabled {
+            return;
+        }
+        self.frame_capture = enabled;
+        self.ensure_display();
+    }
+
+    /// Whether the composed frame is kept for CPU readbacks; see
+    /// [`Self::set_frame_capture`].
+    pub fn frame_capture(&self) -> bool {
+        self.frame_capture
+    }
+
+    /// Choose how finished frames reach the screen (see [`vulkan::PresentMode`]).
+    /// The default is [`vulkan::PresentMode::Fifo`]. Changing it rebuilds the
+    /// swapchain at the current display size; a mode the surface lacks falls
+    /// back to FIFO.
+    ///
+    /// Presenting does not pace the app: a non-FIFO mode lets frames run as
+    /// fast as the CPU builds them, so an animation must sleep to the refresh
+    /// period itself. On some drivers (NVIDIA on Windows) the swapchain and
+    /// fence waits busy-wait, which costs a whole core at high refresh rates.
+    pub fn set_present_mode(&mut self, mode: vulkan::PresentMode) {
+        if self.present_mode == mode {
+            return;
+        }
+        self.present_mode = mode;
+        let (width, height) = self.display_size;
+        self.resize(PhysicalSize::new(width, height));
+    }
+
+    /// The requested present mode; see [`Self::set_present_mode`].
+    pub fn present_mode(&self) -> vulkan::PresentMode {
+        self.present_mode
+    }
+
+    /// Whether frames must be composed through the display image: a crosshair
+    /// is drawn from it, a capture reads it, and it is needed when the gamma
+    /// blend has no UNORM surface to encode into.
+    pub(super) fn needs_display(&self) -> bool {
+        !composes_direct(
+            self.show_crosshair,
+            self.frame_capture,
+            self.swapchain.format,
+            self.ui_blend,
+        )
+    }
+
+    /// Make the display image match [`Self::needs_display`]: allocate it at the
+    /// display size when a frame needs it, otherwise return to the 1x1
+    /// placeholder. Frames in flight may still read the old image, so the GPU
+    /// goes idle before it is replaced.
+    pub(super) fn ensure_display(&mut self) {
+        let live = self.needs_display();
+        if live == self.display_live {
+            return;
+        }
+        self.quiesce_gpu();
+        self.rebuild_display(live);
+        self.write_sets();
+        self.acquire.respawn();
+    }
+
+    /// Replace the display image: full size when `live`, else the 1x1
+    /// placeholder. The caller has quiesced the GPU; the present set is not
+    /// rebound here.
+    fn rebuild_display(&mut self, live: bool) {
+        let size = if live { self.display_size } else { (1, 1) };
+        self.display = build_display(
+            &self.ctx,
+            size,
+            display_format(self.swapchain.format, self.ui_blend),
+        );
+        self.display_live = live;
+        self.display_written = false;
+    }
+
+    /// Join the acquire-ahead worker and wait for the device to go idle, so
+    /// that memory frames may reference can be freed. A reply that landed
+    /// before the join is reclaimed (its slot's semaphore is signalled and
+    /// must be waited out). The worker is left shut down: the caller respawns
+    /// it before the next frame posts a request.
+    ///
+    /// Joining first keeps the device wait from overlapping a
+    /// `vkAcquireNextImageKHR` on the worker thread.
+    fn quiesce_gpu(&mut self) {
+        if let Some(Ok(token)) = self.acquire.shutdown() {
+            self.reclaim_slot(token.slot);
+        }
+        // Read the serial before waiting: idle covers every submission made so
+        // far, and a submission another thread makes later must not be confirmed.
+        let submitted = self.ctx.submitted_serial();
+        unsafe { self.ctx.device().device_wait_idle() }.expect("wait idle on display change");
+        self.ctx.confirm_completed(submitted);
+        self.ctx.collect_retired_buffers();
+    }
+
+    /// Give idle memory back: the UI's upload buffers drop to their start-up
+    /// size, and the composed display image returns to its placeholder when no
+    /// frame needs it. The GPU is waited idle first. Call this when the window
+    /// is hidden; the next frame allocates what it needs again.
+    pub fn trim_memory(&mut self) {
+        self.quiesce_gpu();
+        self.ui.trim();
+        let live = self.needs_display();
+        if live != self.display_live {
+            self.rebuild_display(live);
+            self.write_sets();
+        }
+        self.acquire.respawn();
     }
 
     /// BedFrame's private instanced-quad path (default on). The legacy

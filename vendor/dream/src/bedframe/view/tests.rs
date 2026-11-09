@@ -350,6 +350,56 @@ fn view_paint_order_container_before_children() {
     assert!(u.view_stats().nodes >= 3);
 }
 
+/// Build a 120x60 clipped panel with a 2 px border, containing a full-width
+/// row with its own fill. Returns the finished frame.
+fn clipped_panel_frame(radius: f32) -> crate::ui::draw::UiFrame {
+    let mut u = ui();
+    let panel = Paint {
+        bg: Some(Color::WHITE),
+        border: Some((2.0, Color::BLACK)),
+        radius,
+        clip: true,
+        ..Default::default()
+    };
+    let row = Paint {
+        bg: Some(Color::WHITE),
+        ..Default::default()
+    };
+    u.begin(UiInput::default(), (400.0, 300.0));
+    u.layout_root(Rect::new(0.0, 0.0, 400.0, 300.0), Style::column(), |ui| {
+        ui.container(Style::row().size_px(120.0, 60.0), panel, |ui| {
+            ui.container(Style::row().fill_w().h_px(20.0), row, |ui| {
+                ui.add(Text::new("row"));
+            });
+        });
+    });
+    u.end()
+}
+
+#[test]
+fn view_rounded_clip_carves_children_to_padding_box() {
+    let f = clipped_panel_frame(8.0);
+    let carved: Vec<_> = f.vertices.iter().filter(|v| v.params[3] == -1.0).collect();
+    assert!(
+        !carved.is_empty(),
+        "children of a rounded clip must be carved"
+    );
+    // Padding box: 120x60 inset by the 2 px border, so centre (60, 30) and
+    // half extent (58, 28). Corner radius 8 - 2 = 6.
+    let v = carved[0];
+    assert_eq!(v.params[..3], [60.0, 30.0, 6.0]);
+    assert_eq!(v.extra, [58.0, 28.0]);
+}
+
+#[test]
+fn view_square_clip_children_are_not_carved() {
+    let f = clipped_panel_frame(0.0);
+    assert!(
+        f.vertices.iter().all(|v| v.params[3] != -1.0),
+        "a square clip must not carve its children"
+    );
+}
+
 #[test]
 fn view_baseline_row_aligns_label_button_field() {
     let mut u = ui();
@@ -538,8 +588,14 @@ fn view_late_node_paints_first_frame() {
     });
     let r = u.rect_of("late").unwrap();
     let f = u.end();
+    // Inclusive bounds grown by the one-pixel anti-aliasing pad: an empty
+    // field paints only its padded corners.
+    let near = r.expand(1.0);
     assert!(
-        f.vertices.iter().any(|v| r.contains((v.pos[0], v.pos[1]))),
+        f.vertices.iter().any(|v| {
+            (near.x..=near.max().0).contains(&v.pos[0])
+                && (near.y..=near.max().1).contains(&v.pos[1])
+        }),
         "late TextField painted nothing at {r:?}"
     );
 }
@@ -1175,7 +1231,9 @@ fn view_segmented_solved_geometry() {
     let color = u4.theme().roles.border.focus;
     let expected_ring = Rect::new(fr.x + fr.w * 0.5, fr.y, fr.w * 0.5, fr.h)
         .inset(u4.theme().segmented(crate::ui::font::FontId(0)).inset)
-        .expand(focus.offset + focus.width);
+        // The ring quad adds one physical pixel (the SDF anti-aliasing pad,
+        // 1.0 at this test's scale 1).
+        .expand(focus.offset + focus.width + 1.0);
     let f4 = u4.end();
     let ring: Vec<_> = f4
         .vertices
@@ -1531,10 +1589,156 @@ fn view_keyed_button_keeps_behavior_focus_ring() {
     let rect = u.rect_of("probe").unwrap();
     let color = u.theme().roles.border.focus.to_array();
     let focus = u.theme().tokens.focus;
-    let expected = rect.expand(focus.offset + focus.width);
+    // +1: the ring's SDF quad is padded by one physical pixel (scale 1 here).
+    let expected = rect.expand(focus.offset + focus.width + 1.0);
     let frame = u.end();
     let ring: Vec<_> = frame.vertices.iter().filter(|v| v.color == color).collect();
     assert_eq!(ring.len(), 4, "keyed button lost its focus ring");
     assert_eq!(ring[0].pos, [expected.x, expected.y]);
     assert_eq!(ring[2].pos, [expected.max().0, expected.max().1]);
+}
+
+/// Vertices whose SDF params equal `params` (half extents, radius, mode).
+fn view_shape_count(f: &crate::ui::draw::UiFrame, params: [f32; 4]) -> usize {
+    f.vertices.iter().filter(|v| v.params == params).count()
+}
+
+#[test]
+fn view_shape_circle_is_not_stretched_in_a_row() {
+    let mut u = ui();
+    u.begin(UiInput::default(), (400.0, 300.0));
+    u.layout_root(Rect::new(0.0, 0.0, 400.0, 300.0), Style::column(), |ui| {
+        // Default cross alignment is Stretch; a Px cross size must hold.
+        ui.row(Style::row().h_px(60.0), |ui| {
+            ui.add_styled(
+                Shape::circle(20.0).fill(Color::WHITE),
+                Style::default().key("dot"),
+            );
+        });
+    });
+    let rect = u.rect_of("dot").unwrap();
+    assert_eq!((rect.w, rect.h), (20.0, 20.0));
+    let f = u.end();
+    // One filled SDF quad: half extents 10,10, radius 10, mode 1.
+    assert_eq!(view_shape_count(&f, [10.0, 10.0, 10.0, 1.0]), 4);
+}
+
+#[test]
+fn view_shape_ring_and_arc_modes() {
+    let mut u = ui();
+    u.begin(UiInput::default(), (400.0, 300.0));
+    u.layout_root(Rect::new(0.0, 0.0, 400.0, 300.0), Style::column(), |ui| {
+        ui.add(Shape::ring(40.0, 4.0).fill(Color::WHITE));
+        ui.add(Shape::arc(
+            40.0,
+            4.0,
+            -std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+        ));
+    });
+    let f = u.end();
+    // Ring: outer radius 20, band 4 px → mode 3 + 4.
+    assert_eq!(view_shape_count(&f, [20.0, 20.0, 20.0, 7.0]), 4);
+    // Arc: mid radius 18, half band 2, start -π/2, mode -3.
+    assert_eq!(
+        view_shape_count(&f, [18.0, 2.0, -std::f32::consts::FRAC_PI_2, -3.0]),
+        4
+    );
+}
+
+#[test]
+fn view_shape_fill_and_stroke() {
+    let mut u = ui();
+    u.begin(UiInput::default(), (400.0, 300.0));
+    u.layout_root(Rect::new(0.0, 0.0, 400.0, 300.0), Style::column(), |ui| {
+        ui.add(
+            Shape::circle(30.0)
+                .fill(Color::WHITE)
+                .stroke(2.0, Color::BLACK),
+        );
+    });
+    let f = u.end();
+    // rounded_frame: the opaque border insets the fill by 1 px (radius 14),
+    // and the border is a 2 px ring on the full 30 px disc.
+    let fill = Color::WHITE.to_array();
+    let border = Color::BLACK.to_array();
+    assert_eq!(
+        f.vertices
+            .iter()
+            .filter(|v| v.params == [14.0, 14.0, 14.0, 1.0] && v.color == fill)
+            .count(),
+        4
+    );
+    assert_eq!(
+        f.vertices
+            .iter()
+            .filter(|v| v.params == [15.0, 15.0, 15.0, 5.0] && v.color == border)
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn view_shape_circle_stays_round_in_distorted_box() {
+    let mut u = ui();
+    u.begin(UiInput::default(), (400.0, 300.0));
+    u.layout_root(Rect::new(0.0, 0.0, 400.0, 300.0), Style::column(), |ui| {
+        // A user style gives the box 40x20; the circle is the centred 20 px square.
+        ui.add_styled(
+            Shape::circle(20.0).fill(Color::WHITE),
+            Style::default().key("oval").w_px(40.0).h_px(20.0),
+        );
+    });
+    let rect = u.rect_of("oval").unwrap();
+    assert_eq!((rect.w, rect.h), (40.0, 20.0));
+    let f = u.end();
+    assert_eq!(view_shape_count(&f, [10.0, 10.0, 10.0, 1.0]), 4);
+}
+
+#[test]
+fn view_shape_default_colour_is_theme_accent() {
+    let mut u = ui();
+    u.begin(UiInput::default(), (400.0, 300.0));
+    u.layout_root(Rect::new(0.0, 0.0, 400.0, 300.0), Style::column(), |ui| {
+        ui.add(Shape::rect(10.0, 10.0));
+        ui.add(Shape::ring(20.0, 2.0));
+    });
+    let accent = u.theme().accent.to_array();
+    let f = u.end();
+    assert!(!f.vertices.is_empty());
+    assert!(f.vertices.iter().all(|v| v.color == accent));
+}
+
+#[test]
+fn view_shape_radius_full_container_paints_finite_pill() {
+    let mut u = ui();
+    let pill = Paint {
+        bg: Some(Color::WHITE),
+        border: Some((2.0, Color::BLACK)),
+        clip: true,
+        ..Default::default()
+    }
+    .radius_full();
+    u.begin(UiInput::default(), (400.0, 300.0));
+    u.layout_root(Rect::new(0.0, 0.0, 400.0, 300.0), Style::column(), |ui| {
+        ui.container(Style::row().size_px(60.0, 30.0), pill, |ui| {
+            ui.add(Text::new("pill"));
+        });
+    });
+    let f = u.end();
+    for v in &f.vertices {
+        assert!(
+            v.params.iter().all(|p| p.is_finite()) && v.pos.iter().all(|p| p.is_finite()),
+            "non-finite geometry from radius_full: {v:?}"
+        );
+    }
+    // Border: radius clamped to the short side's half (15), mode 3 + 2.
+    assert_eq!(view_shape_count(&f, [30.0, 15.0, 15.0, 5.0]), 4);
+    // Clip carve: the padding box is 56x26, so its radius clamps to 13.
+    let carved: Vec<_> = f.vertices.iter().filter(|v| v.params[3] == -1.0).collect();
+    assert!(
+        !carved.is_empty(),
+        "children of a radius_full clip are carved"
+    );
+    assert_eq!(carved[0].params[2], 13.0);
 }

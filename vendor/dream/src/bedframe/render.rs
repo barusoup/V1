@@ -62,6 +62,12 @@ impl ResizePolicy {
         self.capacity
     }
 
+    /// Back to the creation size, with the shrink count restarted.
+    fn reset_to_floor(&mut self) {
+        self.capacity = self.floor;
+        self.low_frames = 0;
+    }
+
     /// Account for a frame needing `needed` bytes and return the new capacity
     /// when the buffer must be recreated, or `None` to keep the existing one.
     fn resolve(&mut self, needed: u64) -> Option<u64> {
@@ -150,6 +156,10 @@ pub struct UiRenderer {
     pipeline: vk::Pipeline,
     /// Private instanced-quad pipeline (same layout/dsl/push).
     instance_pipeline: vk::Pipeline,
+    /// Frosted-glass variants of `pipeline` and `instance_pipeline`. Equal to
+    /// them in linear mode; see the note in `new_with_blend`.
+    backdrop_pipeline: vk::Pipeline,
+    backdrop_instance_pipeline: vk::Pipeline,
     /// Compact instancing path — `set_instancing(false)` renders the old
     /// raw-indexed path byte-for-byte.
     instancing: bool,
@@ -178,21 +188,24 @@ pub struct UiRenderer {
 /// Colour space the UI pass blends in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UiBlend {
-    /// Linear light: colours are decoded to linear and the sRGB target
-    /// encodes on write. Physically correct; the engine default.
-    #[default]
-    Linear,
     /// sRGB-encoded values, the way web browsers composite: translucent
     /// layers, gradients and anti-aliased edges match CSS pixel for pixel.
-    /// Needs a UNORM target holding encoded values.
+    /// Needs a UNORM target holding encoded values. The engine default.
+    #[default]
     Gamma,
+    /// Physically linear light: colours are decoded to linear and the sRGB
+    /// target encodes on write. Light-on-dark edges look heavier and dark
+    /// text on light backgrounds thinner than in browsers. Opt in with
+    /// [`Renderer::new_with_ui_blend`](crate::gfx::Renderer::new_with_ui_blend).
+    Linear,
 }
 
 impl UiRenderer {
-    /// Build for targets of `format` (the swapchain format). The UI pass
-    /// writes straight-alpha sRGB colour; `format` should be an sRGB surface.
+    /// Build for targets of `format` (the swapchain format), blending in
+    /// [`UiBlend::default()`]. With the default [`UiBlend::Gamma`], `format`
+    /// must be a UNORM target that stores sRGB-encoded values.
     pub fn new(ctx: &Arc<GpuContext>, format: vk::Format, page_size: u32) -> Self {
-        Self::new_with_blend(ctx, format, page_size, UiBlend::Linear)
+        Self::new_with_blend(ctx, format, page_size, UiBlend::default())
     }
 
     /// Like [`Self::new`], with an explicit [`UiBlend`]. For
@@ -317,6 +330,36 @@ impl UiRenderer {
                 c"fs_linear"
             },
         );
+        // Frosted glass samples its backdrop undecoded. In gamma mode the
+        // shared fragment entries re-encode every sample, so glass needs its
+        // own entry that decodes first (`fs_backdrop`). Linear mode already
+        // samples raw and shares the ordinary pipelines.
+        let (backdrop_pipeline, backdrop_instance_pipeline) = if gamma {
+            (
+                create_ui_pipeline(
+                    ctx,
+                    shader,
+                    &binding,
+                    &attrs,
+                    layout,
+                    format,
+                    c"vs_main",
+                    c"fs_backdrop",
+                ),
+                create_ui_pipeline(
+                    ctx,
+                    shader,
+                    &instance_binding,
+                    &instance_attrs,
+                    layout,
+                    format,
+                    c"vs_instance_gamma",
+                    c"fs_backdrop",
+                ),
+            )
+        } else {
+            (pipeline, instance_pipeline)
+        };
         unsafe { ctx.device().destroy_shader_module(shader, None) };
 
         let white = Arc::new(GpuTexture::white(ctx));
@@ -324,12 +367,14 @@ impl UiRenderer {
             .map(|_| new_slot(ctx, 8 * 1024, 4 * 1024))
             .collect();
         let backdrop = (0..slots.len()).map(|_| None).collect();
-        let blur = backdrop::BlurPipelines::new(ctx, format);
+        let blur = backdrop::BlurPipelines::new(ctx, dsl, format);
 
         Self {
             ctx: Arc::clone(ctx),
             pipeline,
             instance_pipeline,
+            backdrop_pipeline,
+            backdrop_instance_pipeline,
             instancing: true,
             layout,
             dsl,
@@ -375,9 +420,82 @@ impl UiRenderer {
             .sum()
     }
 
+    /// Give every frame slot's upload buffers back at their policy floor, so
+    /// the peak of a busy spell is released at once instead of after a run of
+    /// quiet frames. An idle UI (hidden
+    /// window, minimised) calls this so it holds only its start-up footprint.
+    ///
+    /// The caller guarantees the GPU is idle (`device_wait_idle`): the old
+    /// buffers are freed here, and so are the frosted-glass backdrop textures
+    /// (they are remade on the next glass frame). Each slot's retained list is
+    /// cleared too, since it would otherwise keep those textures alive until
+    /// the slot's next record. The current atlas pages are not touched.
+    pub fn trim(&mut self) {
+        for backdrop in &mut self.backdrop {
+            *backdrop = None;
+        }
+        for slot in &mut self.slots {
+            slot.retained.clear();
+            slot.retained_seen.clear();
+            slot.vertex_policy.reset_to_floor();
+            slot.index_policy.reset_to_floor();
+            slot.instances_policy.reset_to_floor();
+            slot.staging_policy.reset_to_floor();
+            slot.vertices = self
+                .ctx
+                .create_host_vertex_buffer("ui vertices", slot.vertex_policy.capacity());
+            slot.indices = self
+                .ctx
+                .create_host_index_buffer("ui indices", slot.index_policy.capacity());
+            slot.instances = self
+                .ctx
+                .create_host_vertex_buffer("ui instances", slot.instances_policy.capacity());
+            slot.staging = self
+                .ctx
+                .create_transfer_buffer("ui atlas staging", slot.staging_policy.capacity());
+        }
+    }
+
     /// Record the UI pass onto `target_view` (`extent` in pixels). The target
-    /// must already hold the frame underneath (load, don't clear).
+    /// must already hold the frame underneath (load, don't clear). The target
+    /// is expected in `GENERAL`; see [`Self::record_in_layout`].
+    ///
+    /// Frosted-glass ([`CmdTexture::Backdrop`](super::draw::CmdTexture::Backdrop))
+    /// draws sample their backdrop textures, but this entry point has no image
+    /// to copy from, so it does not capture one: the glass shows the last
+    /// backdrop this slot captured (blank until the first capture). Use
+    /// [`Self::record_in_layout`] with the target image to get a live backdrop.
     pub fn record(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        frame_slot: usize,
+        target_view: vk::ImageView,
+        extent: (u32, u32),
+        frame: &UiFrame,
+    ) {
+        self.record_in_layout(
+            cmd,
+            frame_slot,
+            vk::Image::null(),
+            target_view,
+            extent,
+            frame,
+            vk::ImageLayout::GENERAL,
+        );
+    }
+
+    /// [`Self::record`] for a target held in `layout` (for example the
+    /// swapchain image, `COLOR_ATTACHMENT_OPTIMAL`, when the frame is composed
+    /// straight into it). The layout only changes the attachment's declared
+    /// layout; the pipelines and their blending are the same.
+    ///
+    /// `target_image` is the image behind `target_view`, in `layout`. It is
+    /// copied for frosted-glass backdrops, and the copy needs it to be
+    /// blittable (`TRANSFER_SRC`). Pass `vk::Image::null()` when it is not
+    /// available: the backdrop capture is then skipped and glass shows the last
+    /// backdrop this slot captured.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_in_layout(
         &mut self,
         cmd: vk::CommandBuffer,
         frame_slot: usize,
@@ -385,6 +503,7 @@ impl UiRenderer {
         target_view: vk::ImageView,
         extent: (u32, u32),
         frame: &UiFrame,
+        layout: vk::ImageLayout,
     ) {
         let device = self.ctx.device().clone();
         // The *last-record* counters reset every call — an empty-upload
@@ -410,7 +529,7 @@ impl UiRenderer {
             .iter()
             .any(|draw| matches!(draw.texture, super::draw::CmdTexture::Backdrop))
         {
-            self.ensure_backdrop(slot_index, extent);
+            self.ensure_backdrop(slot_index, cmd, extent);
         }
         {
             // The slot is about to be re-recorded: whatever its previous
@@ -506,10 +625,11 @@ impl UiRenderer {
                 height: extent.1,
             },
         };
-        // The pass is begun again after a backdrop capture (see below), so its setup is a closure
-        // over copies of the handles it needs, not a borrow of the slot.
+        // The pass is begun again after a backdrop capture (see below), so its
+        // setup is a closure over copies of the handles it needs, not a borrow
+        // of the slot or of `self`.
         let pipeline = self.pipeline;
-        let layout = self.layout;
+        let pipeline_layout = self.layout;
         let vertex_buffer = slot.vertices.buffer;
         let index_buffer = slot.indices.buffer;
         let instance_buffer = slot.instances.buffer;
@@ -522,7 +642,7 @@ impl UiRenderer {
                     .layer_count(1)
                     .color_attachments(&[vk::RenderingAttachmentInfo::default()
                         .image_view(target_view)
-                        .image_layout(vk::ImageLayout::GENERAL)
+                        .image_layout(layout)
                         .load_op(vk::AttachmentLoadOp::LOAD)
                         .store_op(vk::AttachmentStoreOp::STORE)]),
             );
@@ -546,7 +666,7 @@ impl UiRenderer {
             device.cmd_bind_vertex_buffers(cmd, 1, &[instance_buffer], &[0]);
             device.cmd_push_constants(
                 cmd,
-                layout,
+                pipeline_layout,
                 vk::ShaderStageFlags::VERTEX,
                 0,
                 bytemuck::bytes_of(&push),
@@ -569,25 +689,28 @@ impl UiRenderer {
         let mut bound_pipeline = self.pipeline;
         for prepared_draw in &prepared.draws {
             let draw = &frame.cmds[prepared_draw.cmd_index];
-            // The first glass draw needs everything beneath it drawn. End the pass, blur the frame
-            // so far, and begin again; cached bindings are stale after that and are re-established.
+            // The first glass draw needs everything beneath it drawn. End the pass, blur the target so
+            // far, and begin again; cached bindings are stale after that and are re-established. With no
+            // target image there is nothing to copy, so the pass just carries on.
             if matches!(draw.texture, super::draw::CmdTexture::Backdrop) && !captured {
-                unsafe { device.cmd_end_rendering(cmd) };
-                self.capture_backdrop(slot_index, cmd, target_image, extent);
-                begin_pass(cmd);
                 captured = true;
-                bound_set = vk::DescriptorSet::null();
-                bound_scissor = vk::Rect2D {
-                    offset: vk::Offset2D {
-                        x: i32::MIN,
-                        y: i32::MIN,
-                    },
-                    extent: vk::Extent2D {
-                        width: u32::MAX,
-                        height: u32::MAX,
-                    },
-                };
-                bound_pipeline = pipeline;
+                if target_image != vk::Image::null() {
+                    unsafe { device.cmd_end_rendering(cmd) };
+                    self.capture_backdrop(slot_index, cmd, target_image, layout, extent);
+                    begin_pass(cmd);
+                    bound_set = vk::DescriptorSet::null();
+                    bound_scissor = vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: i32::MIN,
+                            y: i32::MIN,
+                        },
+                        extent: vk::Extent2D {
+                            width: u32::MAX,
+                            height: u32::MAX,
+                        },
+                    };
+                    bound_pipeline = pipeline;
+                }
             }
             let set = match &draw.texture {
                 super::draw::CmdTexture::Backdrop => self.backdrop_set(slot_index),
@@ -644,26 +767,29 @@ impl UiRenderer {
                     device.cmd_set_scissor(cmd, 0, &[scissor]);
                     bound_scissor = scissor;
                 }
+                let glass = matches!(draw.texture, super::draw::CmdTexture::Backdrop);
                 match prepared_draw.kind {
                     DrawKind::Indexed { first, count } => {
-                        if bound_pipeline != self.pipeline {
-                            device.cmd_bind_pipeline(
-                                cmd,
-                                vk::PipelineBindPoint::GRAPHICS,
-                                self.pipeline,
-                            );
-                            bound_pipeline = self.pipeline;
+                        let wanted = if glass {
+                            self.backdrop_pipeline
+                        } else {
+                            self.pipeline
+                        };
+                        if bound_pipeline != wanted {
+                            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, wanted);
+                            bound_pipeline = wanted;
                         }
                         device.cmd_draw_indexed(cmd, count, 1, first, 0, 0);
                     }
                     DrawKind::Instanced { first, count } => {
-                        if bound_pipeline != self.instance_pipeline {
-                            device.cmd_bind_pipeline(
-                                cmd,
-                                vk::PipelineBindPoint::GRAPHICS,
-                                self.instance_pipeline,
-                            );
-                            bound_pipeline = self.instance_pipeline;
+                        let wanted = if glass {
+                            self.backdrop_instance_pipeline
+                        } else {
+                            self.instance_pipeline
+                        };
+                        if bound_pipeline != wanted {
+                            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, wanted);
+                            bound_pipeline = wanted;
                         }
                         device.cmd_draw(cmd, 6, count, 0, first);
                     }
@@ -1032,6 +1158,20 @@ impl UiRenderer {
                             layer_count: 1,
                         }],
                     );
+                    // The partial copy below writes the same page: order it
+                    // after the clear (SYNC-HAZARD-WRITE-AFTER-WRITE).
+                    let order = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[order],
+                        &[],
+                        &[],
+                    );
                 }
                 let region = vk::BufferImageCopy::default()
                     .buffer_offset(buffer_offset)
@@ -1145,7 +1285,15 @@ impl Drop for UiRenderer {
             let _ = self.ctx.device().device_wait_idle();
             let device = self.ctx.device();
             device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline(self.instance_pipeline, None);
+            if self.backdrop_pipeline != self.pipeline {
+                device.destroy_pipeline(self.backdrop_pipeline, None);
+            }
+            if self.backdrop_instance_pipeline != self.instance_pipeline {
+                device.destroy_pipeline(self.backdrop_instance_pipeline, None);
+            }
             device.destroy_pipeline_layout(self.layout, None);
+            self.blur.destroy(&self.ctx);
             device.destroy_descriptor_set_layout(self.dsl, None);
         }
     }

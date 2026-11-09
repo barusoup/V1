@@ -169,6 +169,51 @@ fn layout_flex_percent_and_aspect() {
     assert_eq!(t.rect(b), Rect::new(0.0, 10.0, 40.0, 20.0));
 }
 
+#[test]
+fn layout_aspect_item_is_not_stretched_in_row() {
+    let mut t = LayoutTree::new();
+    let r = t.push(None, Style::row().h_px(100.0), Leaf::None);
+    // Width 40 with ratio 1: height 40, not the 100 px line.
+    let a = t.push(
+        Some(r),
+        Style::default().w_px(40.0).aspect(1.0),
+        fixed(0.0, 0.0),
+    );
+    // A plain sibling still stretches to the line.
+    let b = t.push(Some(r), Style::default().w_px(20.0), fixed(20.0, 10.0));
+    solve(&mut t, 300.0, 100.0);
+    assert_eq!(t.rect(a), Rect::new(0.0, 0.0, 40.0, 40.0));
+    assert_eq!(t.rect(b), Rect::new(40.0, 0.0, 20.0, 100.0));
+}
+
+#[test]
+fn layout_aspect_item_is_not_stretched_in_column() {
+    let mut t = LayoutTree::new();
+    let r = t.push(None, Style::column().w_px(100.0), Leaf::None);
+    // Height 40 with ratio 2 (w / h): width 80, not the 100 px column.
+    let a = t.push(
+        Some(r),
+        Style::default().h_px(40.0).aspect(2.0),
+        fixed(0.0, 0.0),
+    );
+    solve(&mut t, 100.0, 300.0);
+    assert_eq!(t.rect(a), Rect::new(0.0, 0.0, 80.0, 40.0));
+}
+
+#[test]
+fn layout_aspect_item_cross_follows_resolved_main() {
+    let mut t = LayoutTree::new();
+    let r = t.push(None, Style::row().h_px(200.0), Leaf::None);
+    // Grows to the full 300 px row; its height follows: 300 / 2 = 150.
+    let a = t.push(
+        Some(r),
+        Style::default().fill_w().aspect(2.0),
+        fixed(0.0, 0.0),
+    );
+    solve(&mut t, 300.0, 200.0);
+    assert_eq!(t.rect(a), Rect::new(0.0, 0.0, 300.0, 150.0));
+}
+
 struct Text {
     text_w: f32,
     line: f32,
