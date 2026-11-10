@@ -467,6 +467,13 @@ pub struct State {
     search_wanted: bool,
     /// The text the bar held when a page change cleared it, kept on screen while the bar slides away.
     search_ghost: Option<String>,
+    /// When the reader last scrolled the page, so its scrollbar can stay for a moment and then fade
+    /// (see [`build`]). `None` until the first scroll, and again once the bar is fully away.
+    bar_at: Option<Instant>,
+    /// The pointer is on the page's right edge, where the scrollbar floats.
+    bar_hover: bool,
+    /// The pointer holds the scrollbar, so it stays up for as long as the hold lasts.
+    bar_grab: bool,
     volume_open: bool,
     /// The lyric page is open. It is a page of its own: it takes the place of the tab's content.
     lyrics_open: bool,
@@ -690,6 +697,9 @@ impl State {
             glyph_loading: false,
             search_wanted: false,
             search_ghost: None,
+            bar_at: None,
+            bar_hover: false,
+            bar_grab: false,
             volume_open: false,
             lyrics_open: false,
             lyrics_follow: LyricsFollow::default(),
@@ -1244,6 +1254,16 @@ impl State {
         follow
             .scrolled_at
             .map(|at| at + std::time::Duration::from_secs_f32(LYRIC_IDLE_SECS))
+    }
+
+    /// When the scrollbar starts to fade, so the host wakes for it even when nothing else is moving.
+    /// `None` while none is up, or while the pointer keeps one up.
+    pub fn bars_fade_at(&self) -> Option<Instant> {
+        if self.bar_hover || self.bar_grab {
+            return None;
+        }
+        self.bar_at
+            .map(|at| at + std::time::Duration::from_secs_f32(BAR_LINGER))
     }
 
     /// Switch tabs as if the user had clicked one; used by the screenshot harness to film the
@@ -2129,9 +2149,47 @@ fn clock(seconds: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::clock;
-    use super::{advance_badge, BADGE_QUIET_HOLD, SEARCH_CLOSE_RATE, SEARCH_OPEN_RATE};
-    use crate::anim::Anims;
+    use super::{advance_badge, bars_shown, BAR_LINGER, BADGE_QUIET_HOLD, SEARCH_CLOSE_RATE, SEARCH_OPEN_RATE};
+    use crate::anim::{rate, Anims};
     use std::time::{Duration, Instant};
+
+    /// The scrollbar stays up for a moment after the last scroll, then goes. Scrolling, and reaching
+    /// for the bar, bring it straight back.
+    #[test]
+    fn the_scrollbar_lingers_after_the_last_scroll_then_goes() {
+        let now = Instant::now();
+        let just_scrolled = now - Duration::from_secs_f32(BAR_LINGER * 0.5);
+        let long_ago = now - Duration::from_secs_f32(BAR_LINGER + 0.5);
+        assert!(bars_shown(now, Some(just_scrolled), false, false), "it should still be up during the linger");
+        assert!(!bars_shown(now, Some(long_ago), false, false), "it should be gone after the linger");
+        assert!(bars_shown(now, Some(long_ago), true, false), "the pointer on it should bring it back");
+        assert!(bars_shown(now, None, false, true), "scrolling should bring it up");
+        assert!(!bars_shown(now, None, false, false), "it should stay hidden before anything scrolls");
+    }
+
+    /// Played out frame by frame: the bar holds for the whole linger, then fades out within a quarter
+    /// of a second, and the motion stops so the host can park.
+    #[test]
+    fn the_scrollbar_holds_its_linger_then_fades_out() {
+        let start = Instant::now();
+        let step = 1.0 / 60.0;
+        let mut anims = Anims::default();
+        let mut alpha = 1.0;
+        for frame in 0..120 {
+            let elapsed = frame as f32 * step;
+            let now = start + Duration::from_secs_f32(elapsed);
+            let shown = bars_shown(now, Some(start), false, false);
+            anims.begin(step);
+            let bar_rate = if shown { rate::QUICKER } else { rate::QUICK };
+            alpha = anims.toggle("bar", 0, shown, bar_rate);
+            if elapsed < BAR_LINGER - 0.05 {
+                assert!(alpha > 0.99, "it faded during the linger, at {elapsed:.2}s: {alpha}");
+            }
+        }
+        // Two seconds after the last scroll it is gone, and nothing is left moving.
+        assert_eq!(alpha, 0.0, "it never faded out");
+        assert!(!anims.moving(), "the host should be free to park");
+    }
 
     /// The badge over a playing cover must not blink while the volume slider moves the meters
     /// across the threshold. It latches on, tolerates short dips, and only clears after a pause.
@@ -2258,6 +2316,18 @@ fn since(now: Instant, then: Instant) -> f32 {
     now.saturating_duration_since(then).as_secs_f32()
 }
 
+/// How long a scrollbar stays up after the reader stops scrolling, before it fades away.
+const BAR_LINGER: f32 = 1.2;
+/// How close to the page's right edge the pointer brings the scrollbar back up, in pixels. The bar
+/// floats in the margin there, and the rows keep clear of it.
+const BAR_REACH: f32 = 30.0;
+
+/// Whether the scrollbar shows at `now`: while the reader is scrolling, while the pointer is on it,
+/// and for [`BAR_LINGER`] after the last scroll.
+fn bars_shown(now: Instant, last: Option<Instant>, hot: bool, scrolling: bool) -> bool {
+    scrolling || hot || last.is_some_and(|at| since(now, at) < BAR_LINGER)
+}
+
 /// Build one frame. The caller owns the renderer; this only produces geometry.
 ///
 /// `width` and `height` are in logical units; `scale` is device pixels per logical unit (the
@@ -2311,8 +2381,9 @@ pub fn build(
     anims.begin(dt);
 
     // Wheel input over the lyric page is the reader taking it over (see `LyricsFollow`). Read it
-    // before `input` moves into the UI.
+    // before `input` moves into the UI, along with the keys, which scroll the view under the pointer.
     let wheel = input.wheel + input.wheel_precise;
+    let keys = input.nav;
 
     // The track menu closes on a scroll, and on a press outside it. A right press outside it closes it
     // and then reaches the page, so right-clicking another track opens that track's menu. A left press
@@ -2333,13 +2404,6 @@ pub fn build(
     ui.begin(input, (width, height));
     ui.set_theme(&dark);
     ui.set_focus_rings(false);
-    ui.scrollbar = ScrollbarStyle {
-        width: 4.0,
-        inset: 14.0,
-        min_thumb: 40.0,
-        idle: theme::THUMB,
-        active: theme::THUMB_HOT,
-    };
     ui.rect(Rect::new(0.0, 0.0, width, height), theme::BG);
 
     // Layout.
@@ -2358,6 +2422,7 @@ pub fn build(
         theme::CAPTION_BTN_W * 2.0,
         theme::CAPTION_H,
     );
+
     if state.lyrics_open && wheel != 0.0 && main.contains(pointer.pos) {
         state.lyrics_follow.reader = true;
         state.lyrics_follow.scrolled_at = Some(now);
@@ -2390,12 +2455,51 @@ pub fn build(
         state.results_scroll = ui.scroll_state(&list_id).0;
     }
     // `V1_SHOT_SCROLL=<px>` scrolls the list on screen to that offset, to check the glass over rows.
+    // It counts as the reader scrolling, so the bar is up in the shot as it would be for them.
     if let Some(target) = std::env::var("V1_SHOT_SCROLL").ok().and_then(|v| v.parse::<f32>().ok()) {
+        state.bar_at = Some(now);
         let current = ui.scroll_state(&list_id).0;
         if (target - current).abs() > 0.5 {
             ui.scroll_by(&list_id, target - current, dream::ui::widgets::ScrollBehavior::Instant);
         }
     }
+
+    // The scrollbar hides itself when the reader is not scrolling. A wheel turn, a key or a press on
+    // the bar brings it up at once; it lingers for a moment after the last of that, then fades away.
+    // Reaching for the page's right edge, where the bar floats, or holding it keeps it up.
+    let over_bar = pointer.pos.0 > width - BAR_REACH
+        && pointer.pos.1 > theme::SEARCH_TOP + theme::CAPTION_H
+        && pointer.pos.1 < body_h;
+    if pointer.pressed && over_bar {
+        state.bar_grab = true;
+    } else if !pointer.down {
+        state.bar_grab = false;
+    }
+    let keys_scrolled = !focused
+        && (keys.up || keys.down || keys.page_up || keys.page_down || keys.home || keys.end);
+    let scrolling = state.bar_grab
+        || keys_scrolled
+        || (wheel != 0.0 && main.contains(pointer.pos));
+    state.bar_hover = over_bar;
+    if scrolling {
+        state.bar_at = Some(now);
+    }
+    let bar_up = bars_shown(now, state.bar_at, over_bar, scrolling);
+    // It comes back quickly, and goes a little more gently.
+    let bar_rate = if bar_up { rate::QUICKER } else { rate::QUICK };
+    let bar_alpha = anims.toggle("bar", 0, bar_up, bar_rate);
+    if !bar_up && bar_alpha <= 0.0 {
+        // Fully away: nothing left for the host to wake for.
+        state.bar_at = None;
+    }
+    ui.scrollbar = ScrollbarStyle {
+        width: 4.0,
+        inset: 14.0,
+        min_thumb: 40.0,
+        idle: fade(theme::THUMB, bar_alpha),
+        active: fade(theme::THUMB_HOT, bar_alpha),
+    };
+
     // A detail page is pinned like the results: the bar, and the back button with it, stay up while
     // the page is at its top.
     let at_top = ui.scroll_state(&list_id).0 < 0.5;

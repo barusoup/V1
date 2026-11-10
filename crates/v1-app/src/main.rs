@@ -130,9 +130,14 @@ struct Host {
     clock: clock::FrameClock,
     /// When the last frame began, for pacing the next one (see [`Host::pace`]).
     last_frame: Instant,
-    /// The refresh rate of the monitor the window is on, in Hz, re-read each pass so a move to
-    /// another monitor takes effect at once. `None` when the platform does not report one.
+    /// The monitor the window is on, so a move is noticed without asking Windows for the refresh
+    /// rate every frame: that query is too slow to run hundreds of times a second.
+    display_monitor: Option<winit::monitor::MonitorHandle>,
+    /// The refresh rate of [`display_monitor`](Self::display_monitor), in Hz. `None` when the
+    /// platform does not report one.
     display_hz: Option<f32>,
+    /// When the refresh rate was last read, so a changed display mode is still picked up.
+    display_hz_at: Instant,
     hand_cursor: bool,
     /// The window is occluded (another window covers it fully) or minimized. Nothing visible needs
     /// drawing then, and drawing would only animate panels the user cannot see.
@@ -282,6 +287,9 @@ impl ApplicationHandler<UserEvent> for Host {
         self.ui = Some(Ui::new(Fonts::bundled(), AtlasConfig::default()));
         boot_mark("fonts and ui ready");
         self.window = Some(window);
+        // Know the refresh rate before the first frame, so startup motion is paced correctly.
+        self.display_monitor = self.window.as_ref().and_then(|window| window.current_monitor());
+        self.display_hz = self.display_monitor.as_ref().and_then(monitor_hz);
         // Windows routes earbud and keyboard transport buttons through SMTC, not through a Win32
         // window message, so a session is what makes them reach the app at all.
         let proxy = self.proxy.clone();
@@ -455,7 +463,15 @@ impl ApplicationHandler<UserEvent> for Host {
             return;
         }
         if let Some(window) = &self.window {
-            self.display_hz = monitor_hz(window);
+            // `MonitorFromWindow` is cheap; `EnumDisplaySettingsExW`, which has the refresh rate, is
+            // not. Only ask for it when the window has actually moved to another monitor.
+            let monitor = window.current_monitor();
+            let stale = now.duration_since(self.display_hz_at).as_secs_f32() >= 1.0;
+            if monitor != self.display_monitor || stale {
+                self.display_hz = monitor.as_ref().and_then(monitor_hz);
+                self.display_monitor = monitor;
+                self.display_hz_at = now;
+            }
         }
         if let (Some(path), Some(at)) = (self.shot.clone(), self.shoot_at) {
             if now >= at {
@@ -466,25 +482,22 @@ impl ApplicationHandler<UserEvent> for Host {
         // Return the working set to the OS when the warm-up or a quiet period has elapsed. Run it
         // before choosing the wait so the deadline below is the next pending trim, not this one.
         self.idle_maintenance(now);
-        // Motion (a transition, a spring, a window drag) is drawn at the monitor's refresh rate, up
-        // to a cap, so it follows the pointer and the animations without a lag while a high-refresh
-        // display does not make the app render hundreds of frames a second.
-        if self.state.animating() || self.drag.is_some() {
+        // Motion (a transition, a spring, a window drag) is drawn at the monitor's refresh rate, so
+        // it follows the pointer and the animations without a lag. Playback moves the progress bar,
+        // the clock and the equalizer, which are motion too, so it gets the same rate.
+        if self.state.animating() || self.drag.is_some() || self.state.is_playing() {
             self.pace(event_loop, self.frame_period());
-        } else if self.state.is_playing() {
-            // Playback moves the progress bar, the clock and the equalizer, and is paced below the
-            // monitor's rate: only those move, and the app should not burn a core drawing them.
-            self.pace(event_loop, self.playback_period());
         } else if self.state.busy() || self.state.awaiting_covers() {
             self.pace(event_loop, WAITING_FRAME);
         } else {
-            // The lyric page may be waiting out a reader's scroll, the collection may have a file
-            // to clear or a download to retry, or a working-set trim may be pending. Wake for the
-            // earliest of them; only the first two need a frame.
+            // The lyric page may be waiting out a reader's scroll, the scrollbar may be about to
+            // fade, the collection may have a file to clear or a download to retry, or a working-set
+            // trim may be pending. Wake for the earliest of them; only the first three need a frame.
             let frame_wake = self
                 .state
                 .lyrics_resume_at()
                 .into_iter()
+                .chain(self.state.bars_fade_at())
                 .chain(self.shoot_at)
                 .chain(self.state.library_wake_at())
                 .min();
@@ -510,40 +523,17 @@ const WAITING_FRAME: std::time::Duration = std::time::Duration::from_millis(80);
 /// player still needs a poll now and then so a finished song moves on and timers fire.
 const HIDDEN_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Frames per second for steady playback. The playhead, the time and the small equalizers are the
-/// only things moving then, and 30 Hz is smooth for them while costing half the CPU of the display's
-/// refresh rate. Anything that is actually animating still gets the full rate.
-const PLAYBACK_FPS: f32 = 30.0;
-
-/// The fastest the app animates or follows a dragged window. A 360 Hz monitor would otherwise ask
-/// for six times the frames of a 60 Hz one for the same springs and curves; 120 Hz is already past
-/// what the eye needs for UI motion and still leaves input events to redraw at once.
-const MOTION_FPS: f32 = 120.0;
-
 /// The rate used when the platform does not report the monitor's refresh rate.
 const FALLBACK_HZ: f32 = 60.0;
 
 impl Host {
     /// Time between frames while something is moving or playing: one frame per refresh of the
-    /// monitor the window is on, capped at [`MOTION_FPS`], so the picture is never drawn faster than
-    /// the display can show it (or faster than the app needs to animate).
+    /// monitor the window is on, so motion follows the display instead of a fixed ceiling.
     fn frame_period(&self) -> std::time::Duration {
         let hz = self
             .display_hz
             .filter(|hz| hz.is_finite() && *hz > 1.0)
-            .unwrap_or(FALLBACK_HZ)
-            .min(MOTION_FPS);
-        std::time::Duration::from_secs_f32(1.0 / hz.clamp(10.0, 1000.0))
-    }
-
-    /// Time between frames while only playback is moving: no faster than [`PLAYBACK_FPS`], and never
-    /// faster than the display.
-    fn playback_period(&self) -> std::time::Duration {
-        let hz = self
-            .display_hz
-            .filter(|hz| hz.is_finite() && *hz > 1.0)
-            .unwrap_or(FALLBACK_HZ)
-            .min(PLAYBACK_FPS);
+            .unwrap_or(FALLBACK_HZ);
         std::time::Duration::from_secs_f32(1.0 / hz.clamp(10.0, 1000.0))
     }
 
@@ -924,11 +914,10 @@ impl Host {
     }
 }
 
-/// The refresh rate of the monitor the window is on, in Hz, if the platform reports one.
-fn monitor_hz(window: &Window) -> Option<f32> {
-    window
-        .current_monitor()
-        .and_then(|monitor| monitor.refresh_rate_millihertz())
+/// A monitor's refresh rate in Hz, if the platform reports one.
+fn monitor_hz(monitor: &winit::monitor::MonitorHandle) -> Option<f32> {
+    monitor
+        .refresh_rate_millihertz()
         .map(|millihertz| millihertz as f32 / 1000.0)
 }
 
@@ -1112,7 +1101,9 @@ fn main() {
         wheel: 0.0,
         clock: clock::FrameClock::new(Instant::now()),
         last_frame: Instant::now(),
+        display_monitor: None,
         display_hz: None,
+        display_hz_at: Instant::now(),
         hand_cursor: false,
         occluded: false,
         memory: dream::memory::IdleTrim::new(),
