@@ -21,6 +21,7 @@ mod instance;
 mod library;
 mod media;
 mod playlist;
+mod prefs;
 mod spectrum;
 mod store;
 mod theme;

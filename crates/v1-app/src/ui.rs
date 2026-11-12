@@ -39,6 +39,7 @@ use crate::gpu::{CoverImage, Gpu};
 use crate::icons::{self, Icon};
 use crate::library::{Effects, Library};
 use crate::playlist::Playlist;
+use crate::prefs::{Prefs, DEFAULT_VOLUME};
 use crate::spectrum::{self, Spectrum};
 use crate::theme::{self, ease_out, fade, mix};
 use crate::widgets::{hash, Cx, QueueDrag, SliderId};
@@ -407,6 +408,8 @@ pub struct State {
     /// 0..=1 of the current track, bound to the seek bar.
     pub seek: f32,
     pub volume: f32,
+    /// The preferences behind the volume, and whatever else outlives a run.
+    prefs: Prefs,
     /// Set by the host when Enter is pressed.
     pub submit: bool,
     /// Set by the host for Ctrl+K and `/`: reveal the search field and focus it.
@@ -646,6 +649,8 @@ impl State {
     /// first frame.
     pub fn new(data_dir: std::path::PathBuf) -> State {
         let library = Library::in_memory();
+        let prefs = Prefs::open(&data_dir);
+        let volume = prefs.volume();
         let backend = Backend::start(data_dir);
         let (opened_tx, opened_rx) = mpsc::channel();
         let now = Instant::now();
@@ -662,7 +667,8 @@ impl State {
             status: String::new(),
             booted: false,
             seek: 0.0,
-            volume: 0.8,
+            volume,
+            prefs,
             submit: false,
             focus_search: false,
             toggle_request: false,
@@ -1776,6 +1782,13 @@ impl State {
     }
 
     fn set_volume(&mut self, volume: f32) {
+        self.apply_volume(volume);
+        self.prefs.set_volume(self.volume);
+    }
+
+    /// Move the output without changing what the next run starts at. Muting goes through here:
+    /// the muted level is a moment, not the listener's chosen volume.
+    fn apply_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.0);
         if let Some(track) = self.now.as_mut() {
             track.player.set_volume(self.volume * track.gain * track.norm);
@@ -2072,9 +2085,9 @@ impl State {
             Action::Mute => {
                 if self.volume > 0.0 {
                     self.volume_before_mute = Some(self.volume);
-                    self.set_volume(0.0);
+                    self.apply_volume(0.0);
                 } else {
-                    let restored = self.volume_before_mute.take().unwrap_or(0.8);
+                    let restored = self.volume_before_mute.take().unwrap_or(DEFAULT_VOLUME);
                     self.set_volume(restored);
                 }
             }
