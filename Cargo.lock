@@ -3303,7 +3303,7 @@ checksum = "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
 
 [[package]]
 name = "v1-app"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "block2 0.5.1",
  "dream",
@@ -4002,7 +4002,7 @@ dependencies = [
 
 [[package]]
 name = "yt-client"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -4015,7 +4015,7 @@ dependencies = [
 
 [[package]]
 name = "yt-js"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "regex",
  "reqwest",
@@ -4028,7 +4028,7 @@ dependencies = [
 
 [[package]]
 name = "yt-lyrics"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "quick-xml",
  "reqwest",
@@ -4041,7 +4041,7 @@ dependencies = [
 
 [[package]]
 name = "yt-player"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -4050,7 +4050,7 @@ dependencies = [
 
 [[package]]
 name = "yt-proxy"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -4066,7 +4066,7 @@ dependencies = [
 
 [[package]]
 name = "yt-stream"
-version = "0.1.11"
+version = "0.2.0"
 dependencies = [
  "reqwest",
  "serde",
