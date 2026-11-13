@@ -57,18 +57,62 @@ jobs:
           & "C:\Program Files (x86)\NSIS\makensis.exe" "/DVERSION=$env:VERSION" (Resolve-Path installer\V1.nsi).Path
           if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
 
-      - name: Write checksums
-        shell: pwsh
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-dist
+          path: dist/V1-Setup-${{ env.VERSION }}.exe
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the Cargo version
         run: |
-          $installer = "dist\V1-Setup-$env:VERSION.exe"
-          $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
-          "$hash  $(Split-Path $installer -Leaf)" | Set-Content -Encoding ascii dist\SHA256SUMS
+          version="${GITHUB_REF_NAME#v}"
+          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$version" != "$manifest" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Apple Silicon DMG
+        run: ./installer/build-macos.sh
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dist
+          path: target/aarch64-apple-darwin/release/V1-${{ env.VERSION }}-arm64.dmg
+
+  release:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums
+        run: |
+          cd dist
+          sha256sum V1-Setup-*.exe V1-*-arm64.dmg > SHA256SUMS
 
       - name: Publish the release
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          version="${GITHUB_REF_NAME#v}"
           gh release create "$GITHUB_REF_NAME" \
-            "dist/V1-Setup-$VERSION.exe" dist/SHA256SUMS \
-            --title "V1 $VERSION" --generate-notes
+            dist/V1-Setup-*.exe \
+            dist/V1-*-arm64.dmg \
+            dist/SHA256SUMS \
+            --title "V1 $version" --generate-notes
