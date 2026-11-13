@@ -763,11 +763,11 @@ impl UiRenderer {
                     bound_set = set;
                 }
                 let mut scissor = to_scissor(draw, extent);
-                if !clear && let Some(d) = frame.dirty_rect {
-                    let dx0 = (d.x.floor().max(0.0) as i32).min(extent.width as i32);
-                    let dy0 = (d.y.floor().max(0.0) as i32).min(extent.height as i32);
-                    let dx1 = ((d.x + d.w).ceil().max(0.0) as i32).min(extent.width as i32);
-                    let dy1 = ((d.y + d.h).ceil().max(0.0) as i32).min(extent.height as i32);
+                if let Some(d) = frame.dirty_rect {
+                    let dx0 = (d.x.floor().max(0.0) as i32).min(extent.0 as i32);
+                    let dy0 = (d.y.floor().max(0.0) as i32).min(extent.1 as i32);
+                    let dx1 = ((d.x + d.w).ceil().max(0.0) as i32).min(extent.0 as i32);
+                    let dy1 = ((d.y + d.h).ceil().max(0.0) as i32).min(extent.1 as i32);
                     let sx0 = scissor.offset.x.max(dx0);
                     let sy0 = scissor.offset.y.max(dy0);
                     let sx1 = (scissor.offset.x + scissor.extent.width as i32).min(dx1);
