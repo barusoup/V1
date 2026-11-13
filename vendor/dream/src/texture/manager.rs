@@ -4,7 +4,7 @@ use super::SamplerDesc;
 use super::TextureOptions;
 use super::decode::decode_rgba8;
 use super::gpu::GpuTexture;
-use crate::gfx::vulkan::GpuContext;
+use crate::gfx::GpuContext;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

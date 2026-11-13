@@ -20,14 +20,19 @@ gltf = { version = "1.4", features = [
 ] }
 gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan", "std"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-naga = { version = "27.0.3", default-features = false, features = ["wgsl-in", "spv-out"] }
+naga = { version = "27.0.3", default-features = false, features = ["wgsl-in", "spv-out", "msl-out"] }
 raw-window-handle = "0.6"
 unicode-segmentation = "1.13.3"
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "ogg", "vorbis", "flac", "wav", "pcm"] }
 winit = "0.30"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 objc = "0.2.7"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSError", "NSGeometry", "NSString"] }
+objc2-metal = "0.3"
+objc2-quartz-core = "0.3"
 
 [build-dependencies]
-naga = { version = "27.0.3", default-features = false, features = ["wgsl-in", "spv-out"] }
+naga = { version = "27.0.3", default-features = false, features = ["wgsl-in", "spv-out", "msl-out"] }

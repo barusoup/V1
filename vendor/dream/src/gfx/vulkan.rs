@@ -659,6 +659,7 @@ pub fn ext_names(names: &[&CStr]) -> Vec<*const c_char> {
     names.iter().map(|n| n.as_ptr()).collect()
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn align_up(value: u64, align: u64) -> u64 {
     value.div_ceil(align) * align
 }
@@ -666,6 +667,7 @@ pub(crate) fn align_up(value: u64, align: u64) -> u64 {
 /// Whether an allocation failure justifies growing another descriptor pool
 /// chunk. Only pool-local exhaustion does; device loss or real OOM must fail
 /// loudly instead of looping forever.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn pool_exhaustion_is_growable(err: vk::Result) -> bool {
     matches!(
         err,

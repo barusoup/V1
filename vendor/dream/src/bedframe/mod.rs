@@ -89,6 +89,7 @@ pub mod font;
 pub mod icons;
 pub mod layout;
 pub mod pixel;
+#[cfg_attr(target_os = "macos", path = "render_metal.rs")]
 pub mod render;
 pub mod theme;
 pub mod tokens;

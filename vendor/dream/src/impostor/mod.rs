@@ -35,10 +35,13 @@
 //! can keep rendering the mesh.
 
 mod atlas;
+#[cfg_attr(target_os = "macos", path = "bake_metal.rs")]
 mod bake;
 pub mod lod;
+#[cfg_attr(target_os = "macos", path = "render_metal.rs")]
 mod render;
 pub mod scene;
+#[cfg_attr(target_os = "macos", path = "storage_metal.rs")]
 mod storage;
 
 pub use atlas::{AssetDebug, ImpostorAsset, ImpostorAssetLimits};

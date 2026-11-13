@@ -16,10 +16,11 @@ use std::time::Duration;
 const RING_NUMER: usize = 3;
 const RING_DENOM: usize = 4;
 
-/// The device output. Stays on the thread that opened it; only [`AudioShared`]
-/// crosses threads.
+/// The device output. Owns the CPAL stream on a dedicated owner thread so
+/// `AudioOutput` (and `Player`) is `Send` on platforms where `cpal::Stream` is
+/// `!Send` (such as CoreAudio on macOS).
 pub(crate) struct AudioOutput {
-    _stream: Stream,
+    _stop: std::sync::mpsc::Sender<()>,
     shared: Arc<AudioShared>,
     rate: u32,
     channels: u16,
@@ -30,6 +31,30 @@ impl AudioOutput {
     /// `None` means there is no usable device; video still plays silently on
     /// the wall clock.
     pub(crate) fn open() -> Option<Self> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::Builder::new()
+            .name("dream-media-audio".into())
+            .spawn(move || {
+                let Some((stream, shared, rate, channels)) = Self::open_stream() else {
+                    let _ = ready_tx.send(None);
+                    return;
+                };
+                let _ = ready_tx.send(Some((shared, rate, channels)));
+                let _ = stop_rx.recv();
+                drop(stream);
+            })
+            .ok()?;
+        let (shared, rate, channels) = ready_rx.recv().ok()??;
+        Some(Self {
+            _stop: stop_tx,
+            shared,
+            rate,
+            channels,
+        })
+    }
+
+    fn open_stream() -> Option<(Stream, Arc<AudioShared>, u32, u16)> {
         let device = cpal::default_host().default_output_device()?;
         let supported = device.default_output_config().ok()?;
         let format = supported.sample_format();
@@ -139,12 +164,7 @@ impl AudioOutput {
             _ => return None,
         };
         stream.play().ok()?;
-        Some(Self {
-            _stream: stream,
-            shared,
-            rate,
-            channels,
-        })
+        Some((stream, shared, rate, channels))
     }
 
     pub(crate) fn rate(&self) -> u32 {

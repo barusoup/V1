@@ -10,27 +10,57 @@
 //! Coordinate convention: shaders author to wgpu-style NDC (y up, depth 0..1),
 //! which we preserve in Vulkan by using a negative viewport height.
 
+#[cfg(not(target_os = "macos"))]
 mod acquire;
+#[cfg_attr(target_os = "macos", path = "gfx/metal/draw.rs")]
 mod draw;
+#[cfg_attr(target_os = "macos", path = "gfx/metal/frame.rs")]
 mod frame;
+#[cfg(not(target_os = "macos"))]
 mod pipeline;
+pub mod present;
+#[cfg(target_os = "macos")]
+use metal::pipeline;
+#[cfg(target_os = "macos")]
+pub mod metal;
+#[cfg_attr(target_os = "macos", path = "gfx/metal/readback.rs")]
 mod readback;
-mod renderer;
+#[cfg_attr(target_os = "macos", path = "gfx/metal/renderer.rs")]
+pub(crate) mod renderer;
 mod shader;
+#[cfg_attr(target_os = "macos", path = "gfx/metal/thumbnail.rs")]
 mod thumbnail;
+#[cfg(not(target_os = "macos"))]
 mod timing;
 pub mod vulkan;
 
-pub use vulkan::{GpuBuffer, GpuContext, GpuImage, PresentMode, PulledMesh};
+#[cfg(target_os = "macos")]
+pub(crate) use metal::align_up;
+#[cfg(target_os = "macos")]
+pub use metal::{DynamicBuffers, GpuBuffer, GpuContext, GpuImage, PulledMesh};
+pub use present::PresentMode;
+#[cfg(not(target_os = "macos"))]
+pub use vulkan::{DynamicBuffers, GpuBuffer, GpuContext, GpuImage, PulledMesh};
 
 use crate::fsr3::{Fsr3, JitterSequence};
+#[cfg(not(target_os = "macos"))]
 use ash::vk;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "macos"))]
 pub const SCENE_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+#[cfg(not(target_os = "macos"))]
 pub const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+#[cfg(not(target_os = "macos"))]
 pub const VELOCITY_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
+
+#[cfg(target_os = "macos")]
+pub const SCENE_FORMAT: metal::PixelFormat = metal::PixelFormat::RGBA16Float;
+#[cfg(target_os = "macos")]
+pub const DEPTH_FORMAT: metal::PixelFormat = metal::PixelFormat::Depth32Float;
+#[cfg(target_os = "macos")]
+pub const VELOCITY_FORMAT: metal::PixelFormat = metal::PixelFormat::RG16Float;
 
 /// Mirror of the errors the swapchain path can report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,13 +167,22 @@ pub struct FramePhases {
     pub present_us: f32,
 }
 
+#[cfg(not(target_os = "macos"))]
 struct SceneTargets {
     color: GpuImage,
     velocity: GpuImage,
     depth: GpuImage,
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) struct SceneTargets {
+    pub(crate) color: GpuImage,
+    pub(crate) velocity: GpuImage,
+    pub(crate) depth: GpuImage,
+}
+
 /// Draw commands handed to the game for the scene pass.
+#[cfg(not(target_os = "macos"))]
 pub struct DrawCtx<'a> {
     device: &'a ash::Device,
     cmd: vk::CommandBuffer,
@@ -156,6 +195,28 @@ pub struct DrawCtx<'a> {
     starter: std::cell::RefCell<Option<&'a mut dyn FnMut()>>,
 }
 
+/// Draw commands handed to the game for the scene pass (native Metal).
+#[cfg(target_os = "macos")]
+pub struct DrawCtx<'a> {
+    pub(crate) encoder:
+        &'a objc2::runtime::ProtocolObject<dyn objc2_metal::MTLRenderCommandEncoder>,
+    pub(crate) scene_pipeline:
+        &'a objc2::runtime::ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>,
+    pub(crate) scene_depth_stencil:
+        &'a objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDepthStencilState>,
+    pub(crate) scene_uniform: &'a objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    pub(crate) pulling:
+        Option<&'a objc2::runtime::ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>>,
+    pub(crate) index_buffer: Option<(
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+        u64,
+    )>,
+    pub(crate) frame_slot: usize,
+    pub(crate) frame_id: u64,
+    pub(crate) starter: std::cell::RefCell<Option<&'a mut dyn FnMut()>>,
+}
+
+#[cfg(not(target_os = "macos"))]
 pub struct Renderer {
     ctx: Arc<GpuContext>,
     swapchain: vulkan::Swapchain,
@@ -259,4 +320,60 @@ pub struct Renderer {
     /// default -- waits as long as the presentation engine needs, capped at
     /// the liveness bound (`acquire::UNBUDGETED_WAIT_CAP`).
     frame_wait_budget: Option<Duration>,
+}
+
+#[cfg(target_os = "macos")]
+pub struct Renderer {
+    pub(crate) ctx: Arc<GpuContext>,
+    pub(crate) swapchain: metal::Swapchain,
+    pub(crate) scene_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>,
+    >,
+    pub(crate) scene_depth_stencil:
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDepthStencilState>>,
+    pub(crate) no_depth_stencil:
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDepthStencilState>>,
+    pub(crate) pulling: Option<
+        objc2::rc::Retained<
+            objc2::runtime::ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>,
+        >,
+    >,
+    pub(crate) blit_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>,
+    >,
+    pub(crate) present_pipeline: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLRenderPipelineState>,
+    >,
+    pub(crate) scene_uniforms: Vec<GpuBuffer>,
+    pub(crate) slots: Vec<Arc<renderer::SlotSync>>,
+    pub(crate) frame: usize,
+    pub(crate) frame_id: u64,
+    pub(crate) scene_ms: Vec<f32>,
+    pub(crate) scene_sample: Option<(u64, f32)>,
+    pub(crate) scene_recorded: Vec<bool>,
+    pub(crate) targets: SceneTargets,
+    pub(crate) targets_ready: bool,
+    pub(crate) thumb: Option<thumbnail::ThumbnailPass>,
+    pub(crate) fsr: Option<Fsr3>,
+    pub(crate) fsr_enabled: bool,
+    pub(crate) display: GpuImage,
+    pub(crate) display_live: bool,
+    pub(crate) display_written: bool,
+    pub(crate) frame_capture: bool,
+    pub(crate) present_mode: PresentMode,
+    pub(crate) capture_notice: bool,
+    pub(crate) ui: crate::ui::render::UiRenderer,
+    pub(crate) ui_blend: crate::ui::render::UiBlend,
+    pub(crate) display_size: (u32, u32),
+    pub(crate) render_size: (u32, u32),
+    pub(crate) jitter: JitterSequence,
+    pub(crate) prev_view_projection: glam::Mat4,
+    pub(crate) history_valid: bool,
+    pub(crate) temporal: bool,
+    pub(crate) show_crosshair: bool,
+    pub(crate) sharpness: f32,
+    pub(crate) render_scale: f32,
+    pub(crate) last_frame: Instant,
+    pub(crate) phases: FramePhases,
+    pub(crate) frame_wait_budget: Option<Duration>,
 }

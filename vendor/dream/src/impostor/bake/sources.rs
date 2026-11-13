@@ -198,6 +198,7 @@ pub(super) fn prepare_sources<'a>(
 
 /// Test helper: all meshes in one model, merged by material.
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(super) fn merge_by_material(model: &Model) -> Vec<(Vec<PbrVertex>, Vec<u32>)> {
     prepare_sources(&[ImpostorSource::model(model)], 0.0)
         .map(|prepared| prepared.batches)

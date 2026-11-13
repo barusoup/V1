@@ -10,6 +10,7 @@
 //! [`crate::temporal`]).
 
 pub mod anim;
+#[cfg_attr(target_os = "macos", path = "render_metal.rs")]
 pub mod render;
 
 pub use anim::{AnimClip, Channel, Interpolation, Key, NodePose, PlayMode, Player, Target};

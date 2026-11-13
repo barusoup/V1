@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "macos", allow(dead_code))]
+
 //! Texture objects shared by every texture of one [`GpuContext`]: samplers,
 //! the two texture descriptor set layouts, and descriptor pool chunks that
 //! sets are allocated from.

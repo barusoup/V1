@@ -5,7 +5,7 @@ use crate::Result;
 use crate::player::{Frame, Player, PlayerOptions, Status};
 use crate::probe::MediaInfo;
 use crate::tools::Tools;
-use dream::gfx::vulkan::GpuContext;
+use dream::gfx::GpuContext;
 use dream::texture::{GpuTexture, SamplerDesc, TextureFormat, TextureOptions, TextureUploader};
 use std::path::Path;
 use std::sync::Arc;

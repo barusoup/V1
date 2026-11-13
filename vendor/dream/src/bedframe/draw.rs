@@ -140,11 +140,22 @@ pub struct UiFrame {
     pub atlas_snapshot: Option<std::sync::Arc<super::atlas::AtlasSnapshot>>,
     /// Screen size the coordinates are in.
     pub size: (f32, f32),
+    /// Optional dirty rectangle in UI pixel coordinates. When `Some`,
+    /// renderers may clip draws to this region (skipping draws outside it)
+    /// when updating a retained UI target. `None` redraws the full frame.
+    pub dirty_rect: Option<Rect>,
 }
 
 impl UiFrame {
     pub fn is_empty(&self) -> bool {
         self.cmds.is_empty()
+    }
+
+    /// Restricts rendering to `rect` (in UI pixel coordinates) when
+    /// updating a retained UI target.
+    pub fn with_dirty_rect(mut self, rect: Rect) -> Self {
+        self.dirty_rect = Some(rect);
+        self
     }
 
     /// Total quads submitted (diagnostics and tests).
@@ -1725,6 +1736,7 @@ impl DrawList {
                 atlas_updates: Vec::new(),
                 atlas_snapshot: None,
                 size,
+                dirty_rect: None,
             };
         }
         // Stable sort by layer: later layers draw on top. Indices and
@@ -1739,6 +1751,7 @@ impl DrawList {
             atlas_updates: Vec::new(),
             atlas_snapshot: None,
             size,
+            dirty_rect: None,
         }
     }
 }

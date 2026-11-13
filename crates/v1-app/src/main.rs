@@ -87,10 +87,28 @@ fn fps_tick() {
 }
 
 fn data_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("v1")
+    #[cfg(target_os = "macos")]
+    {
+        let base = std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Library/Application Support"))
+            .unwrap_or_else(|| PathBuf::from("."));
+        base.join("v1")
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+            .unwrap_or_else(|| PathBuf::from("."));
+        base.join("v1")
+    }
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        base.join("v1")
+    }
 }
 
 /// Events outside winit's own, delivered to the UI thread from background callbacks. The media
@@ -245,26 +263,23 @@ impl ApplicationHandler<UserEvent> for Host {
                 Some((w.parse().ok()?, h.parse().ok()?))
             })
             .unwrap_or((1280.0, 800.0));
-        let window = Arc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("V1")
-                        .with_window_icon(app_icon())
-                        .with_taskbar_icon(taskbar_icon())
-                        .with_theme(Some(winit::window::Theme::Dark))
-                        // The UI draws its own caption buttons and handles moving the window (see
-                        // `ui::WindowRequest`), so the OS title bar goes. Resizing still works from
-                        // the window edges.
-                        .with_decorations(false)
-                        // Windows 11 rounds the corners of the window itself; no shader work needed.
-                        .with_corner_preference(CornerPreference::Round)
-                        .with_visible(false)
-                        .with_min_inner_size(winit::dpi::LogicalSize::new(720.0, 480.0))
-                        .with_inner_size(winit::dpi::LogicalSize::new(start_w, start_h)),
-                )
-                .expect("create window"),
-        );
+        let attrs = Window::default_attributes()
+            .with_title("V1")
+            .with_window_icon(app_icon())
+            .with_theme(Some(winit::window::Theme::Dark))
+            // The UI draws its own caption buttons and handles moving the window (see
+            // `ui::WindowRequest`), so the OS title bar goes. Resizing still works from
+            // the window edges.
+            .with_decorations(false)
+            .with_visible(false)
+            .with_min_inner_size(winit::dpi::LogicalSize::new(720.0, 480.0))
+            .with_inner_size(winit::dpi::LogicalSize::new(start_w, start_h));
+        #[cfg(windows)]
+        let attrs = attrs
+            .with_taskbar_icon(taskbar_icon())
+            // Windows 11 rounds the corners of the window itself; no shader work needed.
+            .with_corner_preference(CornerPreference::Round);
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         boot_mark("window created (hidden)");
         self.scale = window.scale_factor() as f32;
         // This app draws no 3D scene, so FSR has nothing to upscale and its sharpening only
@@ -406,8 +421,12 @@ impl ApplicationHandler<UserEvent> for Host {
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 let state = modifiers.state();
-                self.keys
-                    .modifiers(state.shift_key(), state.control_key(), state.alt_key());
+                let command = if cfg!(target_os = "macos") {
+                    state.super_key()
+                } else {
+                    state.control_key()
+                };
+                self.keys.modifiers(state.shift_key(), command, state.alt_key());
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
@@ -958,6 +977,7 @@ fn shot_step(
 }
 
 /// The taskbar's big icon, at the size Windows draws it.
+#[cfg(windows)]
 fn taskbar_icon() -> Option<winit::window::Icon> {
     let png = include_bytes!("../assets/icon/app-48.png");
     let rgba = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?.to_rgba8();

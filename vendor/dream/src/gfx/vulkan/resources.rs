@@ -358,6 +358,7 @@ impl GpuContext {
 
     /// Single-layer image whose view swizzles channels — e.g. an R8 coverage
     /// page sampled as (1,1,1,a) so coverage bytes read as white-with-alpha.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn create_image_swizzled(
         self: &Arc<Self>,
         label: &str,

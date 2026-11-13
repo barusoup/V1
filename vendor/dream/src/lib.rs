@@ -2,9 +2,11 @@ pub mod app;
 pub mod audio;
 pub mod bedframe;
 pub mod camera;
+#[cfg_attr(target_os = "macos", path = "fsr3_metal.rs")]
 pub mod fsr3;
 pub mod gfx;
 pub mod impostor;
+#[cfg_attr(target_os = "macos", path = "lighting/mod_metal.rs")]
 pub mod lighting;
 pub mod memory;
 pub mod model;

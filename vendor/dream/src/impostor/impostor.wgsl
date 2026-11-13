@@ -1292,15 +1292,6 @@ fn source_material(
     out.emissive = emissive_tex * m.emissive.rgb * m.emissive.w;
     out.coverage = coverage;
 
-    let world = (model * vec4<f32>(surface.p, 1.0)).xyz;
-    let n_world = normalize(mat3x3<f32>(
-        model[0].xyz,
-        model[1].xyz,
-        model[2].xyz,
-    ) * n);
-    let v = normalize(lighting_env.cam_pos.xyz - world);
-    out.lit = lighting_eval(out.albedo, out.metal, out.rough, n_world, v, world, out.ao)
-        + out.emissive;
     return out;
 }
 
@@ -1313,6 +1304,7 @@ fn projective_material(
     material_lod: f32,
     c: vec3<f32>,
     model: mat4x4<f32>,
+    need_lit: bool,
 ) -> MaterialSample {
     var hit = hit_in;
     let to_cam_obj = normalize(-rd);
@@ -1443,7 +1435,7 @@ fn projective_material(
         ao += w * tex.normal_ao.a;
         emissive += w * tex.emissive.rgb;
         coverage += w * tex.albedo.a;
-        if cells_per_px > 12.0 {
+        if need_lit && cells_per_px > 12.0 {
             let world_s = (model * vec4<f32>(p_sample, 1.0)).xyz;
             let v_s = normalize(lighting_env.cam_pos.xyz - world_s);
             let n_world_s = normalize(mat3x3<f32>(
@@ -1484,7 +1476,7 @@ fn projective_material(
         ao = tex.normal_ao.a;
         emissive = tex.emissive.rgb;
         coverage = tex.albedo.a;
-        if cells_per_px > 12.0 {
+        if need_lit && cells_per_px > 12.0 {
             let world_s = (model * vec4<f32>(shade_p, 1.0)).xyz;
             let v_s = normalize(lighting_env.cam_pos.xyz - world_s);
             let n_world_s = normalize(mat3x3<f32>(
@@ -1550,6 +1542,80 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     }
     let material_lod = clamp(log2(cells_per_px) - 3.5, 0.0, f32(max_hull_mip));
 
+    // Far-field fast path: when an impostor spans fewer than 18px on screen,
+    // a single parallax-snapped capture view avoids per-pixel 3D DDA and
+    // 26-view reconstruction while preserving silhouette, depth, and motion.
+    let box_size = asset.box_max.xyz - asset.box_min.xyz;
+    let max_dim = max(box_size.x, max(box_size.y, box_size.z));
+    if max_dim < px * 18.0 && debug_mode == 0u {
+        let tb = ray_box(ro, rd);
+        if tb.y <= max(tb.x, 0.0) {
+            discard;
+        }
+        let to_cam_obj = -rd;
+        var best_f = 0u;
+        var best_dot = -2.0;
+        for (var f = 0u; f < 26u; f = f + 1u) {
+            let d = dot(asset.views[f].xyz, to_cam_obj);
+            if d > best_dot {
+                best_dot = d;
+                best_f = f;
+            }
+        }
+        let n_f = asset.views[best_f].xyz;
+        let e = asset.extents[best_f];
+        let denom = dot(rd, n_f);
+        var t_plane = 0.5 * (max(tb.x, 0.0) + tb.y);
+        if abs(denom) > 1e-4 {
+            t_plane = clamp(dot(c - ro, n_f) / denom, max(tb.x, 0.0), tb.y);
+        }
+        var p_far = ro + rd * t_plane;
+        var uv_far = face_uv(best_f, p_far, c);
+        let d0 = textureSampleLevel(t_depth, s_tile, uv_far, i32(best_f), material_lod).r;
+        if d0 < 1.0 && abs(denom) > 1e-4 {
+            let target_proj = e.z * (0.5 - d0);
+            let t_snap = clamp(
+                (dot(c - ro, n_f) + target_proj) / denom,
+                max(tb.x, 0.0),
+                tb.y,
+            );
+            p_far = ro + rd * t_snap;
+            uv_far = face_uv(best_f, p_far, c);
+        }
+        let d1 = textureSampleLevel(t_depth, s_tile, uv_far, i32(best_f), material_lod).r;
+        let tex_far = sample_face_level(best_f, uv_far, material_lod);
+        if d1 >= 1.0 || tex_far.albedo.a < asset.params.x {
+            discard;
+        }
+        let world_far = (inst.model * vec4<f32>(p_far, 1.0)).xyz;
+        let clip_far = camera.view_projection * vec4<f32>(world_far, 1.0);
+        let prev_world_far = (inst.prev_model * vec4<f32>(p_far, 1.0)).xyz;
+        let curr_ndc_far = camera.curr_view_projection * vec4<f32>(world_far, 1.0);
+        let prev_ndc_far = camera.prev_view_projection * vec4<f32>(prev_world_far, 1.0);
+        let n_obj_far = normalize(tex_far.normal_ao.xyz * 2.0 - vec3<f32>(1.0));
+        let n_world_far = normalize(mat3x3<f32>(
+            inst.model[0].xyz,
+            inst.model[1].xyz,
+            inst.model[2].xyz,
+        ) * n_obj_far);
+        let v_far = normalize(lighting_env.cam_pos.xyz - world_far);
+        let lit_far = lighting_eval(
+            tex_far.albedo.rgb,
+            clamp(tex_far.mr.g, 0.0, 1.0),
+            clamp(tex_far.mr.r, 0.03, 1.0),
+            n_world_far,
+            v_far,
+            world_far,
+            clamp(tex_far.normal_ao.a, 0.0, 1.0),
+        ) + tex_far.emissive.rgb;
+        var out_far: FragOutput;
+        out_far.color = vec4<f32>(lit_far, clamp(inst.misc.x, 0.0, 1.0));
+        out_far.velocity = screen_uv(prev_ndc_far.xy / prev_ndc_far.w)
+            - screen_uv(curr_ndc_far.xy / curr_ndc_far.w);
+        out_far.depth = clip_far.z / clip_far.w;
+        return out_far;
+    }
+
     // Opaque assets with a voxel grid take the authoritative geometry path:
     // real ray-triangle hits through the DDA grid, no hull reconstruction.
     // debug 7 keeps the shell-decal diagnostic; MASK/voxel-less assets keep
@@ -1589,38 +1655,28 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     let hit_ray_t = length((inst.model * vec4<f32>(hit, 1.0)).xyz - lighting_env.cam_pos.xyz);
     px = hit_ray_t * asset.screen.y / obj_scale;
 
-    var sample = projective_material(hit, ro, rd, px, cells_per_px, material_lod, c, inst.model);
-    if !exact_geom {
-        // Legacy: depth/motion follow the capture-snapped shading point. The
-        // fast path keeps the true triangle hit for both.
-        hit = sample.p;
-    }
-    var albedo = sample.albedo;
-    var normal_sum = sample.normal;
-    var rough = sample.rough;
-    var metal = sample.metal;
-    var ao = sample.ao;
-    var emissive = sample.emissive;
-    var integrated_lit = sample.lit;
-    var coverage = sample.coverage;
-    if cells_per_px > 8.0 && source.valid {
-        // Far field: keep hull coverage/depth, but recover material from the
-        // exact source triangle instead of a capture-space reconstruction.
+    var albedo = vec3<f32>(0.0);
+    var normal_sum = vec3<f32>(0.0, 0.0, 1.0);
+    var rough = 0.8;
+    var metal = 0.0;
+    var ao = 1.0;
+    var emissive = vec3<f32>(0.0);
+    var integrated_lit = vec3<f32>(0.0);
+    var coverage = 1.0;
+    if exact_geom && cells_per_px > 12.0 && source.valid {
         let exact = source_material(source, hit, ro, rd, inst.model);
         if exact.coverage <= 0.0 {
             discard;
         }
-        let w = 0.90;
-        albedo = mix(albedo, exact.albedo, 0.85);
-        normal_sum = normalize(mix(normal_sum, exact.normal, w));
-        rough = mix(rough, exact.rough, w);
-        metal = mix(metal, exact.metal, w);
-        ao = mix(ao, exact.ao, w);
-        emissive = mix(emissive, exact.emissive, w);
-        coverage = mix(coverage, exact.coverage, w);
+        albedo = exact.albedo;
+        normal_sum = exact.normal;
+        rough = exact.rough;
+        metal = exact.metal;
+        ao = exact.ao;
+        emissive = exact.emissive;
+        coverage = exact.coverage;
 
-        let lit_p = mix(hit, source.p, w);
-        let lit_world = (inst.model * vec4<f32>(lit_p, 1.0)).xyz;
+        let lit_world = (inst.model * vec4<f32>(source.p, 1.0)).xyz;
         let lit_n = normalize(mat3x3<f32>(
             inst.model[0].xyz,
             inst.model[1].xyz,
@@ -1629,6 +1685,58 @@ fn fs_main(input: VertexOutput) -> FragOutput {
         let lit_v = normalize(lighting_env.cam_pos.xyz - lit_world);
         integrated_lit = lighting_eval(albedo, metal, rough, lit_n, lit_v, lit_world, ao)
             + emissive;
+    } else {
+        var sample = projective_material(
+            hit,
+            ro,
+            rd,
+            px,
+            cells_per_px,
+            material_lod,
+            c,
+            inst.model,
+            !(cells_per_px > 8.0 && source.valid),
+        );
+        if !exact_geom {
+            // Legacy: depth/motion follow the capture-snapped shading point. The
+            // fast path keeps the true triangle hit for both.
+            hit = sample.p;
+        }
+        albedo = sample.albedo;
+        normal_sum = sample.normal;
+        rough = sample.rough;
+        metal = sample.metal;
+        ao = sample.ao;
+        emissive = sample.emissive;
+        integrated_lit = sample.lit;
+        coverage = sample.coverage;
+        if cells_per_px > 8.0 && source.valid {
+            // Far field: keep hull coverage/depth, but recover material from the
+            // exact source triangle instead of a capture-space reconstruction.
+            let exact = source_material(source, hit, ro, rd, inst.model);
+            if exact.coverage <= 0.0 {
+                discard;
+            }
+            let w = 0.90;
+            albedo = mix(albedo, exact.albedo, 0.85);
+            normal_sum = normalize(mix(normal_sum, exact.normal, w));
+            rough = mix(rough, exact.rough, w);
+            metal = mix(metal, exact.metal, w);
+            ao = mix(ao, exact.ao, w);
+            emissive = mix(emissive, exact.emissive, w);
+            coverage = mix(coverage, exact.coverage, w);
+
+            let lit_p = mix(hit, source.p, w);
+            let lit_world = (inst.model * vec4<f32>(lit_p, 1.0)).xyz;
+            let lit_n = normalize(mat3x3<f32>(
+                inst.model[0].xyz,
+                inst.model[1].xyz,
+                inst.model[2].xyz,
+            ) * normal_sum);
+            let lit_v = normalize(lighting_env.cam_pos.xyz - lit_world);
+            integrated_lit = lighting_eval(albedo, metal, rough, lit_n, lit_v, lit_world, ao)
+                + emissive;
+        }
     }
 
     // Depth of the geometry point: projected and written so the card
@@ -1727,11 +1835,12 @@ fn fs_main(input: VertexOutput) -> FragOutput {
     // Shared lighting at the geometry world position: identical inputs to
     // model_pbr.wgsl -> colour parity with the mesh.
     let v = normalize(lighting_env.cam_pos.xyz - world);
-    let lit = select(
-        lighting_eval(albedo, metal, rough, n_world, v, world, ao) + emissive,
-        integrated_lit,
-        cells_per_px > 12.0,
-    );
+    var lit: vec3<f32>;
+    if cells_per_px > 12.0 {
+        lit = integrated_lit;
+    } else {
+        lit = lighting_eval(albedo, metal, rough, n_world, v, world, ao) + emissive;
+    }
 
     var out: FragOutput;
     out.color = vec4<f32>(lit, alpha);

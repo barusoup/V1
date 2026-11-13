@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "macos", allow(dead_code))]
+
 use super::decode::mip_levels_for;
 use super::sampler::SamplerDesc;
 use super::{TextureFormat, TextureOptions};

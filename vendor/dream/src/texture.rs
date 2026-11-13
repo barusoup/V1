@@ -28,18 +28,29 @@
 //! ```
 
 mod decode;
+#[cfg_attr(target_os = "macos", path = "texture/gpu_metal.rs")]
 mod gpu;
 mod manager;
 mod sampler;
+#[cfg_attr(target_os = "macos", path = "texture/upload_metal.rs")]
 mod upload;
 
 pub use decode::{DecodedTexture, decode_rgba8, mip_levels_for};
+#[cfg(not(target_os = "macos"))]
 pub use gpu::{
     GpuTexture, SAMPLED_TEXTURE_SET_BINDINGS, TEXTURE_SET_BINDINGS,
     create_sampled_texture_set_layout, create_texture_set_layout,
 };
+#[cfg(target_os = "macos")]
+#[path = "texture/gpu.rs"]
+mod gpu_vk;
+#[cfg(target_os = "macos")]
+pub use gpu::GpuTexture;
+#[cfg(target_os = "macos")]
+pub use gpu_vk::{create_sampled_texture_set_layout, create_texture_set_layout};
 pub use manager::{TextureId, TextureManager, TextureStats};
-pub use sampler::{AddressMode, Filter, MipFilter, SamplerDesc, create_sampler};
+pub use sampler::create_sampler;
+pub use sampler::{AddressMode, Filter, MipFilter, SamplerDesc};
 pub use upload::TextureUploader;
 
 use ash::vk;
@@ -61,6 +72,14 @@ impl TextureFormat {
         match self {
             TextureFormat::Srgb => vk::Format::R8G8B8A8_SRGB,
             TextureFormat::Linear => vk::Format::R8G8B8A8_UNORM,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn mtl_format(self) -> objc2_metal::MTLPixelFormat {
+        match self {
+            TextureFormat::Srgb => objc2_metal::MTLPixelFormat::RGBA8Unorm_sRGB,
+            TextureFormat::Linear => objc2_metal::MTLPixelFormat::RGBA8Unorm,
         }
     }
 }
@@ -152,6 +171,7 @@ mod tests {
 /// set — matching [`SAMPLED_TEXTURE_SET_BINDINGS`]. Parsing the real
 /// shaders here keeps the descriptor layout honest: a new binding
 /// order breaks this test, not the GPU frame.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn engine_wgsl_matches_the_sampled_texture_contract() {
     // (source, group index holding the texture pair)

@@ -39,13 +39,13 @@ pub struct MediaInfo<'a> {
     pub playing: bool,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub use imp::MediaControls;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub struct MediaControls;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl MediaControls {
     pub fn new<F>(_window: &winit::window::Window, _on_command: F) -> Option<Self>
     where
@@ -55,6 +55,253 @@ impl MediaControls {
     }
 
     pub fn update(&mut self, _info: Option<&MediaInfo<'_>>) {}
+}
+
+#[cfg(target_os = "macos")]
+mod imp {
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use block2::RcBlock;
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+
+    use super::{Command, MediaInfo};
+
+    #[link(name = "Foundation", kind = "framework")]
+    extern "C" {}
+
+    #[link(name = "MediaPlayer", kind = "framework")]
+    extern "C" {
+        static MPMediaItemPropertyTitle: *mut AnyObject;
+        static MPMediaItemPropertyArtist: *mut AnyObject;
+        static MPMediaItemPropertyAlbumTitle: *mut AnyObject;
+        static MPMediaItemPropertyPlaybackDuration: *mut AnyObject;
+        static MPNowPlayingInfoPropertyElapsedPlaybackTime: *mut AnyObject;
+        static MPNowPlayingInfoPropertyPlaybackRate: *mut AnyObject;
+    }
+
+    const MP_REMOTE_COMMAND_HANDLER_STATUS_SUCCESS: isize = 0;
+    const MP_NOW_PLAYING_PLAYBACK_STATE_STOPPED: usize = 2;
+    const MP_NOW_PLAYING_PLAYBACK_STATE_PLAYING: usize = 1;
+    const MP_NOW_PLAYING_PLAYBACK_STATE_PAUSED: usize = 2;
+
+    const TIMELINE_THROTTLE: Duration = Duration::from_secs(2);
+
+    pub struct MediaControls {
+        last_title: String,
+        last_artist: String,
+        last_album: Option<String>,
+        last_playing: Option<bool>,
+        last_timeline: Option<Instant>,
+        last_position: f64,
+        last_duration: f64,
+        targets: Vec<(*mut AnyObject, *mut AnyObject)>,
+    }
+
+    // SAFETY: `targets` are retained Objective-C command/token pointers only touched on creation
+    // and drop, and `MediaControls` lives on the main UI thread.
+    unsafe impl Send for MediaControls {}
+
+    unsafe fn nsstring(s: &str) -> *mut AnyObject {
+        let cls = AnyClass::get("NSString").expect("NSString class");
+        let obj: *mut AnyObject = msg_send![cls, alloc];
+        let bytes = s.as_ptr() as *const c_void;
+        let len = s.len();
+        // NSUTF8StringEncoding = 4
+        msg_send![obj, initWithBytes: bytes, length: len, encoding: 4usize]
+    }
+
+    unsafe fn nsnumber_f64(v: f64) -> *mut AnyObject {
+        let cls = AnyClass::get("NSNumber").expect("NSNumber class");
+        msg_send![cls, numberWithDouble: v]
+    }
+
+    impl MediaControls {
+        pub fn new<F>(_window: &winit::window::Window, on_command: F) -> Option<Self>
+        where
+            F: Fn(Command) + Send + 'static,
+        {
+            // Wrap in Arc; `RcBlock` requires `Fn` + `'static`.
+            let cb = Arc::new(on_command);
+            let mut targets = Vec::new();
+            unsafe {
+                let cls = AnyClass::get("MPRemoteCommandCenter")?;
+                let center: *mut AnyObject = msg_send![cls, sharedCommandCenter];
+                if center.is_null() {
+                    return None;
+                }
+
+                // Helper closure-free registration using a thin Sync wrapper.
+                struct SyncCb<F>(F);
+                // SAFETY: `F: Send + 'static`, only called from MPRemoteCommandCenter handler.
+                unsafe impl<F: Send> Sync for SyncCb<F> {}
+                let cb = Arc::new(SyncCb(cb));
+
+                let mut reg = |selector: &str, cmd: Command| {
+                    let sel = objc2::runtime::Sel::register(selector);
+                    let command: *mut AnyObject = msg_send![center, performSelector: sel];
+                    if command.is_null() {
+                        return;
+                    }
+                    let _: () = msg_send![command, setEnabled: true];
+                    let cb = Arc::clone(&cb);
+                    let block = RcBlock::new(move |_event: NonNull<AnyObject>| -> isize {
+                        (cb.0)(cmd);
+                        MP_REMOTE_COMMAND_HANDLER_STATUS_SUCCESS
+                    });
+                    let token: *mut AnyObject = msg_send![command, addTargetWithHandler: &*block];
+                    if !token.is_null() {
+                        let _: *mut AnyObject = msg_send![command, retain];
+                        let _: *mut AnyObject = msg_send![token, retain];
+                        targets.push((command, token));
+                    }
+                };
+
+                reg("playCommand", Command::Play);
+                reg("pauseCommand", Command::Pause);
+                reg("togglePlayPauseCommand", Command::Toggle);
+                reg("nextTrackCommand", Command::Next);
+                reg("previousTrackCommand", Command::Previous);
+                reg("stopCommand", Command::Stop);
+
+                // Seek command
+                let seek_sel = objc2::runtime::Sel::register("changePlaybackPositionCommand");
+                let seek_cmd: *mut AnyObject = msg_send![center, performSelector: seek_sel];
+                if !seek_cmd.is_null() {
+                    let _: () = msg_send![seek_cmd, setEnabled: true];
+                    let cb = Arc::clone(&cb);
+                    let block = RcBlock::new(move |event: NonNull<AnyObject>| -> isize {
+                        let pos: f64 = msg_send![event.as_ptr(), positionTime];
+                        (cb.0)(Command::Seek(pos.max(0.0)));
+                        MP_REMOTE_COMMAND_HANDLER_STATUS_SUCCESS
+                    });
+                    let token: *mut AnyObject = msg_send![seek_cmd, addTargetWithHandler: &*block];
+                    if !token.is_null() {
+                        let _: *mut AnyObject = msg_send![seek_cmd, retain];
+                        let _: *mut AnyObject = msg_send![token, retain];
+                        targets.push((seek_cmd, token));
+                    }
+                }
+            }
+
+            Some(Self {
+                last_title: String::new(),
+                last_artist: String::new(),
+                last_album: None,
+                last_playing: None,
+                last_timeline: None,
+                last_position: 0.0,
+                last_duration: 0.0,
+                targets,
+            })
+        }
+
+        pub fn update(&mut self, info: Option<&MediaInfo<'_>>) {
+            unsafe {
+                let Some(cls) = AnyClass::get("MPNowPlayingInfoCenter") else {
+                    return;
+                };
+                let center: *mut AnyObject = msg_send![cls, defaultCenter];
+                if center.is_null() {
+                    return;
+                }
+
+                let Some(info) = info else {
+                    if self.last_playing != Some(false) || !self.last_title.is_empty() {
+                        let null: *mut AnyObject = std::ptr::null_mut();
+                        let _: () = msg_send![center, setNowPlayingInfo: null];
+                        let _: () = msg_send![center, setPlaybackState: MP_NOW_PLAYING_PLAYBACK_STATE_STOPPED];
+                        self.last_title.clear();
+                        self.last_artist.clear();
+                        self.last_album = None;
+                        self.last_playing = Some(false);
+                    }
+                    return;
+                };
+
+                let meta_changed = self.last_title != info.title
+                    || self.last_artist != info.artist
+                    || self.last_album.as_deref() != info.album;
+                let state_changed = self.last_playing != Some(info.playing);
+                let now = Instant::now();
+                let jumped = (info.position - self.last_position).abs() > 2.5
+                    || (info.duration - self.last_duration).abs() > 0.5;
+                let due = self
+                    .last_timeline
+                    .is_none_or(|t| now.duration_since(t) >= TIMELINE_THROTTLE);
+
+                if !meta_changed && !state_changed && !jumped && !due {
+                    return;
+                }
+
+                let dict_cls = AnyClass::get("NSMutableDictionary").expect("NSMutableDictionary");
+                let dict: *mut AnyObject = msg_send![dict_cls, dictionary];
+
+                let title = nsstring(info.title);
+                let artist = nsstring(info.artist);
+                let _: () = msg_send![dict, setObject: title, forKey: MPMediaItemPropertyTitle];
+                let _: () = msg_send![dict, setObject: artist, forKey: MPMediaItemPropertyArtist];
+                let _: () = msg_send![title, release];
+                let _: () = msg_send![artist, release];
+
+                if let Some(album) = info.album {
+                    let ns_album = nsstring(album);
+                    let _: () = msg_send![dict, setObject: ns_album, forKey: MPMediaItemPropertyAlbumTitle];
+                    let _: () = msg_send![ns_album, release];
+                }
+
+                let dur = nsnumber_f64(info.duration.max(0.0));
+                let pos = nsnumber_f64(info.position.max(0.0));
+                let rate = nsnumber_f64(if info.playing { 1.0 } else { 0.0 });
+                let _: () = msg_send![dict, setObject: dur, forKey: MPMediaItemPropertyPlaybackDuration];
+                let _: () = msg_send![dict, setObject: pos, forKey: MPNowPlayingInfoPropertyElapsedPlaybackTime];
+                let _: () = msg_send![dict, setObject: rate, forKey: MPNowPlayingInfoPropertyPlaybackRate];
+
+                let _: () = msg_send![center, setNowPlayingInfo: dict];
+                let state = if info.playing {
+                    MP_NOW_PLAYING_PLAYBACK_STATE_PLAYING
+                } else {
+                    MP_NOW_PLAYING_PLAYBACK_STATE_PAUSED
+                };
+                let _: () = msg_send![center, setPlaybackState: state];
+
+                if meta_changed {
+                    self.last_title.clear();
+                    self.last_title.push_str(info.title);
+                    self.last_artist.clear();
+                    self.last_artist.push_str(info.artist);
+                    self.last_album = info.album.map(str::to_owned);
+                }
+                self.last_playing = Some(info.playing);
+                self.last_timeline = Some(now);
+                self.last_position = info.position;
+                self.last_duration = info.duration;
+            }
+        }
+    }
+
+    impl Drop for MediaControls {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(cls) = AnyClass::get("MPNowPlayingInfoCenter") {
+                    let center: *mut AnyObject = msg_send![cls, defaultCenter];
+                    if !center.is_null() {
+                        let null: *mut AnyObject = std::ptr::null_mut();
+                        let _: () = msg_send![center, setNowPlayingInfo: null];
+                        let _: () = msg_send![center, setPlaybackState: MP_NOW_PLAYING_PLAYBACK_STATE_STOPPED];
+                    }
+                }
+                for (command, token) in self.targets.drain(..) {
+                    let _: () = msg_send![command, removeTarget: token];
+                    let _: () = msg_send![token, release];
+                    let _: () = msg_send![command, release];
+                }
+            }
+        }
+    }
 }
 
 #[cfg(windows)]

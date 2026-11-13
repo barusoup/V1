@@ -762,7 +762,27 @@ impl UiRenderer {
                     );
                     bound_set = set;
                 }
-                let scissor = to_scissor(draw, extent);
+                let mut scissor = to_scissor(draw, extent);
+                if !clear && let Some(d) = frame.dirty_rect {
+                    let dx0 = (d.x.floor().max(0.0) as i32).min(extent.width as i32);
+                    let dy0 = (d.y.floor().max(0.0) as i32).min(extent.height as i32);
+                    let dx1 = ((d.x + d.w).ceil().max(0.0) as i32).min(extent.width as i32);
+                    let dy1 = ((d.y + d.h).ceil().max(0.0) as i32).min(extent.height as i32);
+                    let sx0 = scissor.offset.x.max(dx0);
+                    let sy0 = scissor.offset.y.max(dy0);
+                    let sx1 = (scissor.offset.x + scissor.extent.width as i32).min(dx1);
+                    let sy1 = (scissor.offset.y + scissor.extent.height as i32).min(dy1);
+                    scissor = vk::Rect2D {
+                        offset: vk::Offset2D { x: sx0, y: sy0 },
+                        extent: vk::Extent2D {
+                            width: (sx1 - sx0).max(0) as u32,
+                            height: (sy1 - sy0).max(0) as u32,
+                        },
+                    };
+                    if scissor.extent.width == 0 || scissor.extent.height == 0 {
+                        continue;
+                    }
+                }
                 if bound_scissor != scissor {
                     device.cmd_set_scissor(cmd, 0, &[scissor]);
                     bound_scissor = scissor;

@@ -1,8 +1,7 @@
 //! The baked asset: five channel arrays, one layer for each of the 26 views.
 
 use super::ImpostorBounds;
-use crate::gfx::vulkan::GpuContext;
-use crate::gfx::{GpuBuffer, GpuImage};
+use crate::gfx::{GpuBuffer, GpuContext, GpuImage};
 use std::sync::Arc;
 
 /// Which debug view the impostor shader renders (Asset.params.w).
@@ -186,11 +185,18 @@ impl Drop for ImpostorAsset {
     /// submit serial completes so this wait is skipped).
     fn drop(&mut self) {
         if !self.drop_without_wait {
-            // Hold the submission lock so a racing queue submit can't use
-            // this asset's resources mid-wait.
-            let _queue = self.ctx.queue_lock.lock().unwrap();
-            unsafe {
-                let _ = self.ctx.device().device_wait_idle();
+            #[cfg(target_os = "macos")]
+            {
+                self.ctx.wait_idle();
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                // Hold the submission lock so a racing queue submit can't use
+                // this asset's resources mid-wait.
+                let _queue = self.ctx.queue_lock.lock().unwrap();
+                unsafe {
+                    let _ = self.ctx.device().device_wait_idle();
+                }
             }
         }
     }

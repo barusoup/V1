@@ -105,7 +105,7 @@ impl Image {
     #[cfg(feature = "gpu")]
     pub fn upload(
         &self,
-        ctx: &std::sync::Arc<dream::gfx::vulkan::GpuContext>,
+        ctx: &std::sync::Arc<dream::gfx::GpuContext>,
     ) -> std::sync::Arc<dream::texture::GpuTexture> {
         std::sync::Arc::new(dream::texture::GpuTexture::from_rgba8(
             ctx,

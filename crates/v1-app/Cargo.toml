@@ -43,3 +43,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell",
     "Win32_UI_Shell_PropertiesSystem",
 ] }
+
+# macOS media controls (MPNowPlayingInfoCenter + MPRemoteCommandCenter).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+block2 = "0.5"

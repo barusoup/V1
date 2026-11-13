@@ -13,7 +13,7 @@
 //! editor must run from a bare checkout).
 
 use crate::camera::Camera;
-use crate::gfx::vulkan::DynamicBuffers;
+use crate::gfx::DynamicBuffers;
 use crate::gfx::{ColorVertex, DrawCtx, Renderer};
 use crate::ui::Color;
 use glam::Vec3;
@@ -296,7 +296,7 @@ impl Scene {
     }
 
     /// The GPU context, for building debug geometry on demand.
-    fn canvas_context(&self) -> &Arc<crate::gfx::vulkan::GpuContext> {
+    fn canvas_context(&self) -> &Arc<crate::gfx::GpuContext> {
         // The canvas buffers hold the only long-lived context reference; the
         // renderer's context outlives the scene, so borrow through it.
         self.canvas.context()

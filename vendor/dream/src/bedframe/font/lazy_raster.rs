@@ -476,12 +476,14 @@ pub(crate) struct LazyFont {
 
 impl LazyFont {
     /// Parse a font from a borrowed slice, copying it into the font.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
         Self::from_cow(Cow::Owned(data.to_vec()))
     }
 
     /// Parse a font from `data`, keeping it as-is: a `Cow::Borrowed` font
     /// reads straight from the caller's `'static` bytes without a copy.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn from_cow(data: Cow<'static, [u8]>) -> Result<Self, &'static str> {
         let face = Face::parse(&data, 0).map_err(|_| "failed to parse TTF/OTF face")?;
         let units_per_em = f32::from(face.units_per_em().max(1));

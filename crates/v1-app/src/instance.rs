@@ -8,8 +8,6 @@
 //! gap between this process exiting and the installer starting the updated build; that handoff
 //! marker lives in [`crate::update`].
 
-use std::ffi::c_void;
-
 /// What a launch found when it asked to be the one running copy.
 pub enum Acquire {
     /// This process owns the app; keep the guard until exit.
@@ -23,6 +21,7 @@ pub enum Acquire {
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
 
     const ERROR_ALREADY_EXISTS: u32 = 183;
@@ -78,7 +77,58 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+mod imp {
+    use super::*;
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::AsRawFd;
+
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+
+    extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+
+    /// Keeps the advisory `flock` alive for as long as this process runs.
+    pub struct Guard(#[allow(dead_code)] File);
+
+    pub fn acquire() -> Acquire {
+        acquire_named("v1-app-single-instance")
+    }
+
+    fn acquire_named(name: &str) -> Acquire {
+        let path = std::env::temp_dir().join(format!("{name}.lock"));
+        let Ok(file) = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+        else {
+            return Acquire::Unavailable;
+        };
+        // SAFETY: `file.as_raw_fd()` is a valid open descriptor owned by `file`.
+        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+        if rc == 0 {
+            Acquire::First(Guard(file))
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                Acquire::AlreadyRunning
+            } else {
+                Acquire::Unavailable
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_acquire(name: &str) -> Acquire {
+        acquire_named(name)
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 mod imp {
     use super::*;
 
@@ -96,7 +146,7 @@ pub fn acquire() -> Acquire {
     imp::acquire()
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, unix)))]
 mod tests {
     use super::*;
 

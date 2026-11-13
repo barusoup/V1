@@ -14,8 +14,9 @@ Lyrics are synced line by line from Boidu (the Better Lyrics API), with
 ## Requirements
 
 - Rust 1.85 or newer
-- A GPU with Vulkan 1.3
-- To run from source: `ffmpeg` and `ffprobe` on `PATH`, or set `DREAM_FFMPEG` and `DREAM_FFPROBE`.
+- **Windows / Linux**: A GPU with Vulkan 1.3
+- **macOS**: Apple Silicon (`arm64`, macOS 13.0+ with Metal). Older Intel Macs are not supported.
+- To run from source: `ffmpeg` and `ffprobe` on `PATH` (e.g. `brew install ffmpeg` on macOS), or set `DREAM_FFMPEG` and `DREAM_FFPROBE`.
   The Windows installer includes them.
 
 ## Install
@@ -30,6 +31,12 @@ copy starts exit silently, so the new instance opens cleanly.
 
 ```
 cargo run -p v1-app --release
+```
+
+To package `V1.app` and a `.dmg` for macOS Apple Silicon (`aarch64-apple-darwin`):
+
+```
+./installer/build-macos.sh
 ```
 
 ## License

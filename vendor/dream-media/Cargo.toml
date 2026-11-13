@@ -20,4 +20,4 @@ gpu = ["dep:dream"]
 [dependencies]
 cpal = "0.16"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-dream = { git = "https://github.com/barusoup/Dream.git", branch = "main", optional = true }
+dream = { path = "../dream", optional = true }
