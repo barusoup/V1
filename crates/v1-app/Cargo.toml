@@ -30,6 +30,8 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+# The native "choose a picture" dialog. Only the background picker uses it.
+rfd = { version = "0.15", default-features = false }
 
 # Windows media controls (SMTC): earbud and keyboard play/pause/next/previous, and the media
 # flyout. There is no Win32 message for earbud transport buttons; they arrive through SMTC.

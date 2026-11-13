@@ -133,7 +133,7 @@ fn convert_quad(vertices: &[UiVertex], verts: [u32; 4]) -> Option<UiInstance> {
     }
     let w = tr[0] - x;
     let h = bl[1] - y;
-    if !(w > 0.0 && h > 0.0) || !same(br[0], x + w) || !same(br[1], y + h) {
+    if !(w > 0.0 && h > 0.0 && same(br[0], x + w) && same(br[1], y + h)) {
         return None;
     }
     // UV must match the same corner orientation: TL/TL, TR/TR, BR/BR,
@@ -141,11 +141,12 @@ fn convert_quad(vertices: &[UiVertex], verts: [u32; 4]) -> Option<UiInstance> {
     // them on the indexed path instead of re-orienting.
     let (u0, v0) = (v[0].uv[0], v[0].uv[1]);
     let (u1, v1) = (v[2].uv[0], v[2].uv[1]);
-    if !(u1 > u0 && v1 > v0)
-        || !same(v[1].uv[0], u1)
-        || !same(v[1].uv[1], v0)
-        || !same(v[3].uv[0], u0)
-        || !same(v[3].uv[1], v1)
+    if !(u1 > u0
+        && v1 > v0
+        && same(v[1].uv[0], u1)
+        && same(v[1].uv[1], v0)
+        && same(v[3].uv[0], u0)
+        && same(v[3].uv[1], v1))
     {
         return None;
     }

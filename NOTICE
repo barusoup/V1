@@ -58,11 +58,12 @@ Services and external tools
   run time; that script is not bundled. V1 is not affiliated with or endorsed
   by YouTube, Google, Boidu or LRCLIB.
 
-  The Windows installer bundles FFmpeg and ffprobe, a static build from
-  BtbN/FFmpeg-Builds (https://github.com/BtbN/FFmpeg-Builds), FFmpeg version
-  n9.0.2. It is licensed under the GNU Lesser General Public License v3.0 and
-  installed in the ffmpeg folder with its license text (LICENSE-FFmpeg.txt).
-  V1 runs FFmpeg as a separate program and does not link to it. FFmpeg source:
-  https://ffmpeg.org/download.html. The build also includes third-party
-  libraries under their own licenses, listed in the build configuration on the
-  BtbN release page.
+  Windows bundles FFmpeg and ffprobe from BtbN/FFmpeg-Builds; macOS builds them
+  from the official FFmpeg 9.0.2 source archive at
+  https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz. The macOS build disables external library autodetection, uses FFmpeg's
+  internal libraries statically, and enables VideoToolbox, AudioToolbox and
+  Secure Transport for native hardware video encoding, audio codecs and HTTPS.
+  FFmpeg is licensed under the GNU Lesser General Public License v3.0. The
+  macOS app includes its license, exact source archive and build configuration
+  in Contents/Resources. V1 runs FFmpeg as a separate program and does not link
+  to it. Windows installs its binaries in the ffmpeg folder with license text.

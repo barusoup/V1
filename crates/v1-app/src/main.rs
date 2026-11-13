@@ -13,6 +13,7 @@
 
 mod anim;
 mod backend;
+mod background;
 mod clock;
 mod gpu;
 mod icons;
@@ -44,9 +45,11 @@ use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WinitKey, NamedKey};
-use winit::window::{CursorIcon, Window};
 #[cfg(windows)]
-use winit::platform::windows::{CornerPreference, WindowAttributesExtWindows};
+use winit::platform::windows::{
+    Color as WindowColor, CornerPreference, WindowAttributesExtWindows, WindowExtWindows,
+};
+use winit::window::{CursorIcon, Fullscreen, Window};
 
 /// `V1_BOOT=1` prints when each step of starting up finished, in milliseconds since `main` began.
 /// Off by default, and free then: the switch is read once.
@@ -54,7 +57,10 @@ pub fn boot_mark(label: &str) {
     static START: std::sync::OnceLock<Option<Instant>> = std::sync::OnceLock::new();
     let start = START.get_or_init(|| std::env::var_os("V1_BOOT").map(|_| Instant::now()));
     if let Some(start) = start {
-        eprintln!("boot {:>7.1} ms  {label}", start.elapsed().as_secs_f64() * 1000.0);
+        eprintln!(
+            "boot {:>7.1} ms  {label}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
     }
 }
 
@@ -137,7 +143,7 @@ struct Host {
 
     /// The display's scale factor (device pixels per OS logical pixel).
     scale: f32,
-    /// How much the whole UI is enlarged for the window it is in; see [`zoom_for`].
+    /// Compact-window adjustment to the UI scale; see [`zoom_for`].
     zoom: f32,
     mouse: (f32, f32),
     down: bool,
@@ -187,13 +193,25 @@ struct WindowDrag {
     origin: (i32, i32),
 }
 
-/// The window is designed at 1280x800 logical pixels. Larger windows enlarge the whole UI (text,
-/// icons, spacing) in proportion, so it keeps its balance instead of shrinking into a corner;
-/// smaller ones shrink it a little before the layout starts to give way. The steps are 2% so a
-/// resize does not churn the glyph cache with a new size every pixel.
+/// Keep text, icons and spacing at their normal size in larger windows, leaving more room for
+/// content. Compact windows shrink a little before the layout starts to give way. Display DPI
+/// scaling is applied separately. The 2% steps avoid churning the glyph cache during a resize.
 fn zoom_for(logical_w: f32, logical_h: f32) -> f32 {
     let fit = (logical_w / 1280.0).min(logical_h / 800.0);
-    ((fit.clamp(0.85, 1.75) * 50.0).round()) / 50.0
+    ((fit.clamp(0.85, 1.0) * 50.0).round()) / 50.0
+}
+
+#[test]
+fn larger_windows_keep_normal_ui_size() {
+    for (w, h) in [
+        (1280.0, 800.0),
+        (1920.0, 1080.0),
+        (3840.0, 2160.0),
+        (3440.0, 1440.0),
+    ] {
+        assert_eq!(zoom_for(w, h), 1.0);
+    }
+    assert!(zoom_for(960.0, 600.0) < 1.0);
 }
 
 /// Build a frame, making any textures it asked for first. A frame that finds its icons missing
@@ -221,7 +239,11 @@ fn make_frame(
         mouse_down: input.mouse_down,
         ..Default::default()
     };
-    let pointer = ui::Pointer { pressed: false, secondary: false, ..pointer };
+    let pointer = ui::Pointer {
+        pressed: false,
+        secondary: false,
+        ..pointer
+    };
     ui::build(ui, state, again, pointer, size.0, size.1, scale)
 }
 
@@ -296,7 +318,11 @@ impl ApplicationHandler<UserEvent> for Host {
         // `V1_MEM=1` prints the UI renderer's own GPU allocations, to keep an eye on the app-side
         // share of the process footprint (the Vulkan driver's own allocations are not visible here).
         if mem_trace() {
-            let ui: u64 = renderer.ui_allocation_sizes().iter().map(|(_, bytes)| *bytes).sum();
+            let ui: u64 = renderer
+                .ui_allocation_sizes()
+                .iter()
+                .map(|(_, bytes)| *bytes)
+                .sum();
             eprintln!("ui gpu allocations {:.1} MB", ui as f64 / (1024.0 * 1024.0));
         }
         self.renderer = Some(renderer);
@@ -304,7 +330,10 @@ impl ApplicationHandler<UserEvent> for Host {
         boot_mark("fonts and ui ready");
         self.window = Some(window);
         // Know the refresh rate before the first frame, so startup motion is paced correctly.
-        self.display_monitor = self.window.as_ref().and_then(|window| window.current_monitor());
+        self.display_monitor = self
+            .window
+            .as_ref()
+            .and_then(|window| window.current_monitor());
         self.display_hz = self.display_monitor.as_ref().and_then(monitor_hz);
         // Windows routes earbud and keyboard transport buttons through SMTC, not through a Win32
         // window message, so a session is what makes them reach the app at all.
@@ -388,7 +417,11 @@ impl ApplicationHandler<UserEvent> for Host {
                 self.mouse = (-1.0, -1.0);
                 self.redraw_request();
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
                 match state {
                     ElementState::Pressed => {
                         self.down = true;
@@ -426,10 +459,17 @@ impl ApplicationHandler<UserEvent> for Host {
                 } else {
                     state.control_key()
                 };
-                self.keys.modifiers(state.shift_key(), command, state.alt_key());
+                self.keys
+                    .modifiers(state.shift_key(), command, state.alt_key());
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
+                if event.logical_key == WinitKey::Named(NamedKey::F11) {
+                    if pressed && !event.repeat {
+                        self.toggle_fullscreen();
+                    }
+                    return;
+                }
                 if pressed && self.app_shortcut(&event.logical_key) {
                     self.redraw_request();
                     return;
@@ -526,7 +566,10 @@ impl ApplicationHandler<UserEvent> for Host {
                     window.request_redraw();
                 }
             }
-            let wake = frame_wake.into_iter().chain(self.memory.next_deadline()).min();
+            let wake = frame_wake
+                .into_iter()
+                .chain(self.memory.next_deadline())
+                .min();
             match wake {
                 Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
                 None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -652,14 +695,19 @@ impl Host {
             if size.width == 0 || size.height == 0 {
                 return;
             }
-            self.zoom = zoom_for(size.width as f32 / self.scale, size.height as f32 / self.scale);
+            self.zoom = zoom_for(
+                size.width as f32 / self.scale,
+                size.height as f32 / self.scale,
+            );
         }
     }
 
     /// Take the collection the loading thread read, and hand it to the state. The state starts with
     /// an empty one so that nothing waited for the disk before the window could open.
     fn attach_library(&mut self) {
-        let Some(task) = self.library_task.take() else { return };
+        let Some(task) = self.library_task.take() else {
+            return;
+        };
         match task.join() {
             Ok(library) => self.state.attach_library(library),
             Err(_) => eprintln!("could not read the collection; starting with an empty one"),
@@ -688,6 +736,40 @@ impl Host {
             }
             WinitKey::Named(NamedKey::Space) if !command && !self.editing() => {
                 self.state.toggle_request = true;
+                true
+            }
+            WinitKey::Named(NamedKey::ArrowUp) if !command && !self.editing() => {
+                self.state.adjust_volume(0.05);
+                true
+            }
+            WinitKey::Named(NamedKey::ArrowDown) if !command && !self.editing() => {
+                self.state.adjust_volume(-0.05);
+                true
+            }
+            WinitKey::Named(NamedKey::ArrowLeft) if !command && !self.editing() => {
+                self.state.seek_relative(-5.0);
+                true
+            }
+            WinitKey::Named(NamedKey::ArrowRight) if !command && !self.editing() => {
+                self.state.seek_relative(5.0);
+                true
+            }
+            WinitKey::Character(text)
+                if !command && !self.editing() && text.eq_ignore_ascii_case("m") =>
+            {
+                self.state.toggle_mute();
+                true
+            }
+            WinitKey::Character(text)
+                if !command && !self.editing() && text.eq_ignore_ascii_case("l") =>
+            {
+                self.state.toggle_lyrics();
+                true
+            }
+            WinitKey::Character(text)
+                if !command && !self.editing() && text.eq_ignore_ascii_case("h") =>
+            {
+                self.state.toggle_theater();
                 true
             }
             // Keyboard media keys that Windows delivers as ordinary key events. Most earbuds go
@@ -748,11 +830,29 @@ impl Host {
         match sequence {
             None => {
                 let pos = hover.unwrap_or(self.mouse);
-                shot_step(ui, renderer, &mut self.state, pos, 0.016, (width, height), scale, Some(path));
+                shot_step(
+                    ui,
+                    renderer,
+                    &mut self.state,
+                    pos,
+                    0.016,
+                    (width, height),
+                    scale,
+                    Some(path),
+                );
             }
             Some(frames) => {
                 // Frame 0 settles every spring at its resting value with the pointer parked.
-                shot_step(ui, renderer, &mut self.state, (-1.0, -1.0), 1.0 / 60.0, (width, height), scale, None);
+                shot_step(
+                    ui,
+                    renderer,
+                    &mut self.state,
+                    (-1.0, -1.0),
+                    1.0 / 60.0,
+                    (width, height),
+                    scale,
+                    None,
+                );
                 if std::env::var_os("V1_SHOT_COLLAPSE").is_some() {
                     self.state.sidebar_open = false;
                 }
@@ -762,9 +862,9 @@ impl Host {
                 let last = frames.iter().copied().max().unwrap_or(0);
                 let stem = path.with_extension("");
                 for frame in 1..=last {
-                    let out = frames.contains(&frame).then(|| {
-                        PathBuf::from(format!("{}-{frame:03}.png", stem.display()))
-                    });
+                    let out = frames
+                        .contains(&frame)
+                        .then(|| PathBuf::from(format!("{}-{frame:03}.png", stem.display())));
                     shot_step(
                         ui,
                         renderer,
@@ -789,9 +889,12 @@ impl Host {
 
     /// Do what the UI asked of the window (see [`ui::WindowRequest`]).
     fn window_request(&mut self, event_loop: &ActiveEventLoop, request: ui::WindowRequest) {
-        let Some(window) = self.window.clone() else { return };
+        let Some(window) = self.window.clone() else {
+            return;
+        };
         match request {
             ui::WindowRequest::Minimize => window.set_minimized(true),
+            ui::WindowRequest::ToggleFullscreen => self.toggle_fullscreen(),
             ui::WindowRequest::Close => event_loop.exit(),
             ui::WindowRequest::Drag => {
                 self.start_drag(&window);
@@ -802,15 +905,53 @@ impl Host {
         }
     }
 
+    fn toggle_fullscreen(&mut self) {
+        let Some(window) = &self.window else { return };
+        // Let winit save and restore the native window placement, including the restored
+        // bounds of a maximized window. Resizing it ourselves would overwrite that placement.
+        let fullscreen = if window.fullscreen().is_some() {
+            None
+        } else {
+            Some(Fullscreen::Borderless(window.current_monitor()))
+        };
+        self.drag = None;
+        #[cfg(windows)]
+        let entering = fullscreen.is_some();
+        window.set_fullscreen(fullscreen);
+        #[cfg(windows)]
+        {
+            // DWM can still outline an undecorated window. Remove its border and corner
+            // cutouts at the screen edges, then restore the normal windowed appearance.
+            window.set_border_color(if entering {
+                None
+            } else {
+                Some(WindowColor::SYSTEM_DEFAULT)
+            });
+            window.set_corner_preference(if entering {
+                CornerPreference::DoNotRound
+            } else {
+                CornerPreference::Round
+            });
+        }
+        self.redraw_request();
+    }
+
     /// Begin moving the window with the pointer.
     ///
     /// The host does the move itself rather than calling `drag_window`. That hands the move to the
     /// OS, whose modal loop takes over the thread: winit's loop stops running, so no frame is drawn
     /// until the button comes up, and every animation freezes for the length of the drag.
     fn start_drag(&mut self, window: &Window) {
+        // Moving a fullscreen window would move it off its monitor and spoil its placement.
+        if window.fullscreen().is_some() {
+            return;
+        }
         match (cursor_screen_pos(), window.outer_position()) {
             (Some(cursor), Ok(origin)) => {
-                self.drag = Some(WindowDrag { cursor, origin: (origin.x, origin.y) });
+                self.drag = Some(WindowDrag {
+                    cursor,
+                    origin: (origin.x, origin.y),
+                });
             }
             _ => {
                 let _ = window.drag_window();
@@ -855,6 +996,10 @@ impl Host {
         }
 
         self.update_zoom();
+        self.state.fullscreen = self
+            .window
+            .as_ref()
+            .is_some_and(|w| w.fullscreen().is_some());
         let scale = self.ui_scale();
         let (Some(ui), Some(renderer)) = (self.ui.as_mut(), self.renderer.as_mut()) else {
             return;
@@ -880,7 +1025,15 @@ impl Host {
             pressed: self.pressed,
             secondary: self.secondary_pressed,
         };
-        let frame = make_frame(ui, renderer, &mut self.state, input, pointer, (width, height), scale);
+        let frame = make_frame(
+            ui,
+            renderer,
+            &mut self.state,
+            input,
+            pointer,
+            (width, height),
+            scale,
+        );
         if let Err(error) = renderer.render_ui_only(Some(&frame)) {
             match error {
                 // A stale swapchain is normal after minimize/restore or a display change. Rebuild
@@ -980,7 +1133,9 @@ fn shot_step(
 #[cfg(windows)]
 fn taskbar_icon() -> Option<winit::window::Icon> {
     let png = include_bytes!("../assets/icon/app-48.png");
-    let rgba = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?.to_rgba8();
+    let rgba = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .ok()?
+        .to_rgba8();
     let (w, h) = rgba.dimensions();
     winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
 }
@@ -988,7 +1143,9 @@ fn taskbar_icon() -> Option<winit::window::Icon> {
 /// The window and taskbar icon: the 256 px render of the app icon, decoded once per window.
 fn app_icon() -> Option<winit::window::Icon> {
     let png = include_bytes!("../assets/icon/app-256.png");
-    let rgba = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?.to_rgba8();
+    let rgba = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .ok()?
+        .to_rgba8();
     let (w, h) = rgba.dimensions();
     winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
 }
@@ -1046,7 +1203,9 @@ fn main() {
     let arguments: Vec<String> = std::env::args().collect();
     let smoke_mode = arguments.iter().any(|argument| argument == "--smoke");
     let shot_mode = arguments.iter().any(|argument| argument == "--shot");
-    let updated = arguments.iter().any(|argument| argument == update::UPDATED_FLAG);
+    let updated = arguments
+        .iter()
+        .any(|argument| argument == update::UPDATED_FLAG);
     if smoke_mode {
         smoke();
         return;
@@ -1187,7 +1346,11 @@ fn smoke() {
             tube.clone(),
             YtScripts::new(player),
             HttpProber::new(
-                reqwest::Client::builder().no_proxy().http1_only().build().expect("prober"),
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .http1_only()
+                    .build()
+                    .expect("prober"),
             ),
             FileCache::open(data_dir().join("streams.json")),
             ResolverConfig::default(),

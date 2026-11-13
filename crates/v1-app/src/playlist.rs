@@ -58,8 +58,10 @@ impl Playlist {
     /// Fill in what the songs here are missing from fresher copies of them (see
     /// [`crate::library::fill_gaps`]): the queue, the history, and the current and loading song.
     pub fn fill_in<'a>(&mut self, hits: impl IntoIterator<Item = &'a SongHit>) {
-        let by_id: std::collections::HashMap<&str, &SongHit> =
-            hits.into_iter().map(|hit| (hit.video_id.as_str(), hit)).collect();
+        let by_id: std::collections::HashMap<&str, &SongHit> = hits
+            .into_iter()
+            .map(|hit| (hit.video_id.as_str(), hit))
+            .collect();
         if by_id.is_empty() {
             return;
         }

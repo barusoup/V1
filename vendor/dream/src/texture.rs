@@ -12,7 +12,7 @@
 //!
 //! ```no_run
 //! # use std::sync::Arc;
-//! # use dream::gfx::vulkan::GpuContext;
+//! # use dream::gfx::GpuContext;
 //! # use dream::texture::{TextureFormat, TextureManager, TextureOptions};
 //! # fn example(ctx: Arc<GpuContext>) -> Result<(), String> {
 //! let mut textures = TextureManager::new(ctx.clone());

@@ -123,7 +123,9 @@ fn cache_file(dir: &Path, hash: &str) -> PathBuf {
 /// couple of megabytes behind, and only the current build's is ever read again.
 fn prune_cache(dir: &Path, keep_hash: &str) {
     let keep = cache_file(dir, keep_hash);
-    let Ok(files) = std::fs::read_dir(dir) else { return };
+    let Ok(files) = std::fs::read_dir(dir) else {
+        return;
+    };
     for file in files.flatten() {
         let path = file.path();
         let name = file.file_name();
@@ -176,7 +178,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yt-js-prune-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for name in ["old1.base.js", "old2.base.js", "half.base.tmp", "now.base.js", "notes.txt"] {
+        for name in [
+            "old1.base.js",
+            "old2.base.js",
+            "half.base.tmp",
+            "now.base.js",
+            "notes.txt",
+        ] {
             std::fs::write(dir.join(name), "x").unwrap();
         }
         prune_cache(&dir, "now");

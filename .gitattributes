@@ -1,1 +1,2 @@
 * text=auto
+installer/build-macos.sh text eol=lf

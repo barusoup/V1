@@ -249,16 +249,19 @@ mod imp {
 
                 if let Some(album) = info.album {
                     let ns_album = nsstring(album);
-                    let _: () = msg_send![dict, setObject: ns_album, forKey: MPMediaItemPropertyAlbumTitle];
+                    let _: () =
+                        msg_send![dict, setObject: ns_album, forKey: MPMediaItemPropertyAlbumTitle];
                     let _: () = msg_send![ns_album, release];
                 }
 
                 let dur = nsnumber_f64(info.duration.max(0.0));
                 let pos = nsnumber_f64(info.position.max(0.0));
                 let rate = nsnumber_f64(if info.playing { 1.0 } else { 0.0 });
-                let _: () = msg_send![dict, setObject: dur, forKey: MPMediaItemPropertyPlaybackDuration];
+                let _: () =
+                    msg_send![dict, setObject: dur, forKey: MPMediaItemPropertyPlaybackDuration];
                 let _: () = msg_send![dict, setObject: pos, forKey: MPNowPlayingInfoPropertyElapsedPlaybackTime];
-                let _: () = msg_send![dict, setObject: rate, forKey: MPNowPlayingInfoPropertyPlaybackRate];
+                let _: () =
+                    msg_send![dict, setObject: rate, forKey: MPNowPlayingInfoPropertyPlaybackRate];
 
                 let _: () = msg_send![center, setNowPlayingInfo: dict];
                 let state = if info.playing {
@@ -314,7 +317,8 @@ mod imp {
     use windows::Media::{
         MediaPlaybackStatus, MediaPlaybackType, PlaybackPositionChangeRequestedEventArgs,
         SystemMediaTransportControls, SystemMediaTransportControlsButton,
-        SystemMediaTransportControlsButtonPressedEventArgs, SystemMediaTransportControlsTimelineProperties,
+        SystemMediaTransportControlsButtonPressedEventArgs,
+        SystemMediaTransportControlsTimelineProperties,
     };
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::WinRT::{
@@ -456,9 +460,7 @@ mod imp {
             } else {
                 MediaPlaybackStatus::Paused
             };
-            if self.status != Some(status)
-                && self.controls.SetPlaybackStatus(status).is_ok()
-            {
+            if self.status != Some(status) && self.controls.SetPlaybackStatus(status).is_ok() {
                 self.status = Some(status);
             }
 
@@ -476,7 +478,9 @@ mod imp {
             if self.cleared {
                 return;
             }
-            let _ = self.controls.SetPlaybackStatus(MediaPlaybackStatus::Stopped);
+            let _ = self
+                .controls
+                .SetPlaybackStatus(MediaPlaybackStatus::Stopped);
             let mut cleared = true;
             if let Ok(updater) = self.controls.DisplayUpdater() {
                 let _ = updater.ClearAll();
@@ -508,9 +512,7 @@ mod imp {
     impl Drop for MediaControls {
         fn drop(&mut self) {
             if let Some(token) = self.seek_token.take() {
-                let _ = self
-                    .controls
-                    .RemovePlaybackPositionChangeRequested(token);
+                let _ = self.controls.RemovePlaybackPositionChangeRequested(token);
             }
             let _ = self.controls.RemoveButtonPressed(self.button_token);
             let _ = self.controls.SetIsEnabled(false);
@@ -521,9 +523,7 @@ mod imp {
     fn window_hwnd(window: &winit::window::Window) -> Option<HWND> {
         let handle = window.window_handle().ok()?;
         match handle.as_raw() {
-            RawWindowHandle::Win32(win32) => {
-                Some(HWND(win32.hwnd.get() as *mut core::ffi::c_void))
-            }
+            RawWindowHandle::Win32(win32) => Some(HWND(win32.hwnd.get() as *mut core::ffi::c_void)),
             _ => None,
         }
     }
@@ -554,9 +554,7 @@ mod imp {
         if !seconds.is_finite() || seconds <= 0.0 {
             return 0;
         }
-        (seconds * 10_000_000.0)
-            .round()
-            .clamp(0.0, i64::MAX as f64) as i64
+        (seconds * 10_000_000.0).round().clamp(0.0, i64::MAX as f64) as i64
     }
 
     #[cfg(test)]
@@ -586,7 +584,10 @@ mod imp {
                 Some(Command::Stop)
             );
             // Record, fast-forward, rewind and channel buttons are not ours.
-            assert_eq!(command_for(SystemMediaTransportControlsButton::Record), None);
+            assert_eq!(
+                command_for(SystemMediaTransportControlsButton::Record),
+                None
+            );
             assert_eq!(
                 command_for(SystemMediaTransportControlsButton::FastForward),
                 None
@@ -599,7 +600,13 @@ mod imp {
             assert_eq!(seconds_to_ticks(-3.0), 0);
             assert_eq!(seconds_to_ticks(f64::NAN), 0);
             assert_eq!(seconds_to_ticks(1.5), 15_000_000);
-            assert!((ticks_to_seconds(TimeSpan { Duration: 15_000_000 }) - 1.5).abs() < 1e-9);
+            assert!(
+                (ticks_to_seconds(TimeSpan {
+                    Duration: 15_000_000
+                }) - 1.5)
+                    .abs()
+                    < 1e-9
+            );
         }
     }
 }

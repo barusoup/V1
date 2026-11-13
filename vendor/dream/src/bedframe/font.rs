@@ -936,7 +936,7 @@ static MISSING_ROLE_WARN: std::sync::Mutex<Option<std::collections::HashSet<Stri
 fn warn_preview(cluster: &str) -> String {
     let mut out: String = cluster.chars().take(16).collect();
     if cluster.chars().nth(16).is_some() {
-        out.push_str("…");
+        out.push('…');
     }
     out
 }
@@ -1000,7 +1000,7 @@ fn cluster_font_map(fonts: &Fonts, font: FontId, text: &str) -> Vec<(usize, Opti
 /// The resolved `FontId` for the cluster containing `byte` (or `None`
 /// when that cluster is hidden).
 #[cfg(not(target_os = "macos"))]
-fn font_at<'a>(map: &'a [(usize, Option<FontId>)], byte: usize) -> Option<FontId> {
+fn font_at(map: &[(usize, Option<FontId>)], byte: usize) -> Option<FontId> {
     map.partition_point(|&(start, _)| start <= byte)
         .checked_sub(1)
         .map(|index| map[index].1)

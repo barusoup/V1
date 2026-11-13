@@ -76,14 +76,22 @@ pub fn parse_latest(json: &[u8]) -> Option<Release> {
     let assets = value.get("assets")?.as_array()?;
     let installer = find_asset(assets, &format!("V1-Setup-{version}.exe"))?;
     let checksums = find_asset(assets, CHECKSUMS)?;
-    Some(Release { version, installer, checksums })
+    Some(Release {
+        version,
+        installer,
+        checksums,
+    })
 }
 
 fn find_asset(assets: &[serde_json::Value], name: &str) -> Option<Asset> {
-    let asset = assets.iter().find(|asset| asset.get("name").and_then(|n| n.as_str()) == Some(name))?;
+    let asset = assets
+        .iter()
+        .find(|asset| asset.get("name").and_then(|n| n.as_str()) == Some(name))?;
     let url = asset.get("browser_download_url")?.as_str()?;
-    url.starts_with(DOWNLOAD_PREFIX)
-        .then(|| Asset { name: name.to_owned(), url: url.to_owned() })
+    url.starts_with(DOWNLOAD_PREFIX).then(|| Asset {
+        name: name.to_owned(),
+        url: url.to_owned(),
+    })
 }
 
 /// The SHA-256 the checksum file lists for `file`, in lower-case hex.
@@ -103,8 +111,15 @@ pub fn run_at_startup() {
     if std::env::var_os("V1_NO_UPDATE").is_some() {
         return;
     }
-    let Some(install_dir) = installed_dir() else { return };
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+    let Some(install_dir) = installed_dir() else {
+        return;
+    };
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
     let Ok(client) = reqwest::Client::builder()
         .user_agent(format!("V1/{CURRENT}"))
         .connect_timeout(Duration::from_secs(3))
@@ -114,12 +129,18 @@ pub fn run_at_startup() {
     };
 
     let Some(release) = runtime.block_on(async {
-        tokio::time::timeout(CHECK_BUDGET, newer_release(&client)).await.ok().flatten()
+        tokio::time::timeout(CHECK_BUDGET, newer_release(&client))
+            .await
+            .ok()
+            .flatten()
     }) else {
         return;
     };
     let Some(installer) = runtime.block_on(async {
-        tokio::time::timeout(DOWNLOAD_BUDGET, stage_installer(&client, &release)).await.ok().flatten()
+        tokio::time::timeout(DOWNLOAD_BUDGET, stage_installer(&client, &release))
+            .await
+            .ok()
+            .flatten()
     }) else {
         return;
     };
@@ -158,7 +179,10 @@ fn handoff_path() -> PathBuf {
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 /// Record that this process is about to exit for an installer. The marker covers the gap until the
@@ -181,7 +205,9 @@ fn parse_handoff(text: &str) -> Option<(Version, u64)> {
 }
 
 fn handoff_pending(text: &str, now: u64) -> bool {
-    let Some((_, written)) = parse_handoff(text) else { return false };
+    let Some((_, written)) = parse_handoff(text) else {
+        return false;
+    };
     // A clock that moved backwards still counts as fresh; a crashed update ages out.
     written > now || now.saturating_sub(written) <= HANDOFF_TTL.as_secs()
 }
@@ -193,7 +219,9 @@ pub fn blocked_by_update(from_installer: bool) -> bool {
         clear_handoff();
         return false;
     }
-    let Ok(text) = std::fs::read_to_string(handoff_path()) else { return false };
+    let Ok(text) = std::fs::read_to_string(handoff_path()) else {
+        return false;
+    };
     let pending = handoff_pending(&text, unix_now());
     if !pending {
         clear_handoff();
@@ -211,7 +239,10 @@ async fn newer_release(client: &reqwest::Client) -> Option<Release> {
 /// path of the verified file.
 async fn stage_installer(client: &reqwest::Client, release: &Release) -> Option<PathBuf> {
     let checksums = get(client, &release.checksums.url, Duration::from_secs(10)).await?;
-    let expected = expected_hash(std::str::from_utf8(&checksums).ok()?, &release.installer.name)?;
+    let expected = expected_hash(
+        std::str::from_utf8(&checksums).ok()?,
+        &release.installer.name,
+    )?;
     let installer = get(client, &release.installer.url, DOWNLOAD_BUDGET).await?;
     let actual = format!("{:x}", Sha256::digest(&installer));
     if actual != expected {
@@ -309,7 +340,9 @@ fn restart_into_update(installer: &Path, install_dir: &Path) -> std::io::Result<
 
 #[cfg(not(windows))]
 fn restart_into_update(_installer: &Path, _install_dir: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::other("self-update is only built for Windows"))
+    Err(std::io::Error::other(
+        "self-update is only built for Windows",
+    ))
 }
 
 #[cfg(test)]
@@ -344,7 +377,8 @@ mod tests {
 
     #[test]
     fn a_release_needs_its_installer_and_checksums() {
-        let release = parse_latest(release_json("v0.2.0", "V1-Setup-0.2.0.exe").as_bytes()).unwrap();
+        let release =
+            parse_latest(release_json("v0.2.0", "V1-Setup-0.2.0.exe").as_bytes()).unwrap();
         assert_eq!(release.version, Version(0, 2, 0));
         assert_eq!(release.installer.name, "V1-Setup-0.2.0.exe");
         assert!(parse_latest(release_json("v0.2.0", "V1-Setup-0.1.0.exe").as_bytes()).is_none());
@@ -363,10 +397,16 @@ mod tests {
     #[test]
     fn checksums_are_matched_by_file_name() {
         let hash = "a".repeat(64);
-        let sums = format!("{hash}  V1-Setup-0.2.0.exe\r\n{}  other.exe\r\n", "b".repeat(64));
+        let sums = format!(
+            "{hash}  V1-Setup-0.2.0.exe\r\n{}  other.exe\r\n",
+            "b".repeat(64)
+        );
         assert_eq!(expected_hash(&sums, "V1-Setup-0.2.0.exe"), Some(hash));
         assert_eq!(expected_hash(&sums, "missing.exe"), None);
-        assert_eq!(expected_hash("short  V1-Setup-0.2.0.exe", "V1-Setup-0.2.0.exe"), None);
+        assert_eq!(
+            expected_hash("short  V1-Setup-0.2.0.exe", "V1-Setup-0.2.0.exe"),
+            None
+        );
     }
 
     #[test]

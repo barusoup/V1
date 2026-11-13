@@ -427,4 +427,3 @@ mod tests {
         assert!(image.rgba()[0] > 200);
     }
 }
-

@@ -237,7 +237,11 @@ async fn the_first_read_of_a_file_needs_no_separate_size_probe() {
     assert_eq!(body.bytes().await.unwrap().as_ref(), pattern().as_slice());
 
     let ranges = seen.ranges.lock().unwrap().clone();
-    assert_eq!(ranges[0], (0, 64 * 1024 - 1), "the first request is the first chunk itself");
+    assert_eq!(
+        ranges[0],
+        (0, 64 * 1024 - 1),
+        "the first request is the first chunk itself"
+    );
     assert!(
         !ranges.contains(&(0, 0)),
         "no one-byte size probe was needed: {ranges:?}"

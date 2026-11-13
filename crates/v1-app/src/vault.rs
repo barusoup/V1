@@ -104,7 +104,12 @@ impl ArtistVault {
             }
         }
         vault.dir = Some(dir);
-        let recent: Vec<String> = vault.list().iter().take(PREWARM).map(|e| e.id.clone()).collect();
+        let recent: Vec<String> = vault
+            .list()
+            .iter()
+            .take(PREWARM)
+            .map(|e| e.id.clone())
+            .collect();
         for id in recent {
             vault.get(&id);
         }
@@ -127,8 +132,11 @@ impl ArtistVault {
     pub fn list(&mut self) -> &[ArtistEntry] {
         if self.order_dirty {
             self.order = self.entries.values().cloned().collect();
-            self.order
-                .sort_by(|a, b| b.saved_at.cmp(&a.saved_at).then_with(|| a.name.cmp(&b.name)));
+            self.order.sort_by(|a, b| {
+                b.saved_at
+                    .cmp(&a.saved_at)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
             self.order_dirty = false;
         }
         &self.order
@@ -139,7 +147,9 @@ impl ArtistVault {
     }
 
     fn write_index(&self, writer: Option<&Writer>) {
-        let (Some(dir), Some(writer)) = (&self.dir, writer) else { return };
+        let (Some(dir), Some(writer)) = (&self.dir, writer) else {
+            return;
+        };
         let mut entries: Vec<&ArtistEntry> = self.entries.values().collect();
         entries.sort_by(|a, b| a.id.cmp(&b.id));
         if let Ok(bytes) = serde_json::to_vec(&entries) {
@@ -148,7 +158,9 @@ impl ArtistVault {
     }
 
     fn write_page(&self, page: &ArtistPage, writer: Option<&Writer>) {
-        let (Some(dir), Some(writer)) = (&self.dir, writer) else { return };
+        let (Some(dir), Some(writer)) = (&self.dir, writer) else {
+            return;
+        };
         let stored = Stored { page: page.clone() };
         if let Ok(bytes) = serde_json::to_vec(&stored) {
             writer.put(Self::page_path(dir, &page.browse_id), bytes);
@@ -181,7 +193,9 @@ impl ArtistVault {
 
     /// A fresh copy of a saved artist's page has arrived: keep it in place of the old one.
     pub fn refresh(&mut self, page: &ArtistPage, writer: Option<&Writer>) {
-        let Some(entry) = self.entries.get_mut(&page.browse_id) else { return };
+        let Some(entry) = self.entries.get_mut(&page.browse_id) else {
+            return;
+        };
         entry.fetched_at = now_secs();
         if !page.name.is_empty() {
             entry.name = page.name.clone();
@@ -228,9 +242,19 @@ impl ArtistVault {
     /// with no disk behind it keeps everything: there would be nothing to read back.
     fn warm_page(&mut self, page: ArtistPage) {
         self.clock += 1;
-        self.warm.insert(page.browse_id.clone(), Warm { page, used: self.clock });
+        self.warm.insert(
+            page.browse_id.clone(),
+            Warm {
+                page,
+                used: self.clock,
+            },
+        );
         while self.dir.is_some() && self.warm.len() > WARM_MAX {
-            let coldest = self.warm.iter().min_by_key(|(_, w)| w.used).map(|(id, _)| id.clone());
+            let coldest = self
+                .warm
+                .iter()
+                .min_by_key(|(_, w)| w.used)
+                .map(|(id, _)| id.clone());
             match coldest {
                 Some(id) => {
                     self.warm.remove(&id);
@@ -281,8 +305,13 @@ mod tests {
         }
         let mut vault = ArtistVault::open(dir.clone());
         assert_eq!(vault.len(), WARM_MAX + 10, "the index survived");
-        assert!(vault.warm.len() <= PREWARM, "only the newest few are read ahead");
-        let cold = vault.get("UC0").expect("a cold page is read back from disk");
+        assert!(
+            vault.warm.len() <= PREWARM,
+            "only the newest few are read ahead"
+        );
+        let cold = vault
+            .get("UC0")
+            .expect("a cold page is read back from disk");
         assert_eq!(cold.name, "Artist UC0");
         assert!(vault.get("UCnone").is_none());
         let _ = std::fs::remove_dir_all(&dir);

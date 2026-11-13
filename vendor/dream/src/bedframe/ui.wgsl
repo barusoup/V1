@@ -300,6 +300,10 @@ fn coverage(in: Vs_out, alpha: f32) -> f32 {
         let soft = max(-in.params.w - 5.0, 1.0);
         let d = rounded_box_d(in.uv, in.params.xy, in.params.z);
         return alpha * clamp(0.5 - d / soft, 0.0, 1.0);
+    } else if (in.params.w > 0.25 && in.params.w < 0.5) {
+        // Concave corner fillet: open circle at `params.xy` of radius `params.z`.
+        let d = in.params.z - length(in.pix - in.params.xy);
+        return alpha * clamp(0.5 - d, 0.0, 1.0);
     }
     // Radial gradients and plain quads are fully covered here; the radial
     // edge band is applied by the colour stage below.

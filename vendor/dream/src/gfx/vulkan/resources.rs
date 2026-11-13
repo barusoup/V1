@@ -331,6 +331,7 @@ impl GpuContext {
 
     /// 2D array image with a full mip chain — the impostor atlas keeps six
     /// view layers per channel in one image.
+    #[allow(clippy::too_many_arguments)] // Keep the established rendering API.
     pub fn create_image_array_mips(
         self: &Arc<Self>,
         label: &str,

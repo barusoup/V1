@@ -44,18 +44,10 @@ impl LodEntry {
 }
 
 /// Policy + rolling stats shared by all objects.
+#[derive(Default)]
 pub struct LodBatch {
     pub policy: LodPolicy,
     pub stats: LodStats,
-}
-
-impl Default for LodBatch {
-    fn default() -> Self {
-        Self {
-            policy: LodPolicy::default(),
-            stats: LodStats::default(),
-        }
-    }
 }
 
 impl LodBatch {

@@ -4,21 +4,18 @@ use crate::gfx::GpuImage;
 use crate::impostor::VIEW_COUNT;
 use ash::vk;
 
+type PostBakeOutput = (
+    Vec<GpuImage>,
+    Vec<Vec<Vec<u8>>>,
+    Vec<Vec<u8>>,
+    [f32; VIEW_COUNT],
+);
+
 impl ImpostorBaker {
     /// GPU post-bake: downsample -> dilate -> mipgen -> pack -> copy to the
     /// five final array images. One submission; returns the images, the
     /// level-0 RGBA tiles (for previews/test data), and per-layer coverage.
-    pub(super) fn gpu_post(
-        &self,
-        caps: &[GpuImage],
-        res: u32,
-        ss: u32,
-    ) -> (
-        Vec<GpuImage>,
-        Vec<Vec<Vec<u8>>>,
-        Vec<Vec<u8>>,
-        [f32; VIEW_COUNT],
-    ) {
+    pub(super) fn gpu_post(&self, caps: &[GpuImage], res: u32, ss: u32) -> PostBakeOutput {
         let ctx = &self.ctx;
         let device = ctx.device().clone();
         let mips = 32 - res.leading_zeros();
@@ -460,10 +457,10 @@ impl ImpostorBaker {
                     (&packs[i], 4u64)
                 };
                 let mut regions = Vec::with_capacity(VIEW_COUNT * mips as usize);
-                for l in 0..mips as usize {
+                for (l, &level_offset) in level_off.iter().enumerate() {
                     let r = (res >> l).max(1);
                     for f in 0..VIEW_COUNT {
-                        let off = (level_off[l] + f as u64 * r as u64 * r as u64) * bpt;
+                        let off = (level_offset + f as u64 * r as u64 * r as u64) * bpt;
                         regions.push(
                             vk::BufferImageCopy::default()
                                 .buffer_offset(off)
@@ -560,12 +557,12 @@ impl ImpostorBaker {
         }
         let mut tiles: Vec<Vec<Vec<u8>>> = vec![Vec::new(); 5];
         let mut off = 0usize;
-        for i in 0..4 {
+        for tile in tiles.iter_mut().take(4) {
             let bytes = l0_texels as usize * 4;
             for f in 0..VIEW_COUNT {
-                tiles[i].push(
-                    rb[off + f as usize * res as usize * res as usize * 4
-                        ..off + (f + 1) as usize * res as usize * res as usize * 4]
+                tile.push(
+                    rb[off + f * res as usize * res as usize * 4
+                        ..off + (f + 1) * res as usize * res as usize * 4]
                         .to_vec(),
                 );
             }

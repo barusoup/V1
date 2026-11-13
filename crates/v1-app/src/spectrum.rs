@@ -196,7 +196,10 @@ mod tests {
             // window's main lobe, so a low tone spreads over its neighbours.
             let ratio = HIGH_HZ / LOW_HZ;
             let expected = ((hz / LOW_HZ).ln() / ratio.ln() * BANDS as f32).floor() as usize;
-            assert!(loudest.abs_diff(expected) <= 1, "{hz} Hz lit band {loudest}, not {expected}");
+            assert!(
+                loudest.abs_diff(expected) <= 1,
+                "{hz} Hz lit band {loudest}, not {expected}"
+            );
             assert!(s.levels()[loudest] > 0.4, "{hz} Hz: {:?}", s.levels());
             // Far bands stay dark.
             let far = if loudest > BANDS / 2 { 0 } else { BANDS - 1 };

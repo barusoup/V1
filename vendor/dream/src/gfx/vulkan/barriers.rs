@@ -66,9 +66,11 @@ pub unsafe fn image_barrier_mips(
 /// `cmd` must be recording, `image` must be alive and on `device`, and the
 /// caller must order the barrier correctly around the accesses named by
 /// `src_stage`/`dst_stage`/`src_access`/`dst_access`.
-#[allow(clippy::too_many_arguments)]
 /// Image barrier across every mip level and array layer.
 #[allow(clippy::too_many_arguments)]
+/// # Safety
+/// `cmd` must be recording, `image` must be alive and on `device`, and the caller must order the
+/// barrier correctly around the accesses named by `src_stage`/`dst_stage`/`src_access`/`dst_access`.
 pub unsafe fn image_barrier_full(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
@@ -113,6 +115,9 @@ pub unsafe fn image_barrier_full(
 
 /// Whole-buffer memory barrier.
 #[allow(clippy::too_many_arguments)]
+/// # Safety
+/// `cmd` must be recording, `buffer` must be alive and on `device`, and the caller must order the
+/// barrier correctly around the accesses named by `src_stage`/`dst_stage`/`src_access`/`dst_access`.
 pub unsafe fn buffer_barrier(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
@@ -143,6 +148,10 @@ pub unsafe fn buffer_barrier(
     }
 }
 
+/// # Safety
+/// `cmd` must be recording, `image` must be alive and on `device`, and the caller must order the
+/// barrier correctly around the accesses named by `src_stage`/`dst_stage`/`src_access`/`dst_access`.
+#[allow(clippy::too_many_arguments)] // Keep the established rendering API.
 pub unsafe fn image_barrier(
     device: &ash::Device,
     cmd: vk::CommandBuffer,

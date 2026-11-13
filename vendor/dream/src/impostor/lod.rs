@@ -445,11 +445,12 @@ mod tests {
             let previous = choice;
             choice = p.select(1.0, distance, previous);
             stats.record(previous, choice);
-            if let LodChoice::Crossfade { t, .. } = choice {
-                if t > 0.0 && t < 1.0 {
-                    saw_fade = true;
-                    fade_values.push(t);
-                }
+            if let LodChoice::Crossfade { t, .. } = choice
+                && t > 0.0
+                && t < 1.0
+            {
+                saw_fade = true;
+                fade_values.push(t);
             }
         }
         assert_eq!(stats.switches, 1, "one transition: {}", stats.summary());

@@ -215,6 +215,8 @@ pub struct Player {
     audio_unavailable: bool,
     volume: f32,
     muted: bool,
+    /// The five band gains in dB, so a repeated call does not cross threads.
+    eq: [f32; 10],
 }
 
 impl Player {
@@ -257,7 +259,12 @@ impl Player {
             has_audio: true,
             format: String::new(),
         };
-        Self::from_info(&Tools::discover()?, source.as_ref().to_path_buf(), options, info)
+        Self::from_info(
+            &Tools::discover()?,
+            source.as_ref().to_path_buf(),
+            options,
+            info,
+        )
     }
 
     fn from_info(
@@ -301,6 +308,7 @@ impl Player {
             audio_unavailable: false,
             volume,
             muted: false,
+            eq: [0.0; 10],
         };
         player.begin(0, Instant::now());
         if let Some(message) = player.failure.clone() {
@@ -407,6 +415,17 @@ impl Player {
         };
         if let Some(audio) = &self.audio {
             audio.shared().set_volume(self.volume);
+        }
+    }
+
+    /// Set the five-band equalizer, in dB, from 60 Hz to 10 kHz. Flat is `[0.0; 5]`.
+    pub fn set_equalizer(&mut self, gains: [f32; 10]) {
+        if self.eq == gains {
+            return;
+        }
+        self.eq = gains;
+        if let Some(audio) = &self.audio {
+            audio.shared().set_equalizer(gains);
         }
     }
 
@@ -803,10 +822,9 @@ impl Player {
                     // that finished at once.
                     let nothing_decoded = !has_video
                         && session.start_ms == 0
-                        && self
-                            .audio
-                            .as_ref()
-                            .is_some_and(|audio| session.audio.is_some() && audio.shared().played_frames() == 0);
+                        && self.audio.as_ref().is_some_and(|audio| {
+                            session.audio.is_some() && audio.shared().played_frames() == 0
+                        });
                     if nothing_decoded {
                         Next::Fail(stream_failure(session.audio.as_ref(), NO_AUDIO_DECODED))
                     } else {

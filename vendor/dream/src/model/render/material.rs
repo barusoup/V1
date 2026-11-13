@@ -250,13 +250,13 @@ impl PbrMaterialGpu {
                 );
             }
             unsafe { ctx.device().update_descriptor_sets(&writes, &[]) };
-            return Self {
+            Self {
                 ctx: Arc::clone(ctx),
                 _textures: textures,
                 _factors: factor_buffer,
                 pool,
                 set,
-            };
+            }
         }
     }
 }

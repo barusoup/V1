@@ -13,7 +13,7 @@ Lyrics are synced line by line from Boidu (the Better Lyrics API), with
 
 ## Requirements
 
-- Rust 1.85 or newer
+- Stable Rust (validated with Rust 1.96.1; the workspace includes Rust 2024 crates and current dependency versions)
 - **Windows / Linux**: A GPU with Vulkan 1.3
 - **macOS**: Apple Silicon (`arm64`, macOS 13.0+ with Metal). Older Intel Macs are not supported.
 - To run from source: `ffmpeg` and `ffprobe` on `PATH` (e.g. `brew install ffmpeg` on macOS), or set `DREAM_FFMPEG` and `DREAM_FFPROBE`.
@@ -22,7 +22,10 @@ Lyrics are synced line by line from Boidu (the Better Lyrics API), with
 ## Install
 
 On Windows, download `V1-Setup-<version>.exe` from the [Releases](https://github.com/barusoup/V1/releases) page.
-V1 checks for a newer release every time it starts and installs it before the window opens.
+The installer includes FFmpeg and ffprobe. V1 checks for a newer Windows release every time it starts and installs it before the window opens.
+
+On macOS, open the `.dmg` from Releases and drag `V1.app` to Applications. The app bundle includes
+FFmpeg and ffprobe. Automatic updates are currently Windows only.
 
 Only one copy runs at a time. While a self-update replaces the app, launches made before the updated
 copy starts exit silently, so the new instance opens cleanly.
@@ -33,7 +36,8 @@ copy starts exit silently, so the new instance opens cleanly.
 cargo run -p v1-app --release
 ```
 
-To package `V1.app` and a `.dmg` for macOS Apple Silicon (`aarch64-apple-darwin`):
+To package `V1.app` and a `.dmg` for macOS Apple Silicon (`aarch64-apple-darwin`), see the
+[macOS packaging and validation instructions](docs/macos-packaging.md):
 
 ```
 ./installer/build-macos.sh

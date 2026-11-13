@@ -36,10 +36,7 @@ pub use transport::{Auth, InnerTube, TransportConfig};
 /// The two fetches do not depend on each other, so they run together, and they go through the
 /// transport's own connection pool: the first real request then finds a warm connection to the
 /// music host instead of paying for another DNS lookup and TLS handshake.
-pub async fn connect(
-    config: TransportConfig,
-    session: Session,
-) -> Result<(InnerTube, WebConfig)> {
+pub async fn connect(config: TransportConfig, session: Session) -> Result<(InnerTube, WebConfig)> {
     let shared = SharedSession::new(session);
     let mut tube = InnerTube::new(config, shared.clone())?;
 

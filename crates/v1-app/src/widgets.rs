@@ -39,6 +39,31 @@ pub struct Pointer {
 pub enum SliderId {
     Seek,
     Volume,
+    /// Settings: the background's frost strength, and the equalizer's ten bands.
+    Blur,
+    ThemeBlur,
+    Transparency,
+    ThemeTransparency,
+    Eq(usize),
+    /// Theme builder's in-app colour picker (saturation/value square and hue bar).
+    ColorSv,
+    ColorHue,
+}
+
+impl SliderId {
+    fn anim_key(self) -> u32 {
+        match self {
+            SliderId::Seek => 0,
+            SliderId::Volume => 1,
+            SliderId::Blur => 2,
+            SliderId::ColorSv => 3,
+            SliderId::ColorHue => 4,
+            SliderId::ThemeBlur => 5,
+            SliderId::Transparency => 6,
+            SliderId::ThemeTransparency => 7,
+            SliderId::Eq(i) => 10 + i as u32,
+        }
+    }
 }
 
 /// A queue row being dragged by its handle. `from` is the row's place in the queue when the drag
@@ -109,7 +134,11 @@ impl Cx<'_> {
 
     /// Whether the pointer is over `rect` and nothing covers it.
     pub fn over(&self, rect: Rect) -> bool {
-        let covered = self.covering && self.covers.iter().any(|cover| cover.contains(self.pointer.pos));
+        let covered = self.covering
+            && self
+                .covers
+                .iter()
+                .any(|cover| cover.contains(self.pointer.pos));
         let over = !self.blocked && !covered && rect.contains(self.pointer.pos);
         if over {
             self.touched.set(true);
@@ -194,12 +223,38 @@ impl Cx<'_> {
         self.ui.label_wrapped(rect, text, style);
     }
 
+    /// Like [`Self::text_block`], but lays out `text` at `size` and draws it scaled by `zoom`
+    /// centred in `rect` so animating size does not re-wrap or re-rasterize glyphs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_block_scaled(
+        &mut self,
+        rect: Rect,
+        text: &str,
+        size: f32,
+        color: Color,
+        leading: f32,
+        align: Align,
+        zoom: f32,
+    ) {
+        if color.a == 0 || text.is_empty() {
+            return;
+        }
+        let style = LabelStyle::new(self.font)
+            .size(size)
+            .color(color)
+            .align(align)
+            .line_height(leading);
+        self.ui.label_wrapped_scaled(rect, text, style, zoom);
+    }
+
     /// The height [`Self::text_block`] takes for `text` wrapped to `width`.
     pub fn text_block_height(&mut self, width: f32, text: &str, size: f32, leading: f32) -> f32 {
         if text.is_empty() {
             return 0.0;
         }
-        self.ui.measure_wrapped(text, self.font, size, width, leading).1
+        self.ui
+            .measure_wrapped(text, self.font, size, width, leading)
+            .1
     }
 
     pub fn fit(&mut self, text: &str, size: f32, max_w: f32) -> String {
@@ -243,7 +298,14 @@ impl Cx<'_> {
     /// [`Self::icon`] drawn `factor` times its `size`. The texture is chosen by `size` alone, so an
     /// icon that scales every frame (a hover, a pop) is never re-rasterized or swapped for a
     /// neighbouring size; the change is only in how big the texture is drawn.
-    pub fn icon_scaled(&mut self, icon: Icon, center: (f32, f32), size: f32, factor: f32, color: Color) {
+    pub fn icon_scaled(
+        &mut self,
+        icon: Icon,
+        center: (f32, f32),
+        size: f32,
+        factor: f32,
+        color: Color,
+    ) {
         if color.a == 0 || size * factor <= 0.5 {
             return;
         }
@@ -260,7 +322,9 @@ impl Cx<'_> {
         let extent = drawn / dev;
         let x = (center.0 * dev - drawn * 0.5).round() / dev;
         let y = (center.1 * dev - drawn * 0.5).round() / dev;
-        self.ui.draw_list_mut().image(Rect::new(x, y, extent, extent), texture, color);
+        self.ui
+            .draw_list_mut()
+            .image(Rect::new(x, y, extent, extent), texture, color);
     }
 
     /// The backgroundless V1 mark centred on `center`, scaled to fit inside `max` (logical pixels)
@@ -269,7 +333,9 @@ impl Cx<'_> {
         if color.a == 0 {
             return;
         }
-        let Some(mark) = self.gpu.wordmark.as_ref() else { return };
+        let Some(mark) = self.gpu.wordmark.as_ref() else {
+            return;
+        };
         let scale = (max.0 / mark.width as f32).min(max.1 / mark.height as f32);
         // Snap the size and position to whole device pixels, so the texture is sampled 1:1 with
         // no half-pixel offset blurring its edges.
@@ -278,7 +344,9 @@ impl Cx<'_> {
         let h = (mark.height as f32 * scale * dev).round() / dev;
         let x = ((center.0 * dev - w * dev * 0.5).round()) / dev;
         let y = ((center.1 * dev - h * dev * 0.5).round()) / dev;
-        self.ui.draw_list_mut().image(Rect::new(x, y, w, h), &mark.texture, color);
+        self.ui
+            .draw_list_mut()
+            .image(Rect::new(x, y, w, h), &mark.texture, color);
     }
 
     /// One of several icons for a state. The current one is drawn; the rest are not. There is no
@@ -302,7 +370,11 @@ impl Cx<'_> {
         if hit.album_id.is_some() {
             return;
         }
-        if !self.wanted_meta.iter().any(|seen| seen.video_id == hit.video_id) {
+        if !self
+            .wanted_meta
+            .iter()
+            .any(|seen| seen.video_id == hit.video_id)
+        {
             self.wanted_meta.push(hit.clone());
         }
     }
@@ -319,9 +391,11 @@ impl Cx<'_> {
         });
         let shown = {
             let key = url.map_or(0, hash);
-            self.anims.toggle("cover", key, texture.is_some(), rate::QUICK)
+            self.anims
+                .toggle("cover", key, texture.is_some(), rate::QUICK)
         };
-        self.draw().round_rect(rect, radius, fade(theme::RAISED, alpha));
+        self.draw()
+            .round_rect(rect, radius, fade(theme::raised(), alpha));
         if let Some(texture) = texture {
             self.draw()
                 .image_rounded(rect, &texture, fade(Color::WHITE, alpha * shown), radius);
@@ -338,7 +412,7 @@ impl Cx<'_> {
         enabled: bool,
         opacity: f32,
     ) -> bool {
-        let index = id as u32;
+        let index = id.anim_key();
         let hit = Rect::new(rect.x - 8.0, rect.y - 6.0, rect.w + 16.0, rect.h + 12.0);
         let inside = enabled && self.over(hit);
         if inside {
@@ -377,14 +451,14 @@ impl Cx<'_> {
         let top = self.snap(rect.y + rect.h * 0.5 - height * 0.5);
         let fill_w = rect.w * t;
         let fill = fade(
-            theme::mix(Color::rgb(0xb4, 0xb4, 0xbc), theme::FG, glow),
+            theme::mix(Color::rgb(0xb4, 0xb4, 0xbc), theme::fg(), glow),
             (0.4 + 0.6 * live) * opacity,
         );
         let draw = self.draw();
         draw.round_rect(
             Rect::new(rect.x, top, rect.w, height),
             height * 0.5,
-            fade(theme::TRACK, (0.55 + 0.45 * live) * opacity),
+            fade(theme::track(), (0.55 + 0.45 * live) * opacity),
         );
         if fill_w > 0.01 {
             // A fill narrower than the track's cap shrinks its end radius rather than growing to it.
@@ -394,6 +468,76 @@ impl Cx<'_> {
                 fill,
             );
         }
+        changed
+    }
+
+    /// A vertical bipolar fader (0.0 at bottom, 0.5 at centre 0 dB, 1.0 at top) for the equalizer.
+    pub fn vertical_slider(
+        &mut self,
+        id: SliderId,
+        rect: Rect,
+        value: &mut f32,
+        enabled: bool,
+    ) -> bool {
+        let index = id.anim_key();
+        let hit = Rect::new(rect.x - 8.0, rect.y - 6.0, rect.w + 16.0, rect.h + 12.0);
+        let inside = enabled && self.over(hit);
+        if inside {
+            self.hand = true;
+        }
+
+        let mut changed = false;
+        if enabled {
+            if self.pointer.pressed && inside {
+                self.drag = Some(id);
+            }
+            if self.drag == Some(id) {
+                if self.pointer.down {
+                    let t = (1.0 - (self.pointer.pos.1 - rect.y) / rect.h.max(1.0)).clamp(0.0, 1.0);
+                    if (*value - t).abs() > 1e-4 {
+                        *value = t;
+                        changed = true;
+                    }
+                } else {
+                    self.drag = None;
+                }
+            }
+        } else if self.drag == Some(id) {
+            self.drag = None;
+        }
+
+        let active = enabled && (inside || self.drag == Some(id));
+        let glow = self.anims.toggle("slider", index, active, rate::QUICK);
+        let t = value.clamp(0.0, 1.0);
+
+        let track_w = 4.0;
+        let left = self.snap(rect.x + rect.w * 0.5 - track_w * 0.5);
+        let mid_y = rect.y + rect.h * 0.5;
+        let thumb_y = rect.y + (1.0 - t) * rect.h;
+
+        let draw = self.draw();
+        draw.round_rect(
+            Rect::new(left, rect.y, track_w, rect.h),
+            track_w * 0.5,
+            theme::track(),
+        );
+        // Bipolar fill from centre (0 dB) toward the thumb.
+        let fill_top = thumb_y.min(mid_y);
+        let fill_h = (thumb_y - mid_y).abs();
+        if fill_h > 0.5 {
+            draw.round_rect(
+                Rect::new(left, fill_top, track_w, fill_h),
+                (track_w * 0.5).min(fill_h * 0.5),
+                theme::mix(theme::accent(), theme::fg(), glow * 0.25),
+            );
+        }
+        // Crisp circular thumb.
+        let r = 6.0 + glow * 1.0;
+        draw.round_rect(
+            Rect::new(left + track_w * 0.5 - r, thumb_y - r, r * 2.0, r * 2.0),
+            r,
+            theme::mix(theme::fg(), theme::accent(), 0.35 + 0.35 * glow),
+        );
         changed
     }
 }

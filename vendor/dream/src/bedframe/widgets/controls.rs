@@ -216,6 +216,7 @@ impl Ui {
 
     /// Byte offset nearest to the point `(x, y)` inside text wrapped to
     /// `width` — click-to-place for a wrapped editor.
+    #[allow(clippy::too_many_arguments)] // Keep the established rendering API.
     pub fn wrapped_byte_at(
         &mut self,
         text: &str,
@@ -294,6 +295,46 @@ impl Ui {
         };
         let layout = self.cached_layout(text, style.font, style.size * scale, options);
         self.draw_label(rect, &layout, scale, style);
+    }
+
+    /// Like [`Self::label_wrapped`], but lays out `text` at `style.size` (wrapping to `rect.w`)
+    /// and draws the resulting layout scaled by `zoom` centred in `rect`. Animating `zoom`
+    /// keeps glyph shapes, line breaks, and relative positions locked without re-rasterizing.
+    pub fn label_wrapped_scaled(&mut self, rect: Rect, text: &str, style: LabelStyle, zoom: f32) {
+        if rect.w <= 0.0 || rect.h <= 0.0 || zoom <= 0.0 {
+            return;
+        }
+        let screen = Rect::new(0.0, 0.0, self.screen.0, self.screen.1);
+        if screen.intersect(rect).is_none()
+            || self
+                .draw
+                .clip_rect()
+                .is_some_and(|clip| clip.intersect(rect).is_none())
+        {
+            return;
+        }
+        let scale = self.scale;
+        let options = LayoutOptions {
+            align: style.align,
+            line_height: style.line_height,
+            wrap_width: Some(rect.w * scale),
+            ..Default::default()
+        };
+        let layout = self.cached_layout(text, style.font, style.size * scale, options);
+        let origin_x = match style.align {
+            Align::Left => rect.x,
+            Align::Center => rect.center().0,
+            Align::Right => rect.max().0,
+        };
+        let scaled_h = (layout.height / scale) * zoom;
+        let origin_y = rect.center().1 - scaled_h * 0.5;
+        self.draw.text_layout_scaled(
+            (origin_x, origin_y),
+            &layout,
+            scale / zoom,
+            style.color,
+            &self.cache,
+        );
     }
 
     /// `label` truncated to one line with an ellipsis: the longest whole
@@ -972,6 +1013,7 @@ impl Ui {
     /// apart from `rect` so a scale animation reuses one atlas entry. `stroke`
     /// is the line weight on the grid (Lucide's is 2). With
     /// `fill`, closed subpaths are filled as well as stroked.
+    #[allow(clippy::too_many_arguments)] // Keep the established rendering API.
     pub fn grid_icon(
         &mut self,
         name: &str,

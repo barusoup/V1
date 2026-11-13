@@ -35,15 +35,16 @@ use yt_lyrics::{active_line, Body, Lookup, Query, Source, TimedLine};
 
 use crate::anim::{rate, Anims};
 use crate::backend::{Backend, Command, Event, Ready};
+use crate::background::Background;
 use crate::gpu::{CoverImage, Gpu};
 use crate::icons::{self, Icon};
 use crate::library::{Effects, Library};
 use crate::playlist::Playlist;
-use crate::prefs::{Prefs, DEFAULT_VOLUME};
+use crate::prefs::{Prefs, ThemeRec, VisualizerColorRec, DEFAULT_VOLUME, EQ_RANGE_DB};
 use crate::spectrum::{self, Spectrum};
 use crate::theme::{self, ease_out, fade, mix};
-use crate::widgets::{hash, Cx, QueueDrag, SliderId};
 pub use crate::widgets::Pointer;
+use crate::widgets::{hash, Cx, QueueDrag, SliderId};
 
 type P = (f32, f32);
 
@@ -53,6 +54,8 @@ type P = (f32, f32);
 pub enum Tab {
     Library,
     Queue,
+    /// Reached from the button at the bottom of the sidebar, not from the tab list.
+    Settings,
 }
 
 impl Tab {
@@ -62,6 +65,7 @@ impl Tab {
         match self {
             Tab::Library => "Collection",
             Tab::Queue => "Queue",
+            Tab::Settings => "Settings",
         }
     }
 
@@ -69,6 +73,7 @@ impl Tab {
         match self {
             Tab::Library => Icon::Book,
             Tab::Queue => Icon::Menu,
+            Tab::Settings => Icon::Settings,
         }
     }
 }
@@ -82,7 +87,11 @@ pub enum CollectionTab {
 }
 
 impl CollectionTab {
-    const ALL: [CollectionTab; 3] = [CollectionTab::Songs, CollectionTab::Albums, CollectionTab::Artists];
+    const ALL: [CollectionTab; 3] = [
+        CollectionTab::Songs,
+        CollectionTab::Albums,
+        CollectionTab::Artists,
+    ];
 
     fn icon(self) -> Icon {
         match self {
@@ -244,6 +253,8 @@ struct LyricsFollow {
     scrolled_at: Option<Instant>,
     /// Whether the page has been placed yet. The first placement is instant, not a glide.
     placed: bool,
+    /// The last active lyric index, so a new lyric can re-sync after a short scroll pause.
+    last_active: Option<usize>,
 }
 
 /// Back restarts the current song when it is further in than this, the way most players do.
@@ -307,7 +318,12 @@ const BADGE_QUIET_HOLD: Duration = Duration::from_millis(800);
 /// It comes on the first time the output is clearly audible and goes off only after a sustained
 /// quiet spell (below the lower threshold for the hold), so the badge cannot be blinked by the
 /// meter's release, a volume drag, or the gaps between songs in an album.
-fn advance_badge(audible: bool, quiet_since: &mut Option<Instant>, levels: [f32; 3], now: Instant) -> bool {
+fn advance_badge(
+    audible: bool,
+    quiet_since: &mut Option<Instant>,
+    levels: [f32; 3],
+    now: Instant,
+) -> bool {
     if levels.iter().any(|level| *level > BADGE_ON_LEVEL) {
         *quiet_since = None;
         return true;
@@ -369,13 +385,45 @@ enum Action {
     /// Switch to another kind of result (songs, artists, albums) under the search's top result.
     ResultsTab(ResultsTab),
     /// Move a queue entry to another place in the queue.
-    MoveQueued { from: usize, to: usize },
+    MoveQueued {
+        from: usize,
+        to: usize,
+    },
     /// Take a song out of the queue.
     RemoveQueued(usize),
     /// Add a song to the end of the queue.
     Enqueue(yt_client::SongHit),
     /// Open the menu for a track, at the pointer.
     OpenMenu(TrackMenu),
+    /// Switch to a theme by name, or to Default with `None`.
+    SetTheme(Option<String>),
+    /// Pin or unpin one of the listener's themes.
+    FavoriteTheme(String),
+    /// Delete one of the listener's themes.
+    DeleteTheme(String),
+    /// Load a saved theme into the theme builder for editing.
+    EditTheme(String),
+    /// Save or update a theme from the colours chosen on the Settings page.
+    CreateTheme,
+    /// Open the picture picker for the global background.
+    PickBackground,
+    RemoveBackground,
+    /// Toggle whether the global background overrides per-theme backgrounds.
+    ToggleGlobalBackground(bool),
+    /// Open the picture picker for the theme currently in the builder.
+    PickThemeBackground,
+    /// How soft the background is, 0 to 1.
+    BlurStrength(f32),
+    ThemeBlurStrength(f32),
+    BackgroundTransparency(f32),
+    ThemeBackgroundTransparency(f32),
+    /// Open or close the final confirmation about deleting downloads.
+    ConfirmDialog(Option<ConfirmDialog>),
+    /// Turn local downloads on or off. Off deletes what is already here.
+    SetDownloads(bool),
+    /// The equalizer's ten band gains, in dB.
+    SetEq([f32; 10]),
+    ResetEq,
 }
 
 /// Something the window itself has to do, asked for by the caption buttons or by a press on the
@@ -384,6 +432,7 @@ enum Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowRequest {
     Minimize,
+    ToggleFullscreen,
     Close,
     /// Start moving the window: the press was on empty space in the top strip.
     Drag,
@@ -423,6 +472,8 @@ pub struct State {
     pub gpu: Gpu,
     /// Window actions asked for since the host last took them (see [`WindowRequest`]).
     pub window_requests: Vec<WindowRequest>,
+    /// Current native fullscreen state, supplied by the host before building a frame.
+    pub fullscreen: bool,
 
     tab: Tab,
     /// Which list the Collection page is showing.
@@ -442,6 +493,15 @@ pub struct State {
     /// Players are opened on loading threads and reported back here; see [`State::start`].
     opened_tx: Sender<Opened>,
     opened_rx: Receiver<Opened>,
+    background_prep_pending: std::sync::Arc<(
+        std::sync::Mutex<Option<BackgroundPrepJob>>,
+        std::sync::Condvar,
+    )>,
+    background_prep_rx: Receiver<BackgroundPrepResult>,
+    background_prep_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    background_prep_id: u64,
+    background_editor_generation: u64,
+    background_prep_busy: bool,
     drag: Option<SliderId>,
     /// The queue row being dragged by its handle, if any.
     queue_drag: Option<QueueDrag>,
@@ -480,6 +540,7 @@ pub struct State {
     volume_open: bool,
     /// The lyric page is open. It is a page of its own: it takes the place of the tab's content.
     lyrics_open: bool,
+    theater: bool,
     lyrics_follow: LyricsFollow,
     /// The pages a link opened. The one on top takes the place of the results or the tab.
     pages: Pages,
@@ -519,12 +580,67 @@ pub struct State {
     demo_track: Option<TrackView>,
     /// The track menu, while it is open (see [`TrackMenu`]).
     menu: Option<TrackMenu>,
+    /// The themes the listener made, mirroring what is saved.
+    themes: Vec<ThemeRec>,
+    data_dir: std::path::PathBuf,
+    /// What the Settings page is holding that does not outlive the run.
+    settings: Settings,
+    /// The custom background, decoded and softened off the UI thread.
+    background: Background,
+    /// Error from stripping audio / preparing a chosen background video.
+    background_prep_error: Option<String>,
+    /// The equalizer's ten band gains, in dB.
+    eq: [f32; 10],
 }
 
 /// A player that finished opening on a loading thread, with the track it was opened for.
 struct Opened {
     ready: Ready,
     player: Result<dream_media::Player, String>,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        let (slot, ready) = &*self.background_prep_pending;
+        let mut pending = slot.lock().unwrap_or_else(|error| error.into_inner());
+        self.background_prep_stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        *pending = None;
+        ready.notify_one();
+    }
+}
+
+#[derive(Clone)]
+enum BackgroundPrepTarget {
+    Global,
+    Theme(Option<String>, u64),
+}
+
+fn background_theme_target_is_current(
+    creator_open: bool,
+    editing_theme: &Option<String>,
+    editor_generation: u64,
+    target_theme: &Option<String>,
+    target_generation: u64,
+) -> bool {
+    creator_open && editing_theme == target_theme && editor_generation == target_generation
+}
+
+fn background_prep_failure_updates_global_error(target: &BackgroundPrepTarget) -> bool {
+    matches!(target, BackgroundPrepTarget::Global)
+}
+
+struct BackgroundPrepJob {
+    id: u64,
+    source: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
+    target: BackgroundPrepTarget,
+}
+
+struct BackgroundPrepResult {
+    id: u64,
+    target: BackgroundPrepTarget,
+    result: Result<std::path::PathBuf, String>,
 }
 
 /// What the bar needs to know about the current track.
@@ -566,6 +682,145 @@ struct Row<'a> {
     /// Each artist credit and the page it links to, if any.
     artists: Vec<(&'a str, Option<&'a str>)>,
     album_id: Option<&'a str>,
+}
+
+/// Which category tab is open on the Settings page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SettingsTab {
+    #[default]
+    Appearance,
+    Audio,
+    General,
+}
+
+impl SettingsTab {
+    const ALL: [SettingsTab; 3] = [
+        SettingsTab::Appearance,
+        SettingsTab::Audio,
+        SettingsTab::General,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            SettingsTab::Appearance => 0,
+            SettingsTab::Audio => 1,
+            SettingsTab::General => 2,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Appearance => "Appearance",
+            SettingsTab::Audio => "Audio",
+            SettingsTab::General => "General",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            SettingsTab::Appearance => Icon::Image,
+            SettingsTab::Audio => Icon::Volume2,
+            SettingsTab::General => Icon::Settings,
+        }
+    }
+}
+
+/// Which colour slot in the theme builder the in-app picker is currently editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColorSlot {
+    Primary,
+    Secondary,
+    Accent,
+    LyricsFill,
+    LyricsOutline,
+    Visualizer,
+}
+
+impl ColorSlot {
+    fn label(self) -> &'static str {
+        match self {
+            ColorSlot::Primary => "Background",
+            ColorSlot::Secondary => "Text",
+            ColorSlot::Accent => "Accent",
+            ColorSlot::LyricsFill => "Lyrics Text",
+            ColorSlot::LyricsOutline => "Lyrics Outline",
+            ColorSlot::Visualizer => "Visualizer",
+        }
+    }
+}
+
+/// Live state for the floating in-app colour picker popup.
+struct ColorPickerState {
+    slot: ColorSlot,
+    anchor: Rect,
+    hsv: (f32, f32, f32),
+    hex: String,
+    last_color: Color,
+    /// Prevents the click that opened the popup from immediately closing it on the same frame.
+    just_opened: bool,
+}
+
+/// The Settings page's working state: the theme being made, and whether the download confirmation
+/// is up. Saved choices live in [`Prefs`]; this is only what has not been committed yet.
+struct Settings {
+    /// Active category tab on the Settings page.
+    tab: SettingsTab,
+    /// Filter query for the theme manager.
+    theme_query: String,
+    /// Whether the full theme list is expanded when there are many themes.
+    show_all_themes: bool,
+    /// Whether the inline "New theme" / "Edit theme" builder is expanded.
+    creator_open: bool,
+    /// Name of the saved theme currently being edited, or `None` when creating a new theme.
+    editing_theme: Option<String>,
+    /// The name for the theme being made.
+    name: String,
+    primary: Color,
+    secondary: Color,
+    accent: Color,
+    lyrics_fill: Color,
+    lyrics_outline: Color,
+    visualizer_mode: VisualizerColorRec,
+    visualizer_color: Color,
+    theme_background: Option<String>,
+    theme_background_blur: f32,
+    theme_background_transparency: f32,
+    /// Floating in-app colour picker popup, when open.
+    color_picker: Option<ColorPickerState>,
+    /// Which confirmation dialog is showing, if any.
+    confirm_dialog: Option<ConfirmDialog>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConfirmDialog {
+    Downloads,
+    DeleteTheme(String),
+    RemoveBackground,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            tab: SettingsTab::Appearance,
+            theme_query: String::new(),
+            show_all_themes: false,
+            creator_open: false,
+            editing_theme: None,
+            name: String::new(),
+            primary: Color::rgb(0x00, 0x00, 0x00),
+            secondary: Color::rgb(0xec, 0xec, 0xec),
+            accent: Color::rgb(0xec, 0xec, 0xec),
+            lyrics_fill: Color::rgb(0xec, 0xec, 0xec),
+            lyrics_outline: Color::rgb(0x00, 0x00, 0x00),
+            visualizer_mode: VisualizerColorRec::AlbumArt,
+            visualizer_color: Color::rgb(0xec, 0xec, 0xec),
+            theme_background: None,
+            theme_background_blur: crate::prefs::DEFAULT_BLUR,
+            theme_background_transparency: crate::prefs::DEFAULT_TRANSPARENCY,
+            color_picker: None,
+            confirm_dialog: None,
+        }
+    }
 }
 
 /// The menu open over a track, from a right-click on its row. It keeps the song itself, so it still
@@ -651,8 +906,55 @@ impl State {
         let library = Library::in_memory();
         let prefs = Prefs::open(&data_dir);
         let volume = prefs.volume();
-        let backend = Backend::start(data_dir);
+        // The saved theme goes on before the first frame, so the window never flashes the default.
+        let themes = prefs.themes().to_vec();
+        theme::set_palette(theme_palette(prefs.active_theme(), &themes));
+        let background = Background::new(
+            effective_background_path(&prefs, &themes),
+            prefs.background_blur(),
+        );
+        let eq = prefs.eq();
+        let backend = Backend::start(data_dir.clone());
         let (opened_tx, opened_rx) = mpsc::channel();
+        let background_prep_pending = std::sync::Arc::new((
+            std::sync::Mutex::new(None::<BackgroundPrepJob>),
+            std::sync::Condvar::new(),
+        ));
+        let worker_pending = std::sync::Arc::clone(&background_prep_pending);
+        let background_prep_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = std::sync::Arc::clone(&background_prep_stop);
+        let (background_prep_results, background_prep_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("v1-background-prep".to_owned())
+            .spawn(move || loop {
+                let job = {
+                    let (slot, ready) = &*worker_pending;
+                    let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while slot.is_none() && !worker_stop.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        slot = ready
+                            .wait(slot)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    if worker_stop.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    slot.take().expect("job became available")
+                };
+                let result =
+                    crate::background::prepare_background_media(&job.source, &job.data_dir);
+                if background_prep_results
+                    .send(BackgroundPrepResult {
+                        id: job.id,
+                        target: job.target,
+                        result,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            })
+            .expect("background preparation worker");
         let now = Instant::now();
         State {
             backend,
@@ -676,6 +978,7 @@ impl State {
             hand: false,
             gpu: Gpu::default(),
             window_requests: Vec::new(),
+            fullscreen: false,
             tab: Tab::Library,
             collection_tab: CollectionTab::Songs,
             results_tab: ResultsTab::Songs,
@@ -686,6 +989,12 @@ impl State {
             autoplay: false,
             opened_tx,
             opened_rx,
+            background_prep_pending,
+            background_prep_rx,
+            background_prep_stop,
+            background_prep_id: 0,
+            background_editor_generation: 0,
+            background_prep_busy: false,
             drag: None,
             queue_drag: None,
             results_query: String::new(),
@@ -708,6 +1017,7 @@ impl State {
             bar_grab: false,
             volume_open: false,
             lyrics_open: false,
+            theater: false,
             lyrics_follow: LyricsFollow::default(),
             pages: Pages::default(),
             artists: HashMap::new(),
@@ -730,6 +1040,12 @@ impl State {
             spectrum_live: false,
             demo_track: None,
             menu: None,
+            themes,
+            data_dir,
+            settings: Settings::default(),
+            background,
+            background_prep_error: None,
+            eq,
         }
     }
 
@@ -737,15 +1053,62 @@ impl State {
     /// the first frame, so the backend's `Ready` (which resumes unfinished downloads) finds it.
     pub fn attach_library(&mut self, library: Library) {
         self.library = library;
+        self.library.set_downloading(self.prefs.downloads());
     }
 
-    /// Close the track menu, if one is open. Escape does this.
+    /// Close the track menu, if one is open. Escape does this, along with the download
+    /// confirmation, which is the other thing that sits over the page.
     pub fn close_menu(&mut self) {
         self.menu = None;
+        self.settings.confirm_dialog = None;
+        self.settings.color_picker = None;
     }
 
     /// Drain backend events. Called once per frame, before the build.
     pub fn pump(&mut self) {
+        while let Ok(done) = self.background_prep_rx.try_recv() {
+            if done.id != self.background_prep_id {
+                continue;
+            }
+            self.background_prep_busy = false;
+            match done.result {
+                Ok(path) => match done.target {
+                    BackgroundPrepTarget::Global => {
+                        self.background_prep_error = None;
+                        self.prefs.set_background(Some(&path));
+                        self.prefs.set_background_enabled(true);
+                        sync_background(self);
+                    }
+                    BackgroundPrepTarget::Theme(editing, session) => {
+                        if background_theme_target_is_current(
+                            self.settings.creator_open,
+                            &self.settings.editing_theme,
+                            self.background_editor_generation,
+                            &editing,
+                            session,
+                        ) {
+                            self.settings.theme_background =
+                                Some(path.to_string_lossy().into_owned());
+                        }
+                    }
+                },
+                Err(error) => {
+                    if background_prep_failure_updates_global_error(&done.target) {
+                        self.background_prep_error = Some(error);
+                    }
+                }
+            }
+        }
+        // A softened background that finished on its thread is handed to the GPU for the next frame.
+        if let Some(image) = self.background.poll() {
+            self.gpu.incoming_background = Some(image);
+        }
+        // A picture that could not be read must not leave the previous one on screen under its
+        // name: the Settings page is showing why it failed.
+        if self.background.error.is_some() && !self.background.loading() {
+            self.gpu.clear_background();
+        }
+        self.background.refresh();
         if self.artists.len() > PAGE_CACHE || self.albums.len() > PAGE_CACHE {
             self.trim_pages();
         }
@@ -816,9 +1179,19 @@ impl State {
                         self.status = message;
                     }
                 }
-                Event::Cover { url, width, height, rgba } => {
+                Event::Cover {
+                    url,
+                    width,
+                    height,
+                    rgba,
+                } => {
                     self.cover_inflight.remove(&url);
-                    self.gpu.incoming.push(CoverImage { url, width, height, rgba });
+                    self.gpu.queue_cover(CoverImage {
+                        url,
+                        width,
+                        height,
+                        rgba,
+                    });
                 }
                 Event::CoverFailed(url) => {
                     // Forgotten as requested, but not for a while: the next frame that wants it
@@ -852,8 +1225,10 @@ impl State {
                     // filled in, and its songs saved, once a full page arrives.
                     if let Ok(page) = &result {
                         self.learn(&page.tracks);
-                        let stored_empty =
-                            self.library.album_page(&id).is_some_and(|p| p.tracks.is_empty());
+                        let stored_empty = self
+                            .library
+                            .album_page(&id)
+                            .is_some_and(|p| p.tracks.is_empty());
                         if stored_empty && !page.tracks.is_empty() {
                             let effects = self.library.save_album(page, Instant::now());
                             self.run_effects(effects);
@@ -878,7 +1253,8 @@ impl State {
                         self.length_requested.remove(&video_id);
                         let tries = self.length_failures.get(&video_id).map_or(0, |(n, _)| *n) + 1;
                         let wait = Duration::from_secs(5u64 << tries.min(6));
-                        self.length_failures.insert(video_id, (tries, Instant::now() + wait));
+                        self.length_failures
+                            .insert(video_id, (tries, Instant::now() + wait));
                     }
                 },
                 Event::SongMeta { video_id, hit } => {
@@ -894,11 +1270,17 @@ impl State {
                         let tries = self.meta_failures.get(&video_id).map_or(0, |(n, _)| *n) + 1;
                         let wait = (META_FIRST_RETRY * 2u32.saturating_pow(tries.min(5)))
                             .min(META_MAX_RETRY);
-                        self.meta_failures.insert(video_id, (tries, Instant::now() + wait));
+                        self.meta_failures
+                            .insert(video_id, (tries, Instant::now() + wait));
                     }
                 }
-                Event::Downloaded { video_id, loudness_db, duration_secs } => {
-                    self.library.downloaded(&video_id, loudness_db, duration_secs);
+                Event::Downloaded {
+                    video_id,
+                    loudness_db,
+                    duration_secs,
+                } => {
+                    self.library
+                        .downloaded(&video_id, loudness_db, duration_secs);
                 }
                 // Saving is quiet: a failed download is not announced, only tried again later.
                 Event::DownloadFailed { video_id, message } => {
@@ -918,6 +1300,27 @@ impl State {
         while let Ok(opened) = self.opened_rx.try_recv() {
             self.finish_start(opened);
         }
+    }
+
+    fn cancel_background_prep(&mut self) {
+        self.background_prep_id = self.background_prep_id.wrapping_add(1);
+        self.background_prep_busy = false;
+        let (slot, _) = &*self.background_prep_pending;
+        *slot.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    fn queue_background_prep(&mut self, source: std::path::PathBuf, target: BackgroundPrepTarget) {
+        self.background_prep_id = self.background_prep_id.wrapping_add(1);
+        self.background_prep_busy = true;
+        let job = BackgroundPrepJob {
+            id: self.background_prep_id,
+            source,
+            data_dir: self.data_dir.clone(),
+            target,
+        };
+        let (slot, ready) = &*self.background_prep_pending;
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(job);
+        ready.notify_one();
     }
 
     /// Resolve the next few songs in the queue, one request each, so skipping to them starts
@@ -1075,7 +1478,9 @@ impl State {
             match track.player.status() {
                 dream_media::Status::Ended => finished = true,
                 dream_media::Status::Failed(message) => failed = Some(message),
-                dream_media::Status::Playing | dream_media::Status::Paused | dream_media::Status::Loading => {}
+                dream_media::Status::Playing
+                | dream_media::Status::Paused
+                | dream_media::Status::Loading => {}
             }
             // The fade: the gain moves toward what was asked for, and a pause lands only once it is
             // silent. The bar shows the request at once, not the player's lagging state.
@@ -1088,7 +1493,11 @@ impl State {
                 };
                 self.fading = true;
             }
-            track.player.set_volume(self.volume * track.gain * track.norm);
+            track.player.set_volume(
+                self.volume_before_mute.unwrap_or(self.volume) * track.gain * track.norm,
+            );
+            track.player.set_muted(self.volume_before_mute.is_some());
+            track.player.set_equalizer(self.eq);
             if !track.want_playing && track.gain <= 0.0 && !track.held {
                 track.player.pause(now);
                 track.held = true;
@@ -1099,12 +1508,7 @@ impl State {
             // meters follow with their own ballistics; a plain threshold would cross both ways
             // between frames and blink the badge.
             let levels = track.player.levels();
-            track.audible = advance_badge(
-                track.audible,
-                &mut track.quiet_since,
-                levels,
-                now,
-            );
+            track.audible = advance_badge(track.audible, &mut track.quiet_since, levels, now);
         }
         if let Some(message) = failed {
             self.status = message;
@@ -1154,14 +1558,16 @@ impl State {
                 playing: !track.paused,
             });
         }
-        self.demo_track.as_ref().map(|track| crate::media::MediaInfo {
-            title: &track.title,
-            artist: &track.artist,
-            album: track.hit.as_ref().and_then(|hit| hit.album.as_deref()),
-            position: track.position as f64,
-            duration: track.duration as f64,
-            playing: !track.paused,
-        })
+        self.demo_track
+            .as_ref()
+            .map(|track| crate::media::MediaInfo {
+                title: &track.title,
+                artist: &track.artist,
+                album: track.hit.as_ref().and_then(|hit| hit.album.as_deref()),
+                position: track.position as f64,
+                duration: track.duration as f64,
+                playing: !track.paused,
+            })
     }
 
     /// Apply a transport button from the OS (earbuds, media keys, or the Windows flyout).
@@ -1203,10 +1609,14 @@ impl State {
     /// Make the current play/pause request take effect now, without waiting for fade frames.
     fn settle_transport(&mut self) {
         let now = Instant::now();
-        let Some(track) = self.now.as_mut() else { return };
+        let Some(track) = self.now.as_mut() else {
+            return;
+        };
         let goal = if track.want_playing { 1.0 } else { 0.0 };
         track.gain = goal;
-        track.player.set_volume(self.volume * goal * track.norm);
+        track
+            .player
+            .set_volume(self.volume_before_mute.unwrap_or(self.volume) * goal * track.norm);
         if track.want_playing {
             track.held = false;
         } else if !track.held {
@@ -1242,12 +1652,12 @@ impl State {
 
     /// True while the UI is waiting on the backend, so the host keeps polling for the reply.
     pub fn busy(&self) -> bool {
-        !self.booted || self.searching || self.playlist.is_loading()
+        !self.booted || self.searching || self.playlist.is_loading() || self.background_prep_busy
     }
 
     /// True while something on screen is still moving, so the host keeps presenting frames.
     pub fn animating(&self) -> bool {
-        self.animating
+        self.animating || self.background.is_animated()
     }
 
     /// When the lyric page will take its place back after a reader's scroll, so the host wakes then
@@ -1306,31 +1716,49 @@ impl State {
         self.booted = true;
         let songs = [
             ("Around the World", "Daft Punk", "Homework", "7:09"),
-            ("Instant Crush", "Daft Punk, Julian Casablancas", "Random Access Memories", "5:38"),
+            (
+                "Instant Crush",
+                "Daft Punk, Julian Casablancas",
+                "Random Access Memories",
+                "5:38",
+            ),
             ("One More Time", "Daft Punk", "Discovery", "5:20"),
-            ("Harder, Better, Faster, Stronger", "Daft Punk", "Discovery", "3:45"),
+            (
+                "Harder, Better, Faster, Stronger",
+                "Daft Punk",
+                "Discovery",
+                "3:45",
+            ),
             ("Something About Us", "Daft Punk", "Discovery", "3:52"),
             ("Veridis Quo", "Daft Punk", "Discovery", "5:45"),
             ("Digital Love", "Daft Punk", "Discovery", "5:01"),
             ("Aerodynamic", "Daft Punk", "Discovery", "3:27"),
-            ("Get Lucky", "Daft Punk, Pharrell Williams, Nile Rodgers", "Random Access Memories", "6:10"),
+            (
+                "Get Lucky",
+                "Daft Punk, Pharrell Williams, Nile Rodgers",
+                "Random Access Memories",
+                "6:10",
+            ),
             ("Da Funk", "Daft Punk", "Homework", "5:28"),
         ];
         self.results = songs
             .iter()
             .enumerate()
-            .map(|(index, (title, artist, album, duration))| yt_client::SongHit {
-                video_id: format!("demo{index}"),
-                title: (*title).to_owned(),
-                artists: artist.split(", ").map(str::to_owned).collect(),
-                album: Some((*album).to_owned()),
-                duration: Some((*duration).to_owned()),
-                // `V1_SHOT_COVERS` stands in plain tiles for real covers, to check layout offline.
-                thumbnail: std::env::var_os("V1_SHOT_COVERS").map(|_| format!("demo://{index}")),
-                artist_id: None,
-                album_id: None,
-                artist_ids: Vec::new(),
-            })
+            .map(
+                |(index, (title, artist, album, duration))| yt_client::SongHit {
+                    video_id: format!("demo{index}"),
+                    title: (*title).to_owned(),
+                    artists: artist.split(", ").map(str::to_owned).collect(),
+                    album: Some((*album).to_owned()),
+                    duration: Some((*duration).to_owned()),
+                    // `V1_SHOT_COVERS` stands in plain tiles for real covers, to check layout offline.
+                    thumbnail: std::env::var_os("V1_SHOT_COVERS")
+                        .map(|_| format!("demo://{index}")),
+                    artist_id: None,
+                    album_id: None,
+                    artist_ids: Vec::new(),
+                },
+            )
             .collect();
         if std::env::var_os("V1_SHOT_COVERS").is_some() {
             for index in 0..songs.len() {
@@ -1341,7 +1769,7 @@ impl State {
                 };
                 let (r, g, b) = (channel(0.0), channel(0.33), channel(0.66));
                 let rgba = (0..64 * 64).flat_map(|_| [r, g, b, 255]).collect();
-                self.gpu.incoming.push(CoverImage {
+                self.gpu.queue_cover(CoverImage {
                     url: format!("demo://{index}"),
                     width: 64,
                     height: 64,
@@ -1350,7 +1778,8 @@ impl State {
             }
         }
         // The search's top result and the artists and albums it matched, invented to match the songs.
-        let thumb = |index: usize| std::env::var_os("V1_SHOT_COVERS").map(|_| format!("demo://{index}"));
+        let thumb =
+            |index: usize| std::env::var_os("V1_SHOT_COVERS").map(|_| format!("demo://{index}"));
         self.top = Some(TopResult::Artist(ArtistCard {
             browse_id: "UCdemo-top".to_owned(),
             name: "Daft Punk".to_owned(),
@@ -1413,7 +1842,8 @@ impl State {
                     let _ = self.library.save_artist(&ArtistPage {
                         browse_id: format!("UCdemo{index}"),
                         name: format!("Demo Artist {}", index + 1),
-                        thumbnail: std::env::var_os("V1_SHOT_COVERS").map(|_| format!("demo://{}", index % 10)),
+                        thumbnail: std::env::var_os("V1_SHOT_COVERS")
+                            .map(|_| format!("demo://{}", index % 10)),
                         ..ArtistPage::default()
                     });
                     let _ = self.library.save_album(
@@ -1421,7 +1851,8 @@ impl State {
                             browse_id: format!("MPREb_demo{index}"),
                             title: format!("Demo Album {}", index + 1),
                             artist: format!("Demo Artist {}", index + 1),
-                            thumbnail: std::env::var_os("V1_SHOT_COVERS").map(|_| format!("demo://{}", index % 10)),
+                            thumbnail: std::env::var_os("V1_SHOT_COVERS")
+                                .map(|_| format!("demo://{}", index % 10)),
                             ..AlbumPage::default()
                         },
                         now,
@@ -1445,8 +1876,48 @@ impl State {
         match std::env::var("V1_SHOT_TAB").as_deref() {
             Ok("library") => self.tab = Tab::Library,
             Ok("queue") => self.tab = Tab::Queue,
+            Ok("settings") => {
+                self.tab = Tab::Settings;
+                self.results.clear();
+                self.top = None;
+                self.result_artists.clear();
+                self.result_albums.clear();
+                self.results_query.clear();
+                self.query.clear();
+                self.query_seen.clear();
+            }
             Ok("lyrics") => self.set_lyrics_open(true),
             _ => {}
+        }
+        // `V1_SHOT_SETTINGS=1` seeds the theme manager, a half-made theme and an equalizer curve, to
+        // check the Settings page's layout.
+        if std::env::var_os("V1_SHOT_SETTINGS").is_some() {
+            self.themes = vec![
+                ThemeRec {
+                    favorite: true,
+                    ..ThemeRec::new("Midnight", 0x002b_3350, 0x00e8_edff, 0x008f_b3ff)
+                },
+                ThemeRec::new("Ember", 0x003a_231c, 0x00ff_e3d1, 0x00ff_8a4c),
+            ];
+            self.settings.name = "Storm".to_owned();
+            self.eq = [4.0, 3.0, 1.5, 0.0, -1.0, 0.0, 1.0, 2.0, 3.0, 3.5];
+        }
+        // `V1_SHOT_THEME=Midnight` draws the frame in a saved theme, to check a custom palette.
+        if let Ok(name) = std::env::var("V1_SHOT_THEME") {
+            theme::set_palette(theme_palette(Some(&name), &self.themes));
+        }
+        // `V1_SHOT_DIALOG=1` shows the final confirmation about deleting downloads.
+        if std::env::var_os("V1_SHOT_DIALOG").is_some() {
+            self.settings.confirm_dialog = Some(ConfirmDialog::Downloads);
+        }
+        // `V1_SHOT_BACKGROUND=<path>` puts a picture behind the demo, decoded on this thread so a
+        // still can show it without waiting for the loader.
+        if let Ok(path) = std::env::var("V1_SHOT_BACKGROUND") {
+            if let Some(image) =
+                crate::background::preview(std::path::Path::new(&path), self.background.strength)
+            {
+                self.gpu.incoming_background = Some(image);
+            }
         }
         // `V1_SHOT_PAGE=artist|album` opens a stand-in artist or album page over the results, to check
         // its layout. The names are invented.
@@ -1484,7 +1955,10 @@ impl State {
                         songs_title: "Top songs".to_owned(),
                         songs: tracks,
                         shelves: vec![
-                            yt_client::Shelf { title: "Albums".to_owned(), albums: demo_cards("Album", 7) },
+                            yt_client::Shelf {
+                                title: "Albums".to_owned(),
+                                albums: demo_cards("Album", 7),
+                            },
                             yt_client::Shelf {
                                 title: "Singles & EPs".to_owned(),
                                 albums: demo_cards("Single", 3),
@@ -1643,7 +2117,9 @@ impl State {
                 video_id: hit.video_id,
                 url: local.path.to_string_lossy().into_owned(),
                 artist: hit.artists.join(", "),
-                duration_secs: local.duration_secs.or((known > 0.0).then_some(known as f64)),
+                duration_secs: local
+                    .duration_secs
+                    .or((known > 0.0).then_some(known as f64)),
                 loudness_db: local.loudness_db,
             });
             return;
@@ -1724,8 +2200,9 @@ impl State {
                 // `/player` usually gives the length; when it does not, the list's or a fetched one
                 // stands in until the decoder reads it from the stream.
                 let known = self.known_length(&hit);
-                let duration_secs =
-                    ready.duration_secs.or((known > 0.0).then_some(known as f64));
+                let duration_secs = ready
+                    .duration_secs
+                    .or((known > 0.0).then_some(known as f64));
                 // Search results carry richer metadata than the player response: full artist
                 // credits and the cover.
                 let artist = if hit.artists.is_empty() {
@@ -1791,7 +2268,10 @@ impl State {
     fn apply_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.0);
         if let Some(track) = self.now.as_mut() {
-            track.player.set_volume(self.volume * track.gain * track.norm);
+            track.player.set_volume(
+                self.volume_before_mute.unwrap_or(self.volume) * track.gain * track.norm,
+            );
+            track.player.set_muted(self.volume_before_mute.is_some());
         }
     }
 
@@ -1802,11 +2282,12 @@ impl State {
         // Remember the results when the reader stayed on them for a while or clicked into them.
         let showing = !self.results_query.is_empty();
         let stayed = self.results_at.elapsed() >= RESULTS_STAY;
-        self.results_return = (showing && (self.results_clicked || stayed)).then(|| ResultsReturn {
-            query: self.query.clone(),
-            results_query: self.results_query.clone(),
-            scroll: self.results_scroll,
-        });
+        self.results_return =
+            (showing && (self.results_clicked || stayed)).then(|| ResultsReturn {
+                query: self.query.clone(),
+                results_query: self.results_query.clone(),
+                scroll: self.results_scroll,
+            });
         self.results_clicked = false;
         self.results_query.clear();
         // The bar slides away as it always does; its text goes with it instead of vanishing first.
@@ -1880,8 +2361,11 @@ impl State {
             Detail::Album(id) => {
                 if matches!(self.albums.get(id), None | Some(Loaded::Failed(_))) {
                     // A stored page with no tracks is fetched again rather than shown empty.
-                    if let Some(page) =
-                        self.library.album_page(id).filter(|p| !p.tracks.is_empty()).cloned()
+                    if let Some(page) = self
+                        .library
+                        .album_page(id)
+                        .filter(|p| !p.tracks.is_empty())
+                        .cloned()
                     {
                         self.albums.insert(id.clone(), Loaded::Ready(page));
                         return;
@@ -1900,12 +2384,14 @@ impl State {
             Some(Detail::Artist(id)) => Some(id.clone()),
             _ => None,
         };
-        self.artists.retain(|id, _| current.as_deref() == Some(id.as_str()));
+        self.artists
+            .retain(|id, _| current.as_deref() == Some(id.as_str()));
         let current = match &self.pages.top {
             Some(Detail::Album(id)) => Some(id.clone()),
             _ => None,
         };
-        self.albums.retain(|id, _| current.as_deref() == Some(id.as_str()));
+        self.albums
+            .retain(|id, _| current.as_deref() == Some(id.as_str()));
     }
 
     /// The tracks of the page on screen, to play from. Empty while it loads.
@@ -1927,7 +2413,11 @@ impl State {
         if self.gpu.covers.contains_key(&url) || self.cover_inflight.contains(&url) {
             return;
         }
-        if self.cover_retry.get(&url).is_some_and(|retry_at| Instant::now() < *retry_at) {
+        if self
+            .cover_retry
+            .get(&url)
+            .is_some_and(|retry_at| Instant::now() < *retry_at)
+        {
             return;
         }
         self.cover_retry.remove(&url);
@@ -1952,6 +2442,29 @@ impl State {
         }
         self.meta_requested.insert(hit.video_id.clone());
         let _ = self.backend.commands.send(Command::SongMeta(hit));
+    }
+
+    pub fn seek_relative(&mut self, seconds: f64) {
+        if let Some(track) = &self.now {
+            let position = track.player.position_ms(Instant::now()) as f64 / 1000.0;
+            self.media_command(crate::media::Command::Seek(position + seconds), false);
+        }
+    }
+
+    pub fn adjust_volume(&mut self, delta: f32) {
+        self.set_volume(self.volume + delta);
+    }
+
+    pub fn toggle_mute(&mut self) {
+        self.apply(Action::Mute);
+    }
+    pub fn toggle_theater(&mut self) {
+        if self.lyrics_open {
+            self.theater = !self.theater;
+        }
+    }
+    pub fn toggle_lyrics(&mut self) {
+        self.apply(Action::ToggleLyrics);
     }
 
     fn apply(&mut self, action: Action) {
@@ -2050,8 +2563,10 @@ impl State {
             }
             Action::PlayLibrary(index) => {
                 let ids: Vec<String> = self.library.song_list(&self.ghosts).to_vec();
-                let hits: Vec<yt_client::SongHit> =
-                    ids.iter().filter_map(|id| self.library.song_hit(id).cloned()).collect();
+                let hits: Vec<yt_client::SongHit> = ids
+                    .iter()
+                    .filter_map(|id| self.library.song_hit(id).cloned())
+                    .collect();
                 if let Some(hit) = hits.get(index) {
                     if self.clicked_current(&hit.video_id) {
                         return;
@@ -2079,6 +2594,214 @@ impl State {
                 if tab != self.tab {
                     self.tab = tab;
                 }
+            }
+            Action::SetTheme(name) => set_theme(self, name),
+            Action::FavoriteTheme(name) => {
+                if let Some(theme) = self.themes.iter_mut().find(|theme| theme.name == name) {
+                    theme.favorite = !theme.favorite;
+                    self.prefs.set_themes(&self.themes);
+                }
+            }
+            Action::DeleteTheme(name) => {
+                self.settings.confirm_dialog = None;
+                self.themes.retain(|theme| theme.name != name);
+                self.prefs.set_themes(&self.themes);
+                if self.settings.editing_theme.as_deref() == Some(name.as_str()) {
+                    self.settings.editing_theme = None;
+                    self.settings.creator_open = false;
+                    self.settings.color_picker = None;
+                }
+                if self.prefs.active_theme() == Some(name.as_str()) {
+                    set_theme(self, None);
+                }
+            }
+            Action::EditTheme(name) => {
+                if self.settings.creator_open
+                    && self.settings.editing_theme.as_deref() == Some(name.as_str())
+                {
+                    self.settings.creator_open = false;
+                    self.settings.editing_theme = None;
+                    self.settings.name.clear();
+                    self.settings.color_picker = None;
+                } else if let Some(theme) = self.themes.iter().find(|t| t.name == name).cloned() {
+                    self.settings.editing_theme = Some(theme.name.clone());
+                    self.settings.name = theme.name;
+                    self.settings.primary = rgb_color(theme.primary);
+                    self.settings.secondary = rgb_color(theme.secondary);
+                    self.settings.accent = rgb_color(theme.accent);
+                    self.settings.lyrics_fill =
+                        theme.lyrics_fill.map(rgb_color).unwrap_or_else(|| {
+                            theme::Palette::from_colors(
+                                rgb_color(theme.primary),
+                                rgb_color(theme.secondary),
+                                rgb_color(theme.accent),
+                            )
+                            .lyrics_fg
+                        });
+                    self.settings.lyrics_outline = theme
+                        .lyrics_outline
+                        .map(rgb_color)
+                        .unwrap_or(Color::rgb(0x00, 0x00, 0x00));
+                    self.settings.visualizer_mode = theme.visualizer_mode;
+                    self.settings.visualizer_color = theme
+                        .visualizer_color
+                        .map(rgb_color)
+                        .unwrap_or(self.settings.accent);
+                    self.settings.theme_background = theme.background;
+                    self.settings.theme_background_blur = theme.background_blur;
+                    self.settings.theme_background_transparency = theme.background_transparency;
+                    self.background_editor_generation =
+                        self.background_editor_generation.wrapping_add(1);
+                    self.settings.creator_open = true;
+                    self.settings.color_picker = None;
+                }
+            }
+            Action::CreateTheme => {
+                let raw_name = self.settings.name.trim();
+                let editing = self.settings.editing_theme.take();
+                let was_active = editing
+                    .as_deref()
+                    .is_some_and(|old| self.prefs.active_theme() == Some(old));
+                let final_name = match editing.as_deref() {
+                    Some(old) if raw_name == old => old.to_owned(),
+                    Some(old) => {
+                        let others: Vec<ThemeRec> = self
+                            .themes
+                            .iter()
+                            .filter(|t| t.name != old)
+                            .cloned()
+                            .collect();
+                        unique_theme_name(raw_name, &others)
+                    }
+                    None => unique_theme_name(raw_name, &self.themes),
+                };
+                let existing_fav = editing
+                    .as_deref()
+                    .and_then(|old| self.themes.iter().find(|t| t.name == old))
+                    .is_some_and(|t| t.favorite);
+                let theme = ThemeRec {
+                    name: final_name.clone(),
+                    primary: rgb_value(self.settings.primary),
+                    secondary: rgb_value(self.settings.secondary),
+                    accent: rgb_value(self.settings.accent),
+                    favorite: existing_fav,
+                    lyrics_fill: Some(rgb_value(self.settings.lyrics_fill)),
+                    lyrics_outline: Some(rgb_value(self.settings.lyrics_outline)),
+                    visualizer_mode: self.settings.visualizer_mode,
+                    visualizer_color: Some(rgb_value(self.settings.visualizer_color)),
+                    background: self.settings.theme_background.clone(),
+                    background_blur: self.settings.theme_background_blur,
+                    background_transparency: self.settings.theme_background_transparency,
+                };
+                if let Some(old) = editing.as_deref() {
+                    if let Some(slot) = self.themes.iter_mut().find(|t| t.name == old) {
+                        *slot = theme;
+                    } else {
+                        self.themes.push(theme);
+                    }
+                } else {
+                    self.themes.push(theme);
+                }
+                self.prefs.set_themes(&self.themes);
+                self.settings.name.clear();
+                self.settings.creator_open = false;
+                self.settings.color_picker = None;
+                if editing.is_none() || was_active {
+                    set_theme(self, Some(final_name));
+                } else if self.prefs.active_theme().is_some() {
+                    set_theme(self, self.prefs.active_theme().map(str::to_owned));
+                }
+            }
+            Action::PickBackground => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter(
+                        "Images & Video",
+                        &[
+                            "png", "jpg", "jpeg", "webp", "jxl", "avif", "gif", "bmp", "tif",
+                            "tiff", "ico", "tga", "pnm", "qoi", "dds", "hdr", "exr", "ff", "mp4",
+                            "webm", "mov", "mkv", "avi", "m4v", "ogv",
+                        ],
+                    )
+                    .pick_file()
+                {
+                    self.background_prep_error = None;
+                    self.queue_background_prep(path, BackgroundPrepTarget::Global);
+                }
+            }
+            Action::RemoveBackground => {
+                self.cancel_background_prep();
+                self.settings.confirm_dialog = None;
+                self.background_prep_error = None;
+                self.prefs.set_background(None);
+                sync_background(self);
+            }
+            Action::ToggleGlobalBackground(enabled) => {
+                self.cancel_background_prep();
+                self.prefs.set_background_enabled(enabled);
+                sync_background(self);
+            }
+            Action::PickThemeBackground => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter(
+                        "Images & Video",
+                        &[
+                            "png", "jpg", "jpeg", "webp", "jxl", "avif", "gif", "bmp", "tif",
+                            "tiff", "ico", "tga", "pnm", "qoi", "dds", "hdr", "exr", "ff", "mp4",
+                            "webm", "mov", "mkv", "avi", "m4v", "ogv",
+                        ],
+                    )
+                    .pick_file()
+                {
+                    let editing = self.settings.editing_theme.clone();
+                    self.queue_background_prep(
+                        path,
+                        BackgroundPrepTarget::Theme(editing, self.background_editor_generation),
+                    );
+                }
+            }
+            Action::BlurStrength(strength) => {
+                if self.prefs.background_enabled() && self.prefs.background().is_some() {
+                    self.background.set_strength(strength);
+                }
+                self.prefs.set_background_blur(strength);
+            }
+            Action::ThemeBlurStrength(strength) => {
+                self.settings.theme_background_blur = strength;
+                let global_active =
+                    self.prefs.background_enabled() && self.prefs.background().is_some();
+                let editing_active = self.settings.editing_theme.as_deref().is_some()
+                    && self.settings.editing_theme.as_deref() == self.prefs.active_theme();
+                if !global_active && editing_active {
+                    self.background.set_strength(strength);
+                }
+            }
+            Action::BackgroundTransparency(transparency) => {
+                self.prefs.set_background_transparency(transparency);
+            }
+            Action::ThemeBackgroundTransparency(transparency) => {
+                self.settings.theme_background_transparency = transparency;
+            }
+            Action::ConfirmDialog(dialog) => self.settings.confirm_dialog = dialog,
+            Action::SetDownloads(enabled) => {
+                if !enabled {
+                    // Final, as the dialog says: every downloaded file goes now.
+                    self.library.clear_downloads();
+                }
+                self.prefs.set_downloads(enabled);
+                self.library.set_downloading(enabled);
+                if enabled {
+                    let effects = self.library.resume();
+                    self.run_effects(effects);
+                }
+                self.settings.confirm_dialog = None;
+            }
+            Action::SetEq(gains) => {
+                self.eq = gains;
+                self.prefs.set_eq(gains);
+            }
+            Action::ResetEq => {
+                self.eq = [0.0; 10];
+                self.prefs.set_eq(self.eq);
             }
             Action::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
             Action::ToggleLyrics => self.set_lyrics_open(!self.lyrics_open),
@@ -2129,9 +2852,9 @@ fn demo_lookup(kind: &str) -> Lookup {
         "instrumental" => Lookup::Found(yt_lyrics::Lyrics::instrumental(source)),
         "none" => Lookup::NotFound,
         "unavailable" => Lookup::Unavailable("offline".to_owned()),
-        _ => Lookup::Found(
-            yt_lyrics::Lyrics::synced(source, timed).expect("the stand-in has text"),
-        ),
+        _ => {
+            Lookup::Found(yt_lyrics::Lyrics::synced(source, timed).expect("the stand-in has text"))
+        }
     }
 }
 
@@ -2139,8 +2862,9 @@ fn demo_lookup(kind: &str) -> Lookup {
 fn hit_seconds(duration: Option<&str>) -> f32 {
     duration
         .and_then(|text| {
-            text.split(':')
-                .try_fold(0.0_f32, |total, part| part.parse::<f32>().ok().map(|p| total * 60.0 + p))
+            text.split(':').try_fold(0.0_f32, |total, part| {
+                part.parse::<f32>().ok().map(|p| total * 60.0 + p)
+            })
         })
         .unwrap_or(0.0)
 }
@@ -2162,9 +2886,47 @@ fn clock(seconds: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::clock;
-    use super::{advance_badge, bars_shown, BAR_LINGER, BADGE_QUIET_HOLD, SEARCH_CLOSE_RATE, SEARCH_OPEN_RATE};
+    use super::{
+        advance_badge, background_prep_failure_updates_global_error,
+        background_theme_target_is_current, bars_shown, BackgroundPrepTarget, BADGE_QUIET_HOLD,
+        BAR_LINGER, SEARCH_CLOSE_RATE, SEARCH_OPEN_RATE,
+    };
     use crate::anim::{rate, Anims};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn background_theme_result_requires_the_same_open_editor_session() {
+        let theme = Some("theme-1".to_owned());
+        assert!(background_theme_target_is_current(
+            true, &theme, 7, &theme, 7
+        ));
+        assert!(!background_theme_target_is_current(
+            false, &theme, 7, &theme, 7
+        ));
+        assert!(!background_theme_target_is_current(
+            true, &theme, 8, &theme, 7
+        ));
+        assert!(!background_theme_target_is_current(
+            true,
+            &Some("theme-2".to_owned()),
+            7,
+            &theme,
+            7
+        ));
+    }
+
+    #[test]
+    fn only_global_background_failures_replace_the_global_error() {
+        assert!(background_prep_failure_updates_global_error(
+            &BackgroundPrepTarget::Global
+        ));
+        assert!(!background_prep_failure_updates_global_error(
+            &BackgroundPrepTarget::Theme(None, 1)
+        ));
+        assert!(!background_prep_failure_updates_global_error(
+            &BackgroundPrepTarget::Theme(Some("theme".to_owned()), 2)
+        ));
+    }
 
     /// The scrollbar stays up for a moment after the last scroll, then goes. Scrolling, and reaching
     /// for the bar, bring it straight back.
@@ -2173,11 +2935,26 @@ mod tests {
         let now = Instant::now();
         let just_scrolled = now - Duration::from_secs_f32(BAR_LINGER * 0.5);
         let long_ago = now - Duration::from_secs_f32(BAR_LINGER + 0.5);
-        assert!(bars_shown(now, Some(just_scrolled), false, false), "it should still be up during the linger");
-        assert!(!bars_shown(now, Some(long_ago), false, false), "it should be gone after the linger");
-        assert!(bars_shown(now, Some(long_ago), true, false), "the pointer on it should bring it back");
-        assert!(bars_shown(now, None, false, true), "scrolling should bring it up");
-        assert!(!bars_shown(now, None, false, false), "it should stay hidden before anything scrolls");
+        assert!(
+            bars_shown(now, Some(just_scrolled), false, false),
+            "it should still be up during the linger"
+        );
+        assert!(
+            !bars_shown(now, Some(long_ago), false, false),
+            "it should be gone after the linger"
+        );
+        assert!(
+            bars_shown(now, Some(long_ago), true, false),
+            "the pointer on it should bring it back"
+        );
+        assert!(
+            bars_shown(now, None, false, true),
+            "scrolling should bring it up"
+        );
+        assert!(
+            !bars_shown(now, None, false, false),
+            "it should stay hidden before anything scrolls"
+        );
     }
 
     /// Played out frame by frame: the bar holds for the whole linger, then fades out within a quarter
@@ -2196,7 +2973,10 @@ mod tests {
             let bar_rate = if shown { rate::QUICKER } else { rate::QUICK };
             alpha = anims.toggle("bar", 0, shown, bar_rate);
             if elapsed < BAR_LINGER - 0.05 {
-                assert!(alpha > 0.99, "it faded during the linger, at {elapsed:.2}s: {alpha}");
+                assert!(
+                    alpha > 0.99,
+                    "it faded during the linger, at {elapsed:.2}s: {alpha}"
+                );
             }
         }
         // Two seconds after the last scroll it is gone, and nothing is left moving.
@@ -2224,14 +3004,20 @@ mod tests {
             ));
         }
         // Nor does a drag whose readings cross the on-level back and forth.
-        for (frame, level) in [0.021, 0.019, 0.03, 0.012, 0.025, 0.01].into_iter().enumerate() {
+        for (frame, level) in [0.021, 0.019, 0.03, 0.012, 0.025, 0.01]
+            .into_iter()
+            .enumerate()
+        {
             let now = start + Duration::from_millis(300 + 16 * frame as u64);
             assert!(advance_badge(true, &mut quiet, [level; 3], now));
         }
         // A long quiet spell clears it.
         let quiet_at = start + Duration::from_secs(1);
         let after = quiet_at + BADGE_QUIET_HOLD + Duration::from_millis(1);
-        assert!(advance_badge(true, &mut quiet, [0.001; 3], quiet_at), "the hold starts now");
+        assert!(
+            advance_badge(true, &mut quiet, [0.001; 3], quiet_at),
+            "the hold starts now"
+        );
         assert!(!advance_badge(true, &mut quiet, [0.001; 3], after));
     }
 
@@ -2274,9 +3060,15 @@ mod tests {
         assert_eq!(same_track_press(Some("a"), None, "b"), TrackPress::Start);
         // A second press while it is still loading must not start it over.
         assert_eq!(same_track_press(None, Some("a"), "a"), TrackPress::Ignore);
-        assert_eq!(same_track_press(Some("a"), Some("a"), "a"), TrackPress::Ignore);
+        assert_eq!(
+            same_track_press(Some("a"), Some("a"), "a"),
+            TrackPress::Ignore
+        );
         // Pressing the fading song while another loads starts it again.
-        assert_eq!(same_track_press(Some("a"), Some("b"), "a"), TrackPress::Start);
+        assert_eq!(
+            same_track_press(Some("a"), Some("b"), "a"),
+            TrackPress::Start
+        );
     }
 
     #[test]
@@ -2288,7 +3080,10 @@ mod tests {
         assert!(pages.back());
         assert_eq!(pages.top, Some(Detail::Artist("a".to_owned())));
         assert!(pages.back());
-        assert_eq!(pages.top, None, "back from the first page is the results or the tab");
+        assert_eq!(
+            pages.top, None,
+            "back from the first page is the results or the tab"
+        );
         assert!(!pages.back(), "nothing left to go back to");
     }
 
@@ -2299,7 +3094,10 @@ mod tests {
         assert!(pages.open(Detail::Album("b".to_owned())));
         assert!(!pages.open(Detail::Album("b".to_owned())));
         assert!(pages.back());
-        assert_eq!(pages.top, None, "one open, one back: the repeat did not add a step");
+        assert_eq!(
+            pages.top, None,
+            "one open, one back: the repeat did not add a step"
+        );
     }
 
     #[test]
@@ -2355,6 +3153,19 @@ pub fn build(
     scale: f32,
 ) -> UiFrame {
     let now = Instant::now();
+    let mut input = input;
+    if state.theater && state.lyrics_open {
+        // The UI scroll engine receives no reader input; programmatic following still runs.
+        input.wheel = 0.0;
+        input.wheel_precise = 0.0;
+        input.nav = Default::default();
+        input.mouse = (-1.0, -1.0);
+        input.mouse_down = false;
+        input.mouse_pressed = false;
+        input.mouse_released = false;
+        state.lyrics_follow.reader = false;
+        state.lyrics_follow.scrolled_at = None;
+    }
     let dt = input.dt;
     let mut actions: Vec<Action> = Vec::new();
 
@@ -2406,7 +3217,11 @@ pub fn build(
         None => Vec::new(),
     };
     let mut left_dismissed = false;
-    if let Some(rect) = state.menu.as_ref().map(|menu| menu_rect(menu, menu_entries.len(), width, height)) {
+    if let Some(rect) = state
+        .menu
+        .as_ref()
+        .map(|menu| menu_rect(menu, menu_entries.len(), width, height))
+    {
         let inside = rect.contains(pointer.pos);
         if !inside && (pointer.pressed || pointer.secondary || wheel != 0.0) {
             left_dismissed = pointer.pressed;
@@ -2417,22 +3232,28 @@ pub fn build(
     ui.begin(input, (width, height));
     ui.set_theme(&dark);
     ui.set_focus_rings(false);
-    ui.rect(Rect::new(0.0, 0.0, width, height), theme::BG);
+    ui.rect(Rect::new(0.0, 0.0, width, height), theme::bg());
+    draw_background(ui, &gpu, width, height);
 
     // Layout.
-    let body_h = height - theme::BAR_H;
+    let theater = state.theater && state.lyrics_open;
+    let t = anims.toggle("theater", 0, theater, rate::PANEL);
+    let body_h = height - theme::BAR_H * (1.0 - t);
     let want_open = state.sidebar_open && width >= theme::SIDEBAR_AUTO_SHUT;
     let open_t = anims.toggle("sidebar", 0, want_open, rate::PANEL);
-    let sidebar_w = (theme::SIDEBAR_SHUT + (theme::SIDEBAR_OPEN - theme::SIDEBAR_SHUT) * open_t).round();
-    let sidebar = Rect::new(0.0, 0.0, sidebar_w, body_h);
+    let sidebar_w =
+        (theme::SIDEBAR_SHUT + (theme::SIDEBAR_OPEN - theme::SIDEBAR_SHUT) * open_t).round();
+    let full_w = sidebar_w;
+    let sidebar_w = sidebar_w * (1.0 - t);
+    let sidebar = Rect::new(sidebar_w - full_w, 0.0, full_w, body_h);
     let main = Rect::new(sidebar_w, 0.0, width - sidebar_w, body_h);
     let bar = Rect::new(0.0, body_h, width, theme::BAR_H);
     // The window's own caption buttons, in the top-right corner over the page, centred on the
     // search field's line so the two sit level.
     let caption = Rect::new(
-        width - theme::CAPTION_INSET - theme::CAPTION_BTN_W * 2.0,
+        width - theme::CAPTION_INSET - theme::CAPTION_BTN_W * 3.0,
         theme::SEARCH_TOP + (theme::SEARCH_H - theme::CAPTION_H) * 0.5,
-        theme::CAPTION_BTN_W * 2.0,
+        theme::CAPTION_BTN_W * 3.0,
         theme::CAPTION_H,
     );
 
@@ -2449,8 +3270,16 @@ pub fn build(
     let focused = ui.focused("search");
     let on_detail = !state.lyrics_open && state.pages.top.is_some();
     let results_page = !state.lyrics_open && !on_detail && !state.results_query.is_empty();
-    let open_zone = if results_page || on_detail { theme::TOP_H + 150.0 } else { 124.0 };
-    let zone_h = if state.search_wanted { open_zone } else { theme::TOP_H };
+    let open_zone = if results_page || on_detail {
+        theme::TOP_H + 150.0
+    } else {
+        124.0
+    };
+    let zone_h = if state.search_wanted {
+        open_zone
+    } else {
+        theme::TOP_H
+    };
     let zone = Rect::new(main.x, 0.0, main.w, zone_h);
     // On the results page the bar stays up while the list is at its top; once scrolled, it is hidden
     // again and behaves like everywhere else.
@@ -2463,24 +3292,36 @@ pub fn build(
     // it is, so leaving the results can return to it.
     if results_page {
         if let Some(target) = state.pending_results_scroll.take() {
-            ui.scroll_by(&list_id, target - ui.scroll_state(&list_id).0, dream::ui::widgets::ScrollBehavior::Instant);
+            ui.scroll_by(
+                &list_id,
+                target - ui.scroll_state(&list_id).0,
+                dream::ui::widgets::ScrollBehavior::Instant,
+            );
         }
         state.results_scroll = ui.scroll_state(&list_id).0;
     }
     // `V1_SHOT_SCROLL=<px>` scrolls the list on screen to that offset, to check the glass over rows.
     // It counts as the reader scrolling, so the bar is up in the shot as it would be for them.
-    if let Some(target) = std::env::var("V1_SHOT_SCROLL").ok().and_then(|v| v.parse::<f32>().ok()) {
+    if let Some(target) = std::env::var("V1_SHOT_SCROLL")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+    {
         state.bar_at = Some(now);
         let current = ui.scroll_state(&list_id).0;
         if (target - current).abs() > 0.5 {
-            ui.scroll_by(&list_id, target - current, dream::ui::widgets::ScrollBehavior::Instant);
+            ui.scroll_by(
+                &list_id,
+                target - current,
+                dream::ui::widgets::ScrollBehavior::Instant,
+            );
         }
     }
 
     // The scrollbar hides itself when the reader is not scrolling. A wheel turn, a key or a press on
     // the bar brings it up at once; it lingers for a moment after the last of that, then fades away.
     // Reaching for the page's right edge, where the bar floats, or holding it keeps it up.
-    let over_bar = pointer.pos.0 > width - BAR_REACH
+    let over_bar = !theater
+        && pointer.pos.0 > width - BAR_REACH
         && pointer.pos.1 > theme::SEARCH_TOP + theme::CAPTION_H
         && pointer.pos.1 < body_h;
     if pointer.pressed && over_bar {
@@ -2490,9 +3331,7 @@ pub fn build(
     }
     let keys_scrolled = !focused
         && (keys.up || keys.down || keys.page_up || keys.page_down || keys.home || keys.end);
-    let scrolling = state.bar_grab
-        || keys_scrolled
-        || (wheel != 0.0 && main.contains(pointer.pos));
+    let scrolling = state.bar_grab || keys_scrolled || (wheel != 0.0 && main.contains(pointer.pos));
     state.bar_hover = over_bar;
     if scrolling {
         state.bar_at = Some(now);
@@ -2509,8 +3348,8 @@ pub fn build(
         width: 4.0,
         inset: 14.0,
         min_thumb: 40.0,
-        idle: fade(theme::THUMB, bar_alpha),
-        active: fade(theme::THUMB_HOT, bar_alpha),
+        idle: fade(theme::thumb(), bar_alpha),
+        active: fade(theme::thumb_hot(), bar_alpha),
     };
 
     // A detail page is pinned like the results: the bar, and the back button with it, stay up while
@@ -2526,13 +3365,19 @@ pub fn build(
     state.search_wanted = wanted;
     // It drops in from above the window and settles without overshoot; leaving, it springs back up,
     // faster still, so the page is clear the moment the pointer leaves the zone.
-    let stiffness = if wanted { SEARCH_OPEN_RATE } else { SEARCH_CLOSE_RATE };
+    let search_h = theme::SEARCH_H;
+    let hidden_y = -(search_h + 20.0);
+    let previous_reveal = anims.value("search", 0).unwrap_or(0.0);
+    let was_hidden = hidden_y + (theme::SEARCH_TOP - hidden_y) * previous_reveal + search_h <= 0.0;
+    let stiffness = if wanted {
+        SEARCH_OPEN_RATE
+    } else {
+        SEARCH_CLOSE_RATE
+    };
     let reveal = anims.toggle("search", 0, wanted, stiffness);
     if wanted || reveal <= 0.001 {
         state.search_ghost = None;
     }
-    let search_h = theme::SEARCH_H;
-    let hidden_y = -(search_h + 20.0);
     let search_y = hidden_y + (theme::SEARCH_TOP - hidden_y) * reveal;
     // Centred on the page. On a narrow window that would run under the caption buttons, so it is
     // centred in the room left of them instead.
@@ -2553,7 +3398,16 @@ pub fn build(
         search_w = (caption_edge - search_x).min(search_w).max(0.0);
     }
     let back_wanted = state.pages.top.is_some() || state.lyrics_open;
-    let back_stiffness = if back_wanted { SEARCH_OPEN_RATE } else { SEARCH_CLOSE_RATE };
+    // Prepare the horizontal layout offscreen, before the vertical reveal advances. Otherwise
+    // opening a detail page from a hidden bar animates both axes and makes it drop diagonally.
+    if was_hidden {
+        anims.snap("back", 0, if back_wanted { 1.0 } else { 0.0 });
+    }
+    let back_stiffness = if back_wanted {
+        SEARCH_OPEN_RATE
+    } else {
+        SEARCH_CLOSE_RATE
+    };
     let back_t = anims.toggle("back", 0, back_wanted, back_stiffness);
     let shave = BACK_STEP * back_t;
     let search = Rect::new(
@@ -2564,9 +3418,10 @@ pub fn build(
     );
     let back = Rect::new(search.x - BACK_STEP, search.y, search_h, search_h);
     let back_visible = back_t > 0.001 && back.y + back.h > 0.0;
-    let covered = (search.y + search.h > 0.0 && search.contains(pointer.pos))
-        || (back_visible && back.contains(pointer.pos));
-    let over_caption = caption.contains(pointer.pos);
+    let covered = !theater
+        && ((search.y + search.h > 0.0 && search.contains(pointer.pos))
+            || (back_visible && back.contains(pointer.pos)));
+    let over_caption = !theater && caption.contains(pointer.pos);
 
     // The spinner turns while a song loads, the same for the bar and the rows.
     if state.playlist.is_loading() {
@@ -2574,11 +3429,14 @@ pub fn build(
     }
     // Everything drawn over the page. The page is drawn first, so these are known up front and a
     // page widget under one of them does not take the press.
-    let mut covers = vec![bar, sidebar, caption];
-    if search.y + search.h > 0.0 {
+    let mut covers = vec![bar, sidebar];
+    if !theater {
+        covers.push(caption);
+    }
+    if !theater && search.y + search.h > 0.0 {
         covers.push(search);
     }
-    if back_visible {
+    if !theater && back_visible {
         covers.push(back);
     }
     // While the track menu is open, the page under it takes no presses, and a press outside it (which
@@ -2587,6 +3445,10 @@ pub fn build(
         covers.push(menu_rect(menu, menu_entries.len(), width, height));
     }
     if left_dismissed {
+        covers.push(Rect::new(0.0, 0.0, width, height));
+    }
+    // The download confirmation and colour picker cover the window: nothing beneath them takes a press.
+    if state.settings.confirm_dialog.is_some() || state.settings.color_picker.is_some() {
         covers.push(Rect::new(0.0, 0.0, width, height));
     }
 
@@ -2611,25 +3473,91 @@ pub fn build(
         saved: state.library.ids(),
     };
 
+    // Exiting Settings cancels any in-progress theme builder or colour picker.
+    if (state.tab != Tab::Settings || state.lyrics_open || state.pages.top.is_some())
+        && (state.settings.creator_open || state.settings.color_picker.is_some())
+    {
+        state.settings.creator_open = false;
+        state.settings.editing_theme = None;
+        state.settings.name.clear();
+        state.settings.color_picker = None;
+    }
+
     // Page first, then the surfaces that sit over it.
     page(&mut cx, state, track.as_ref(), main, now, &mut actions);
     cx.covering = false;
     // Over the caption buttons, everything beneath them ignores the pointer, the page included.
-    cx.blocked = over_caption;
-    draw_sidebar(&mut cx, state, sidebar, open_t, &mut actions);
-    draw_join_crescent(&mut cx, sidebar);
+    // The confirmation dialog does the same to everything it covers: only its own buttons are
+    // live while it is up.
+    cx.blocked = over_caption
+        || state.settings.confirm_dialog.is_some()
+        || state.settings.color_picker.is_some();
+    if sidebar_w > 0.001 {
+        cx.blocked |= theater;
+        cx.clip(Rect::new(0.0, 0.0, sidebar_w, body_h));
+        draw_sidebar(&mut cx, state, sidebar, open_t, &mut actions);
+        let panel_alpha = ui_panel_alpha(state);
+        draw_join_crescent(&mut cx, sidebar, panel_alpha);
+        cx.unclip();
+    }
     // The chrome floats over the content, which now scrolls up under it. Its layer sorts it above
     // the page's rows, so a row's text never paints over the search bar or the caption icons.
     let page_layer = cx.draw().set_layer(CHROME_LAYER);
-    draw_search(&mut cx, state, search);
-    draw_back(&mut cx, back, back_t, &mut actions);
+    if !theater {
+        draw_search(&mut cx, state, search);
+        draw_back(&mut cx, back, back_t, &mut actions);
+    }
     draw_bar(&mut cx, state, track.as_ref(), bar, &mut actions);
     cx.blocked = false;
-    draw_caption(&mut cx, caption, &mut actions);
+    if !theater {
+        draw_caption(&mut cx, caption, state.fullscreen, &mut actions);
+    }
+    cx.blocked = false;
     cx.draw().set_layer(page_layer);
 
+    if state.lyrics_open {
+        cx.blocked = state.menu.is_some()
+            || state.settings.confirm_dialog.is_some()
+            || state.settings.color_picker.is_some();
+        let hit = Rect::new(main.x + 16.0, 16.0, 32.0, 32.0);
+        let hot = hit.contains(pointer.pos);
+        let shown = !theater || hot;
+        let fade_rate = if shown { rate::QUICK } else { rate::QUICKER };
+        let a = cx.anims.toggle("theater_button", 0, shown, fade_rate);
+        let hover = a > 0.5 && cx.over_clickable(hit);
+        let hv = cx.anims.toggle("theater_hover", 0, hover, rate::QUICK);
+        if a > 0.001 {
+            cx.draw()
+                .round_rect(hit, 8.0, fade(theme::panel_hover(), hv * a));
+            let c = fade(mix(theme::muted(), theme::fg(), hv), a);
+            // Transparent outline: every stroke fades together over any background.
+            cx.draw()
+                .round_ring(Rect::new(hit.x + 7.0, hit.y + 8.0, 18.0, 13.0), 2.5, 1.5, c);
+            cx.draw().line(
+                (hit.x + 16.0, hit.y + 21.0),
+                (hit.x + 16.0, hit.y + 24.0),
+                1.5,
+                c,
+            );
+            cx.draw().line(
+                (hit.x + 12.0, hit.y + 24.0),
+                (hit.x + 20.0, hit.y + 24.0),
+                1.5,
+                c,
+            );
+            if a > 0.5 && cx.clicked(hit) {
+                state.toggle_theater();
+            }
+        }
+    }
     // The track menu sits over everything, the caption buttons included.
     draw_track_menu(&mut cx, state, &menu_entries, width, height, &mut actions);
+    if state.settings.color_picker.is_some() {
+        draw_color_picker(&mut cx, state, width, height);
+    }
+    if let Some(dialog) = state.settings.confirm_dialog.as_ref() {
+        draw_confirm_dialog(&mut cx, dialog, width, height, &mut actions);
+    }
 
     // A press on empty space in the top strip grabs the window. Anything that took the press (a
     // row, the sidebar toggle), the search field, and the caption buttons keep it for themselves.
@@ -2641,6 +3569,8 @@ pub fn build(
         && !search.contains(cx.pointer.pos)
         && !back.contains(cx.pointer.pos)
         && !caption.contains(cx.pointer.pos)
+        && state.settings.confirm_dialog.is_none()
+        && state.settings.color_picker.is_none()
     {
         actions.push(Action::Window(WindowRequest::Drag));
     }
@@ -2696,29 +3626,32 @@ pub fn build(
 /// the bar are the same colour, so the join reads as one panel: the page corner is cut by a
 /// concave quarter-circle, and the sliver outside that arc is painted in the panel colour.
 /// Drawn as thin horizontal strips, each as wide as the sliver is at its height.
-fn draw_join_crescent(cx: &mut Cx, sidebar: Rect) {
+fn draw_join_crescent(cx: &mut Cx, sidebar: Rect, panel_alpha: f32) {
     let r = theme::JOIN_R;
     let right = sidebar.x + sidebar.w;
     let bottom = sidebar.y + sidebar.h;
+    let corner = Rect::new(right, bottom - r, r, r);
     // Centre of the fillet circle: `r` in from the sidebar edge and `r` up from the bar.
-    let (cx_, cy) = (right + r, bottom - r);
-    let step = 0.5;
-    let rows = (r / step).ceil() as i32;
-    for i in 0..rows {
-        let y0 = cy + i as f32 * step;
-        let y1 = (y0 + step).min(bottom);
-        let dy = (y0 + y1) * 0.5 - cy;
-        // Where the circle's edge sits at this height; the sliver runs from the sidebar to there.
-        let edge = cx_ - (r * r - dy * dy).max(0.0).sqrt();
-        let w = edge - right;
-        if w > 0.0 && y1 > y0 {
-            cx.draw().rect(Rect::new(right, y0, w, y1 - y0), theme::PANEL);
-        }
+    let center = (right + r, bottom - r);
+    if cx.gpu.background.is_some() {
+        cx.draw()
+            .concave_corner(corner, center, r, Color::WHITE, true);
+        cx.draw()
+            .concave_corner(corner, center, r, fade(theme::panel(), panel_alpha), false);
+    } else {
+        cx.draw()
+            .concave_corner(corner, center, r, theme::panel(), false);
     }
 }
 
 fn draw_sidebar(cx: &mut Cx, state: &State, rect: Rect, open_t: f32, actions: &mut Vec<Action>) {
-    cx.draw().rect(rect, theme::PANEL);
+    if cx.gpu.background.is_some() {
+        cx.draw().backdrop_rect(rect, Color::WHITE);
+        cx.draw()
+            .rect(rect, fade(theme::panel(), ui_panel_alpha(state)));
+    } else {
+        cx.draw().rect(rect, theme::panel());
+    }
     // Labels appear in the second half of the opening, and leave in the first half of closing, so
     // they are never squeezed against a narrow edge.
     let label_a = ((open_t - 0.55) / 0.45).clamp(0.0, 1.0);
@@ -2727,8 +3660,8 @@ fn draw_sidebar(cx: &mut Cx, state: &State, rect: Rect, open_t: f32, actions: &m
     // icons. Shut, the box holds the logo, and hovering it swaps in the toggle. Open, the logo
     // stays on the left and the toggle moves to the top right. At the shut width (68) the two
     // boxes are the same, so the toggle slides across as the sidebar animates.
-    let logo = Rect::new(12.5, 16.0, 43.0, 40.0);
-    let toggle = Rect::new(rect.w - 56.0, 16.0, 43.0, 40.0);
+    let logo = Rect::new(rect.x + 12.5, 16.0, 43.0, 40.0);
+    let toggle = Rect::new(rect.x + rect.w - 56.0, 16.0, 43.0, 40.0);
     let shut = open_t < 0.5;
     let logo_hover = shut && cx.over_clickable(logo);
     let swap = cx.anims.toggle("logo_swap", 0, logo_hover, rate::QUICKER);
@@ -2737,7 +3670,11 @@ fn draw_sidebar(cx: &mut Cx, state: &State, rect: Rect, open_t: f32, actions: &m
     let logo_a = if shut { 1.0 - swap } else { 1.0 };
 
     if logo_a > 0.0 {
-        cx.wordmark((34.0, 36.0), (32.0, 30.0), fade(Color::WHITE, logo_a));
+        cx.wordmark(
+            (rect.x + 34.0, 36.0),
+            (32.0, 30.0),
+            fade(Color::WHITE, logo_a),
+        );
     }
 
     if toggle_a > 0.0 {
@@ -2749,7 +3686,7 @@ fn draw_sidebar(cx: &mut Cx, state: &State, rect: Rect, open_t: f32, actions: &m
             if open_t > 0.5 { 0 } else { 1 },
             center,
             22.0,
-            fade(mix(theme::MUTED, theme::FG, hv), toggle_a),
+            fade(mix(theme::muted(), theme::fg(), hv), toggle_a),
         );
         if toggle_a > 0.5 && cx.clicked(toggle) {
             actions.push(Action::ToggleSidebar);
@@ -2761,52 +3698,85 @@ fn draw_sidebar(cx: &mut Cx, state: &State, rect: Rect, open_t: f32, actions: &m
     let top = 76.0;
     let pitch = 40.0;
     let item_h = 36.0;
+    // While the lyric page, a detail page (artist, album, ...) or the search results are up, they
+    // are the page: no tab is selected.
+    let on_tab = !state.lyrics_open && state.pages.top.is_none() && state.results_query.is_empty();
     for (index, tab) in Tab::ALL.iter().copied().enumerate() {
-        let item = Rect::new(12.0, top + index as f32 * pitch, item_w, item_h);
-        let hover = cx.over_clickable(item);
-        let hv = cx.anims.toggle("tab_hv", index as u32, hover, rate::SNAP);
-        // While the lyric page, a detail page (artist, album, ...) or the search results are up,
-        // they are the page: no tab is selected.
-        let selected = tab == state.tab
-            && !state.lyrics_open
-            && state.pages.top.is_none()
-            && state.results_query.is_empty();
-
-        if selected {
-            cx.draw().round_rect(item, 11.0, theme::PANEL_SELECT);
-        } else {
-            cx.draw().round_rect(item, 11.0, mix(theme::PANEL, theme::PANEL_HOVER, hv));
-        }
-
-        let color = mix(theme::MUTED, theme::FG, if selected { 1.0 } else { hv });
-        cx.icon(tab.icon(), (34.0, item.y + item_h * 0.5), 19.0, color);
-        cx.clip(item);
-        cx.ui.label(
-            Rect::new(52.0, item.y, 150.0, item.h),
-            tab.label(),
-            dream::ui::widgets::LabelStyle::new(FontId(2))
-                .size(13.0)
-                .color(fade(color, label_a))
-                .align(Align::Left)
-                .vcenter(true),
-        );
-        cx.unclip();
-        if cx.clicked(item) {
+        let item = Rect::new(rect.x + 12.0, top + index as f32 * pitch, item_w, item_h);
+        let selected = on_tab && tab == state.tab;
+        if sidebar_item(cx, item, tab, selected, label_a, index as u32) {
             actions.push(Action::Tab(tab));
         }
     }
+    // Settings lives at the foot of the sidebar, above the player bar, away from the destinations.
+    let item = Rect::new(rect.x + 12.0, rect.h - 48.0, item_w, item_h);
+    let selected = on_tab && state.tab == Tab::Settings;
+    if sidebar_item(cx, item, Tab::Settings, selected, label_a, 2) {
+        actions.push(Action::Tab(Tab::Settings));
+    }
+}
+
+/// One sidebar destination: a pill when chosen, a wash under the pointer, the icon fixed at x = 34
+/// so it never moves while the sidebar folds. Returns whether it was pressed.
+fn sidebar_item(cx: &mut Cx, item: Rect, tab: Tab, selected: bool, label_a: f32, key: u32) -> bool {
+    let has_bg = cx.gpu.background.is_some();
+    let hover = cx.over_clickable(item);
+    let hv = cx.anims.toggle("tab_hv", key, hover, rate::SNAP);
+    if selected {
+        let fill = if has_bg {
+            fade(theme::panel_select(), 0.72)
+        } else {
+            theme::panel_select()
+        };
+        cx.draw().round_rect(item, 11.0, fill);
+    } else if has_bg {
+        if hv > 0.005 {
+            cx.draw()
+                .round_rect(item, 11.0, fade(theme::panel_hover(), hv * 0.65));
+        }
+    } else {
+        cx.draw()
+            .round_rect(item, 11.0, mix(theme::panel(), theme::panel_hover(), hv));
+    }
+    let color = mix(theme::muted(), theme::fg(), if selected { 1.0 } else { hv });
+    cx.icon(
+        tab.icon(),
+        (item.x + 22.0, item.y + item.h * 0.5),
+        19.0,
+        color,
+    );
+    cx.clip(item);
+    cx.ui.label(
+        Rect::new(item.x + 40.0, item.y, 150.0, item.h),
+        tab.label(),
+        dream::ui::widgets::LabelStyle::new(FontId(2))
+            .size(13.0)
+            .color(fade(color, label_a))
+            .align(Align::Left)
+            .vcenter(true),
+    );
+    cx.unclip();
+    cx.clicked(item)
 }
 
 // ---------------------------------------------------------------------------------------------
 // Caption
 // ---------------------------------------------------------------------------------------------
 
-/// The window's own minimise and close buttons, top right. There is no OS title bar, so the app
+/// The window's own minimise, fullscreen and close buttons, top right. There is no OS title bar, so the app
 /// draws them in its own greys. No shared container or group hover: each button only lifts a step
 /// under the pointer.
-fn draw_caption(cx: &mut Cx, rect: Rect, actions: &mut Vec<Action>) {
+fn draw_caption(cx: &mut Cx, rect: Rect, fullscreen: bool, actions: &mut Vec<Action>) {
     let buttons = [
         (Icon::Minus, WindowRequest::Minimize),
+        (
+            if fullscreen {
+                Icon::ExitFullscreen
+            } else {
+                Icon::Fullscreen
+            },
+            WindowRequest::ToggleFullscreen,
+        ),
         (Icon::X, WindowRequest::Close),
     ];
     for (index, (icon, request)) in buttons.into_iter().enumerate() {
@@ -2817,15 +3787,27 @@ fn draw_caption(cx: &mut Cx, rect: Rect, actions: &mut Vec<Action>) {
             rect.h,
         );
         let hover = cx.over_clickable(button);
-        let hv = cx.anims.toggle("caption_btn", index as u32, hover, rate::SNAP);
-        // Close turns its glyph red on hover; both buttons keep the grey container behind them.
+        let hv = cx
+            .anims
+            .toggle("caption_btn", index as u32, hover, rate::SNAP);
+        // Close turns its glyph red on hover; the buttons keep the grey container behind them.
         let is_close = matches!(request, WindowRequest::Close);
         if hv > 0.0 {
-            let lit = Rect::new(button.x + 3.0, button.y + 3.0, button.w - 6.0, button.h - 6.0);
-            cx.draw().round_rect(lit, 8.0, fade(theme::PANEL_PRESS, hv));
+            let lit = Rect::new(
+                button.x + 3.0,
+                button.y + 3.0,
+                button.w - 6.0,
+                button.h - 6.0,
+            );
+            cx.draw()
+                .round_rect(lit, 8.0, fade(theme::panel_press(), hv));
         }
-        let hot = if is_close { theme::CLOSE_RED } else { theme::FG };
-        let color = mix(theme::MUTED, hot, hv);
+        let hot = if is_close {
+            theme::CLOSE_RED
+        } else {
+            theme::fg()
+        };
+        let color = mix(theme::muted(), hot, hv);
         let center = (button.x + button.w * 0.5, button.y + button.h * 0.5);
         cx.icon(icon, center, 16.0, color);
         if cx.clicked(button) {
@@ -2856,18 +3838,23 @@ fn draw_search(cx: &mut Cx, state: &mut State, rect: Rect) {
     // it. The wash is kept well under opaque so the blur stays readable; the grey is dark enough to
     // sit on black. (The wash is a palette grey: white at low alpha blends in linear light and reads
     // far brighter on screen than its alpha suggests.)
-    cx.draw().backdrop_rounded(rect, Color::rgb(0xff, 0xff, 0xff), rect.h * 0.5);
-    // The tint is the sidebar's selected-pill grey, brightening one step toward its press grey on focus.
+    cx.draw()
+        .backdrop_rounded(rect, Color::rgb(0xff, 0xff, 0xff), rect.h * 0.5);
+    // The tint matches the sidebar and player bar (`theme::panel()`), brightening on hover/focus,
+    // without using the accent colour.
     cx.draw().round_rect(
         rect,
         rect.h * 0.5,
-        fade(mix(theme::PANEL_SELECT, theme::PANEL_PRESS, lift), 0.5 + 0.1 * lift),
+        fade(
+            mix(theme::panel(), theme::panel_press(), lift),
+            0.62 + 0.12 * lift,
+        ),
     );
     cx.icon(
         Icon::Search,
         (rect.x + 28.0, rect.y + rect.h * 0.5),
         19.0,
-        mix(theme::MUTED, theme::FG, focus_t),
+        mix(theme::muted(), theme::fg(), focus_t),
     );
 
     let clear = Rect::new(rect.x + rect.w - 42.0, rect.y + 9.0, 28.0, 28.0);
@@ -2879,14 +3866,14 @@ fn draw_search(cx: &mut Cx, state: &mut State, rect: Rect) {
     }
     let mut style = TextFieldStyle::new(cx.font);
     style.size = 15.5;
-    style.text = theme::FG;
+    style.text = theme::fg();
     style.normal = Color::TRANSPARENT;
     style.hover = Color::TRANSPARENT;
-    style.accent = theme::FG;
+    style.accent = theme::fg();
     style.selection_alpha = 56;
     style.corner_radius = 0.0;
     style.border_width = 0.0;
-    style.caret = theme::FG;
+    style.caret = theme::fg();
     style.caret_width = 1.5;
     style.caret_inset = 13.0;
     // Selection highlight spans the same height as the caret, so the two line up.
@@ -2895,13 +3882,13 @@ fn draw_search(cx: &mut Cx, state: &mut State, rect: Rect) {
     cx.ui.text_field("search", field, &mut state.query, style);
 
     if let (false, Some(ghost)) = (typed, state.search_ghost.as_deref()) {
-        cx.text(field, ghost, 15.5, theme::FG, Align::Left);
+        cx.text(field, ghost, 15.5, theme::fg(), Align::Left);
     } else if !typed {
         cx.text(
             field,
             "Search songs and artists",
             15.5,
-            fade(theme::MUTED, 1.0 - 0.35 * focus_t),
+            fade(theme::muted(), 1.0 - 0.35 * focus_t),
             Align::Left,
         );
     }
@@ -2918,10 +3905,15 @@ fn draw_search(cx: &mut Cx, state: &mut State, rect: Rect) {
             cx.draw().round_rect(
                 Rect::new(center.0 - 14.0, center.1 - 14.0, 28.0, 28.0),
                 14.0,
-                theme::RAISED_TOP,
+                theme::raised_top(),
             );
         }
-        cx.icon(Icon::X, center, 16.0, if hovered { theme::FG } else { theme::MUTED });
+        cx.icon(
+            Icon::X,
+            center,
+            16.0,
+            if hovered { theme::fg() } else { theme::muted() },
+        );
         if hovered && cx.pointer.pressed {
             state.query.clear();
             cx.ui.set_focus("search");
@@ -2944,7 +3936,10 @@ fn page(
     cx.clip(main);
 
     if state.lyrics_open {
+        let blocked = cx.blocked;
+        cx.blocked |= state.theater;
         lyrics_page(cx, state, track, main, now, actions);
+        cx.blocked = blocked;
         cx.unclip();
         return;
     }
@@ -2978,6 +3973,7 @@ fn page(
 
     match state.tab {
         Tab::Library => collection_page(cx, state, track, main, view, actions),
+        Tab::Settings => settings_page(cx, state, view, actions),
         Tab::Queue => {
             if state.playlist.queue.is_empty() {
                 empty_state(
@@ -2989,9 +3985,23 @@ fn page(
                 );
             } else {
                 // Queue rows are always fully shown: no stagger on tab switch.
-                let rows: Vec<Row> =
-                    state.playlist.queue.iter().map(|hit| Row::from(hit, &state.lengths)).collect();
-                track_list(cx, track, &rows, view, "queue_list", 4000, f32::INFINITY, true, actions);
+                let rows: Vec<Row> = state
+                    .playlist
+                    .queue
+                    .iter()
+                    .map(|hit| Row::from(hit, &state.lengths))
+                    .collect();
+                track_list(
+                    cx,
+                    track,
+                    &rows,
+                    view,
+                    "queue_list",
+                    4000,
+                    f32::INFINITY,
+                    true,
+                    actions,
+                );
             }
         }
     }
@@ -3021,11 +4031,15 @@ fn collection_page(
     // The lists sit side by side and the page slides between them: `at` is which one is centred,
     // moving on a spring toward the chosen tab, so switching again mid-slide turns around smoothly.
     let target = state.collection_tab;
-    let at = cx.anims.spring("collection_slide", 0, target.index() as f32, 380.0);
+    let at = cx
+        .anims
+        .spring("collection_slide", 0, target.index() as f32, 380.0);
     // The scrollbars are hidden for the whole slide, then fade back in quickly as it lands. The
     // spring always tracks "not sliding", so it is already rising when the slide ends.
     let sliding = (at - target.index() as f32).abs() > 0.01;
-    let bar_a = cx.anims.toggle("collection_bar", 0, !sliding, rate::QUICKER);
+    let bar_a = cx
+        .anims
+        .toggle("collection_bar", 0, !sliding, rate::QUICKER);
     let bar_a = if sliding { 0.0 } else { bar_a };
     for tab in CollectionTab::ALL {
         let dx = (tab.index() as f32 - at) * view.w;
@@ -3033,7 +4047,16 @@ fn collection_page(
             continue;
         }
         let shift = |r: Rect| Rect::new(r.x + dx, r.y, r.w, r.h);
-        collection_list(cx, state, track, tab, shift(main), shift(view), bar_a, actions);
+        collection_list(
+            cx,
+            state,
+            track,
+            tab,
+            shift(main),
+            shift(view),
+            bar_a,
+            actions,
+        );
     }
     // The pills are drawn once, apart from the lists that slide, so they never move or clip with
     // them. They ride the chosen list's scroll, as they did when they were part of it.
@@ -3044,7 +4067,14 @@ fn collection_page(
     };
     let offset = cx.ui.scroll_state(id).0;
     let labels = CollectionTab::ALL.map(|tab| (tab.label(), tab.icon()));
-    if let Some(index) = tab_pills(cx, &labels, target.index(), view.x + 8.0, PAGE_TOP - offset, &COLLECTION_PILLS) {
+    if let Some(index) = tab_pills(
+        cx,
+        &labels,
+        target.index(),
+        view.x + 8.0,
+        PAGE_TOP - offset,
+        &COLLECTION_PILLS,
+    ) {
         actions.push(Action::CollectionTab(CollectionTab::ALL[index]));
     }
 }
@@ -3062,10 +4092,8 @@ fn collection_list(
     bar_alpha: f32,
     actions: &mut Vec<Action>,
 ) {
-    // The lists scroll below the caption buttons, as the detail pages do, so their scrollbar never
-    // runs up behind them. Their content is measured from that scroll area's top.
-    let view = below_caption(view);
-    let content_top = PAGE_TOP + COLLECTION_TAB_H + COLLECTION_TAB_GAP - SCROLL_TOP;
+    // Keep the initial clearance inside the content so it scrolls away with the list.
+    let content_top = PAGE_TOP + COLLECTION_TAB_H + COLLECTION_TAB_GAP;
 
     // How many entries the list has, and what to say when it has none.
     let count = match tab {
@@ -3075,9 +4103,21 @@ fn collection_list(
     };
     if count == 0 {
         let (icon, title, hint) = match tab {
-            CollectionTab::Songs => (Icon::Music, "No saved songs", "Press + on a song to keep it here. It is downloaded to this device."),
-            CollectionTab::Artists => (Icon::Mic, "No saved artists", "Press + on an artist's page to keep them here."),
-            CollectionTab::Albums => (Icon::Disc, "No saved albums", "Press + on an album to save every song on it."),
+            CollectionTab::Songs => (
+                Icon::Music,
+                "No saved songs",
+                "Press + on a song to keep it here. It is downloaded to this device.",
+            ),
+            CollectionTab::Artists => (
+                Icon::Mic,
+                "No saved artists",
+                "Press + on an artist's page to keep them here.",
+            ),
+            CollectionTab::Albums => (
+                Icon::Disc,
+                "No saved albums",
+                "Press + on an album to save every song on it.",
+            ),
         };
         empty_state(cx, main, icon, title, hint);
         return;
@@ -3097,7 +4137,8 @@ fn collection_list(
 
     match tab {
         CollectionTab::Songs => {
-            let first = (((offset - content_top) / theme::ROW_H).floor().max(0.0) as usize).saturating_sub(2);
+            let first = (((offset - content_top) / theme::ROW_H).floor().max(0.0) as usize)
+                .saturating_sub(2);
             let last = (first + (view.h / theme::ROW_H).ceil() as usize + 6).min(count);
             let ids: Vec<String> = state.library.song_list(&state.ghosts)[first..last].to_vec();
             let rows: Vec<Row> = ids
@@ -3127,7 +4168,8 @@ fn collection_list(
         CollectionTab::Artists | CollectionTab::Albums => {
             let columns = tile_columns(view.w - 44.0);
             let step = TILE + TILE_TEXT_H + TILE_GAP;
-            let first_row = (((offset - content_top) / step).floor().max(0.0) as usize).saturating_sub(1);
+            let first_row =
+                (((offset - content_top) / step).floor().max(0.0) as usize).saturating_sub(1);
             let rows_shown = (view.h / step).ceil() as usize + 3;
             let from = (first_row * columns).min(count);
             let to = ((first_row + rows_shown) * columns).min(count);
@@ -3135,9 +4177,18 @@ fn collection_list(
             let tiles: Vec<(String, String, Option<String>, Detail)> = match tab {
                 CollectionTab::Artists => state.library.vault.list()[from..to]
                     .iter()
-                    .map(|a| (a.name.clone(), "Artist".to_owned(), a.thumbnail.clone(), Detail::Artist(a.id.clone())))
+                    .map(|a| {
+                        (
+                            a.name.clone(),
+                            "Artist".to_owned(),
+                            a.thumbnail.clone(),
+                            Detail::Artist(a.id.clone()),
+                        )
+                    })
                     .collect(),
-                _ => state.library.albums_between(from, to)
+                _ => state
+                    .library
+                    .albums_between(from, to)
                     .into_iter()
                     .map(|a| {
                         (
@@ -3225,8 +4276,11 @@ fn tab_pills(
     // The chosen pill is a single shape that glides from tab to tab: position and width are springs.
     let pill_x = cx.anims.spring(keys.glide_x, 0, lefts[current] - x, 700.0) + x;
     let pill_w = cx.anims.spring(keys.glide_w, 0, widths[current], 700.0);
-    cx.draw()
-        .round_rect(Rect::new(pill_x, y, pill_w, COLLECTION_TAB_H), COLLECTION_TAB_H * 0.5, theme::PRESS);
+    cx.draw().round_rect(
+        Rect::new(pill_x, y, pill_w, COLLECTION_TAB_H),
+        COLLECTION_TAB_H * 0.5,
+        theme::press(),
+    );
 
     let mut picked = None;
     for (index, (label, icon)) in tabs.iter().enumerate() {
@@ -3236,10 +4290,23 @@ fn tab_pills(
         let hv = cx.anims.toggle(keys.hover, index as u32, hover, rate::SNAP);
         let on = cx.anims.toggle(keys.on, index as u32, selected, rate::SNAP);
         // Hover only warms the text and icon; the container belongs to the chosen tab alone.
-        let ink = mix(theme::MUTED, theme::FG, hv.max(on));
-        cx.icon(*icon, (rect.x + 17.0 + COLLECTION_TAB_ICON * 0.5, rect.y + rect.h * 0.5), COLLECTION_TAB_ICON, ink);
+        let ink = mix(theme::muted(), theme::fg(), hv.max(on));
+        cx.icon(
+            *icon,
+            (
+                rect.x + 17.0 + COLLECTION_TAB_ICON * 0.5,
+                rect.y + rect.h * 0.5,
+            ),
+            COLLECTION_TAB_ICON,
+            ink,
+        );
         cx.text(
-            Rect::new(rect.x + 17.0 + COLLECTION_TAB_ICON + 8.0, rect.y, rect.w, rect.h),
+            Rect::new(
+                rect.x + 17.0 + COLLECTION_TAB_ICON + 8.0,
+                rect.y,
+                rect.w,
+                rect.h,
+            ),
             label,
             13.5,
             ink,
@@ -3255,9 +4322,10 @@ fn tab_pills(
 /// Type size for every synced line. It never changes: the line being sung is lit by colour alone, so
 /// its wrapping and size stay put as it becomes active.
 const LYRIC_SIZE: f32 = 22.0;
+const LYRIC_ACTIVE_SIZE: f32 = 26.0;
 /// The emphasis (a line lighting up as it is sung) is a spring like the rest of the UI, a little
 /// quicker than the `PANEL` preset.
-const LYRIC_RATE: f32 = 640.0;
+const LYRIC_RATE: f32 = 360.0;
 const LYRIC_LEADING: f32 = 1.2;
 const LYRIC_GAP: f32 = 18.0;
 const PAUSE_H: f32 = 30.0;
@@ -3266,7 +4334,6 @@ const PLAIN_LEADING: f32 = 1.4;
 const PLAIN_GAP: f32 = 8.0;
 const STANZA_H: f32 = 24.0;
 /// The lyric column is centred, never wider than this, and keeps this much room at each side.
-const LYRIC_COLUMN_MAX: f32 = 640.0;
 const LYRIC_COLUMN_PAD: f32 = 40.0;
 /// Once the reader has scrolled the lyrics, the page keeps its place until they have been still this
 /// long, then goes back to the line being sung.
@@ -3298,7 +4365,7 @@ const VISUALIZER_AUDIBLE: f32 = 0.02;
 /// A colour as it looks `amount` of the way out of the page. It is mixed from black, not blended
 /// with alpha, so it stays opaque and sharp.
 fn revealed(base: Color, amount: f32) -> Color {
-    mix(theme::BG, base, amount)
+    mix(theme::bg(), base, amount)
 }
 
 /// How far a line has arrived `age` seconds after its set appeared, 0 to 1.
@@ -3308,8 +4375,32 @@ fn arrival(age: f32, index: usize) -> f32 {
 
 /// The centred column the lyrics are set in: its left edge and width.
 fn lyric_column(view: Rect) -> (f32, f32) {
-    let width = (view.w - 2.0 * LYRIC_COLUMN_PAD).clamp(120.0, LYRIC_COLUMN_MAX);
+    let width = (view.w - 2.0 * LYRIC_COLUMN_PAD).max(120.0);
     (view.x + (view.w - width) * 0.5, width)
+}
+
+/// Pre-wrap a lyric line at `size` for `max_w` using explicit newlines so it keeps the same
+/// line-by-line breaks regardless of animated font size.
+fn wrap_lyric_lines(cx: &mut Cx, text: &str, size: f32, max_w: f32) -> String {
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        let mut current = String::new();
+        for word in para.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(word);
+            } else {
+                let candidate = format!("{current} {word}");
+                if cx.text_width(&candidate, size) <= max_w {
+                    current = candidate;
+                } else {
+                    out.push(current);
+                    current = word.to_owned();
+                }
+            }
+        }
+        out.push(current);
+    }
+    out.join("\n")
 }
 
 /// The sound behind the lyric page: the spectrum of what is playing as rounded bars along the bottom,
@@ -3320,7 +4411,9 @@ fn lyric_visualizer(cx: &mut Cx, state: &mut State, track: Option<&TrackView>, m
     let dt = cx.anims.dt();
     let levels = track.map_or([0.0; 3], |t| t.levels);
     let loudest = levels.iter().copied().fold(0.0_f32, f32::max);
-    let audible = track.is_some_and(|t| !t.paused) && loudest > VISUALIZER_AUDIBLE;
+    let paused = track.is_some_and(|t| t.paused);
+    let muted = state.volume_before_mute.is_some();
+    let audible = track.is_some_and(|t| !t.paused) && (muted || loudest > VISUALIZER_AUDIBLE);
 
     // Feed the analyser: the real output when there is one, a still shape for `--shot`.
     let rate = state
@@ -3332,11 +4425,17 @@ fn lyric_visualizer(cx: &mut Cx, state: &mut State, track: Option<&TrackView>, m
         None if audible && state.demo_track.is_some() => {
             state.spectrum.set(demo_spectrum());
         }
+        _ if paused => {}
         _ => state.spectrum.decay(dt),
     }
-    state.spectrum_live = state.spectrum.active();
+    state.spectrum_live = !paused && (audible || state.spectrum.active());
 
-    let show = cx.anims.toggle("lyric_visualizer", 0, audible, rate::PANEL);
+    let show = cx
+        .anims
+        .toggle("lyric_visualizer", 0, audible || paused, rate::PANEL);
+    let tint = cx
+        .anims
+        .toggle("lyric_visualizer_quiet", 0, paused || muted, rate::PANEL);
     if show <= 0.002 {
         return;
     }
@@ -3349,7 +4448,30 @@ fn lyric_visualizer(cx: &mut Cx, state: &mut State, track: Option<&TrackView>, m
     let radius = bar_w * 0.5;
     let max_h = main.h * VISUALIZER_HEIGHT;
     let base = (main.y + main.h - VISUALIZER_BASE).round();
-    let tone = |amount: f32| mix(theme::BG, theme::FG, amount * show);
+    let cover_color = track
+        .and_then(|t| t.thumbnail.as_deref())
+        .and_then(|url| cx.gpu.cover_color(url));
+    let viz_color = match theme::visualizer() {
+        theme::VisualizerColor::AlbumArt => cover_color,
+        theme::VisualizerColor::Accent => Some(theme::accent()),
+        theme::VisualizerColor::Custom(c) => Some(c),
+    };
+    let bar_colour = |level: f32, edge: f32| -> Color {
+        if let Some(c) = viz_color {
+            let lit = mix(mix(c, Color::WHITE, 0.14 * level), theme::bg(), tint);
+            let alpha = ((0.42 + 0.46 * level) * edge * show * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            Color::rgba(lit.r, lit.g, lit.b, alpha)
+        } else {
+            let amount = VISUALIZER_QUIET + (VISUALIZER_LOUD - VISUALIZER_QUIET) * level;
+            mix(
+                theme::bg(),
+                theme::fg(),
+                amount * edge * show * (1.0 - tint),
+            )
+        }
+    };
 
     let draw = cx.draw();
     for side in [-1.0_f32, 1.0] {
@@ -3364,10 +4486,8 @@ fn lyric_visualizer(cx: &mut Cx, state: &mut State, track: Option<&TrackView>, m
             // The outer bands dim toward the page edges, so the row has no hard ends.
             let reach = band as f32 / (bands - 1) as f32;
             let edge = 1.0 - 0.55 * ease_out(((reach - 0.55) / 0.45).max(0.0)).powi(2);
-            let amount = VISUALIZER_QUIET + (VISUALIZER_LOUD - VISUALIZER_QUIET) * level;
-            let colour = tone(amount * edge);
+            let colour = bar_colour(level, edge);
             draw.round_rect(Rect::new(x, base - h, bar_w, h), radius, colour);
-
         }
     }
 }
@@ -3402,7 +4522,13 @@ fn lyrics_page(
         .as_ref()
         .filter(|v| track.is_some_and(|t| t.video_id == v.video_id));
     match track {
-        None => empty_state(cx, main, Icon::Music, "Nothing playing", "Play a song to see its lyrics."),
+        None => empty_state(
+            cx,
+            main,
+            Icon::Music,
+            "Nothing playing",
+            "Play a song to see its lyrics.",
+        ),
         Some(track) => match shown {
             // Still asking the providers: nothing yet, rather than a placeholder that flickers.
             None => {}
@@ -3492,13 +4618,23 @@ fn lyrics_synced(
         };
     }
 
-    let slots: Vec<f32> = lines
+    let wrapped: Vec<String> = lines
         .iter()
         .map(|line| {
             if line.text.is_empty() {
+                String::new()
+            } else {
+                wrap_lyric_lines(cx, &line.text, LYRIC_ACTIVE_SIZE, width)
+            }
+        })
+        .collect();
+    let slots: Vec<f32> = wrapped
+        .iter()
+        .map(|text| {
+            if text.is_empty() {
                 PAUSE_H
             } else {
-                cx.text_block_height(width, &line.text, LYRIC_SIZE, LYRIC_LEADING)
+                cx.text_block_height(width, text, LYRIC_ACTIVE_SIZE, LYRIC_LEADING)
             }
         })
         .collect();
@@ -3517,8 +4653,17 @@ fn lyrics_synced(
         None => 0.0,
     };
 
-    // Once the reader has been still for a while, the page takes its place back on the line being sung.
-    if follow.reader && follow.scrolled_at.is_none_or(|at| since(now, at) >= LYRIC_IDLE_SECS) {
+    let line_changed = active != follow.last_active;
+    follow.last_active = active;
+
+    // Once the reader has been still for a while, or when a new lyric becomes active after a
+    // short pause since the last scroll, the page takes its place back on the line being sung.
+    if follow.reader
+        && (follow
+            .scrolled_at
+            .is_none_or(|at| since(now, at) >= LYRIC_IDLE_SECS)
+            || (line_changed && follow.scrolled_at.is_none_or(|at| since(now, at) >= 1.5)))
+    {
         follow.reader = false;
     }
     if !follow.reader {
@@ -3528,15 +4673,25 @@ fn lyrics_synced(
             ScrollBehavior::Instant
         };
         follow.placed = true;
-        cx.ui.scroll_to("lyrics", ScrollToOptions { top: target, behavior });
+        cx.ui.scroll_to(
+            "lyrics",
+            ScrollToOptions {
+                top: target,
+                behavior,
+            },
+        );
     }
     let body = cx.ui.scroll_begin("lyrics", view, content_h);
 
     // Every line's spring runs each frame, even one that is off screen, so it is right when it returns.
     let emphasis: Vec<f32> = (0..lines.len())
         .map(|i| {
-            cx.anims
-                .toggle("lyric_on", reveal.key + i as u32, active == Some(i), LYRIC_RATE)
+            cx.anims.toggle(
+                "lyric_on",
+                reveal.key + i as u32,
+                active == Some(i),
+                LYRIC_RATE,
+            )
         })
         .collect();
 
@@ -3545,22 +4700,59 @@ fn lyrics_synced(
             continue;
         }
         let is_active = active == Some(i);
-        let text_h = cx.text_block_height(width, &line.text, LYRIC_SIZE, LYRIC_LEADING);
+        let size = LYRIC_SIZE + (LYRIC_ACTIVE_SIZE - LYRIC_SIZE) * emphasis[i];
+        let zoom = size / LYRIC_ACTIVE_SIZE;
+        let text = &wrapped[i];
         let arrived = arrival(reveal.age, i);
-        // Centred in its slot, so a line that grows or shrinks stays on the middle of its place.
-        let top = body.y + tops[i] + (slots[i] - text_h) * 0.5 + (1.0 - arrived) * ENTER_RISE;
-        if top + text_h < view.y || top > view.y + view.h {
+        let slot_top = body.y + tops[i] + (1.0 - arrived) * ENTER_RISE;
+        if slot_top + slots[i] < view.y || slot_top > view.y + view.h {
             continue;
         }
-        let rect = Rect::new(x, top, width, text_h);
-        let over = cx.over_clickable(rect);
-        let hv = cx
-            .anims
-            .toggle("lyric_hover", reveal.key + i as u32, over && !is_active, rate::SNAP);
-        let rest = mix(theme::FAINT, theme::FG, emphasis[i]);
-        let colour = revealed(mix(rest, theme::MUTED, hv), arrived);
-        cx.text_block(rect, &line.text, LYRIC_SIZE, colour, LYRIC_LEADING, Align::Center);
-        if over && cx.clicked(rect) && playhead.duration > 0.0 {
+        let rect = Rect::new(x, slot_top, width, slots[i]);
+        let text_w = (text
+            .lines()
+            .map(|l| cx.text_width(l, LYRIC_ACTIVE_SIZE))
+            .fold(0.0_f32, f32::max)
+            * zoom)
+            .min(width);
+        let text_h = slots[i] * zoom;
+        let hit_top = slot_top + (slots[i] - text_h) * 0.5;
+        let hit_rect = Rect::new(x + (width - text_w) * 0.5, hit_top, text_w, text_h);
+        let edge_fade = if is_active {
+            1.0
+        } else {
+            let view_mid = view.y + view.h * 0.5;
+            let line_mid = slot_top + slots[i] * 0.5;
+            let fade_radius = (view.h * 0.32).max(1.0);
+            let dist = ((line_mid - view_mid).abs() / fade_radius).clamp(0.0, 1.0);
+            1.0 - dist * dist
+        };
+        let in_view = view.contains(cx.pointer.pos) && cx.pointer.pos.1 >= theme::TOP_H;
+        let over = edge_fade > 0.0 && in_view && cx.over_clickable(hit_rect);
+        let hv = cx.anims.toggle(
+            "lyric_hover",
+            reveal.key + i as u32,
+            over && !is_active,
+            rate::SNAP,
+        );
+        let lyrics_fg = theme::lyrics_fg();
+        let lyrics_dim = mix(lyrics_fg, theme::bg(), 0.62);
+        let rest = mix(lyrics_dim, lyrics_fg, emphasis[i]);
+        let colour = fade(
+            revealed(mix(rest, mix(lyrics_fg, theme::muted(), 0.45), hv), arrived),
+            edge_fade,
+        );
+        lyric_text_outlined(
+            cx,
+            rect,
+            text,
+            LYRIC_ACTIVE_SIZE,
+            colour,
+            LYRIC_LEADING,
+            emphasis[i],
+            zoom,
+        );
+        if over && cx.clicked(hit_rect) && playhead.duration > 0.0 {
             let fraction = (line.time_ms as f32 / 1000.0 / playhead.duration).clamp(0.0, 1.0);
             actions.push(Action::Seek(fraction));
             // A click asks to be synced to this line, so the page takes its place back at once.
@@ -3603,29 +4795,64 @@ fn lyrics_plain(cx: &mut Cx, lines: &[String], reveal: Reveal, view: Rect) {
             width,
             heights[i],
         );
-        let colour = revealed(theme::FG, arrived);
-        cx.text_block(rect, line, PLAIN_SIZE, colour, PLAIN_LEADING, Align::Center);
+        let colour = revealed(theme::lyrics_fg(), arrived);
+        lyric_text_outlined(cx, rect, line, PLAIN_SIZE, colour, PLAIN_LEADING, 1.0, 1.0);
     }
     cx.ui.scroll_end();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lyric_text_outlined(
+    cx: &mut Cx,
+    rect: Rect,
+    text: &str,
+    size: f32,
+    color: Color,
+    leading: f32,
+    outline_strength: f32,
+    zoom: f32,
+) {
+    let alpha = (color.a as f32 / 255.0) * outline_strength.clamp(0.0, 1.0) * 0.55;
+    if alpha > 0.01 {
+        let outline = fade(theme::lyrics_outline(), alpha);
+        for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+            let offset = Rect::new(rect.x + dx, rect.y + dy, rect.w, rect.h);
+            if (zoom - 1.0).abs() > 1e-4 {
+                cx.text_block_scaled(offset, text, size, outline, leading, Align::Center, zoom);
+            } else {
+                cx.text_block(offset, text, size, outline, leading, Align::Center);
+            }
+        }
+    }
+    if (zoom - 1.0).abs() > 1e-4 {
+        cx.text_block_scaled(rect, text, size, color, leading, Align::Center, zoom);
+    } else {
+        cx.text_block(rect, text, size, color, leading, Align::Center);
+    }
 }
 
 /// An icon, title and hint, centred in `main`, for when there are no lyrics to show.
 fn empty_state(cx: &mut Cx, main: Rect, icon: Icon, title: &str, hint: &str) {
     let center_x = main.x + main.w * 0.5;
     let y = main.h * 0.5 - 8.0;
-    cx.icon(icon, (center_x, y - 54.0), 38.0, theme::FAINT);
+    cx.icon(icon, (center_x, y - 54.0), 38.0, theme::faint());
     cx.text(
         Rect::new(main.x, y - 16.0, main.w, 28.0),
         title,
         18.0,
-        theme::FG,
+        theme::fg(),
         Align::Center,
     );
     cx.text_fit(
-        Rect::new(main.x + theme::PAGE_PAD, y + 14.0, main.w - theme::PAGE_PAD * 2.0, 22.0),
+        Rect::new(
+            main.x + theme::PAGE_PAD,
+            y + 14.0,
+            main.w - theme::PAGE_PAD * 2.0,
+            22.0,
+        ),
         hint,
         13.0,
-        theme::MUTED,
+        theme::muted(),
         Align::Center,
     );
 }
@@ -3669,14 +4896,29 @@ fn track_list(
     actions: &mut Vec<Action>,
 ) {
     // The rows start below the floating search bar's row when at rest; scrolled, they run under it.
-    // The scroll area starts below the caption buttons, so its scrollbar never runs up behind them.
-    // The rows still rest at the same place: their top spacing is shortened by that same amount.
-    let view = below_caption(view);
-    let top = theme::TOP_H - SCROLL_TOP;
+    let top = theme::TOP_H;
     let content_h = top + rows.len() as f32 * theme::ROW_H + 24.0;
     let body = cx.ui.scroll_begin(scroll_id, view, content_h);
-    let play: fn(usize) -> Action = if queued { Action::PlayQueued } else { Action::Play };
-    track_rows(cx, track, rows, view, body, body.y + top, base, age, true, queued, play, 0, actions);
+    let play: fn(usize) -> Action = if queued {
+        Action::PlayQueued
+    } else {
+        Action::Play
+    };
+    track_rows(
+        cx,
+        track,
+        rows,
+        view,
+        body,
+        body.y + top,
+        base,
+        age,
+        true,
+        queued,
+        play,
+        0,
+        actions,
+    );
     cx.ui.scroll_end();
 }
 
@@ -3719,7 +4961,10 @@ fn track_rows(
         if let Some(done) = cx.queue_drag.filter(|_| !cx.pointer.down) {
             cx.queue_drag = None;
             if done.to != done.from {
-                actions.push(Action::MoveQueued { from: done.from, to: done.to });
+                actions.push(Action::MoveQueued {
+                    from: done.from,
+                    to: done.to,
+                });
             }
         }
     }
@@ -3750,12 +4995,19 @@ fn track_rows(
         }
         let y = y0 + (1.0 - enter) * 6.0;
         // 28 px of margin on the right keeps the scrollbar clear of the rows.
-        let pill = Rect::new(body.x, y + 4.0, (body.w - 28.0).max(0.0), theme::ROW_H - 8.0);
+        let pill = Rect::new(
+            body.x,
+            y + 4.0,
+            (body.w - 28.0).max(0.0),
+            theme::ROW_H - 8.0,
+        );
         let key = base + i as u32;
 
         let hovered = pointer_in_view && cx.over_clickable(pill);
         let hv = cx.anims.toggle("row", key, hovered, rate::SNAP);
-        let press = cx.anims.toggle("row_press", key, hovered && cx.pointer.down, rate::SNAP);
+        let press = cx
+            .anims
+            .toggle("row_press", key, hovered && cx.pointer.down, rate::SNAP);
         let playing = !queued && playing_id == Some(row.video_id);
         // A row from a list that does not carry the album's link can still fill it in later; a
         // row on an album page already knows its album from the page itself.
@@ -3765,15 +5017,18 @@ fn track_rows(
 
         // The playing row keeps a resting fill that brightens under the pointer.
         let wash = if playing {
-            fade(mix(theme::SELECT, theme::PRESS, hv * (0.5 + 0.5 * press)), a)
+            fade(
+                mix(theme::select(), theme::press(), hv * (0.5 + 0.5 * press)),
+                a,
+            )
         } else {
-            fade(mix(theme::HOVER, theme::PRESS, press), hv * a)
+            fade(mix(theme::hover(), theme::press(), press), hv * a)
         };
         // A dragged row is lifted: drawn in its own layer, over an opaque ground so the rows it
         // passes do not show through.
         let lift = dragged.then(|| cx.draw().set_layer(DRAG_LAYER));
         if dragged {
-            cx.draw().round_rect(pill, 10.0, fade(theme::RAISED, a));
+            cx.draw().round_rect(pill, 10.0, fade(theme::raised(), a));
         }
         cx.draw().round_rect(pill, 10.0, wash);
 
@@ -3801,18 +5056,23 @@ fn track_rows(
             let handle = Rect::new(pill.x, pill.y, HANDLE_W, pill.h);
             let grip_hover = pointer_in_view && cx.over_clickable(handle);
             let gv = cx.anims.toggle("queue_grip", key, grip_hover, rate::SNAP);
-            let grip = mix(mix(theme::FAINT, theme::MUTED, hv), theme::FG, gv);
+            let grip = mix(mix(theme::faint(), theme::muted(), hv), theme::fg(), gv);
             let grip_center = (handle.x + handle.w * 0.5, handle.y + handle.h * 0.5);
             cx.icon(Icon::GripVertical, grip_center, 16.0, fade(grip, a));
             handle_pressed = pointer_in_view && cx.clicked(handle);
             if handle_pressed && cx.queue_drag.is_none() {
-                cx.queue_drag = Some(QueueDrag { from: i, to: i, grab: cx.pointer.pos.1 - y0 });
+                cx.queue_drag = Some(QueueDrag {
+                    from: i,
+                    to: i,
+                    grab: cx.pointer.pos.1 - y0,
+                });
             }
 
             let trash_hover = pointer_in_view && cx.over_clickable(trash);
             let tv = cx.anims.toggle("queue_trash", key, trash_hover, rate::SNAP);
             if tv > 0.002 {
-                cx.draw().round_rect(trash, TRASH_R, fade(theme::CLOSE_RED, 0.16 * tv * a));
+                cx.draw()
+                    .round_rect(trash, TRASH_R, fade(theme::CLOSE_RED, 0.16 * tv * a));
             }
             cx.icon(Icon::Trash2, trash_center, 16.0, fade(theme::CLOSE_RED, a));
             trash_clicked = pointer_in_view && cx.clicked(trash);
@@ -3820,12 +5080,26 @@ fn track_rows(
 
         // With no cover the names start where one would have: on the page's left edge, level with
         // the album's own cover above them.
-        let text_x = if covers { cover.x + cover.w + 14.0 } else { cover.x };
+        let text_x = if covers {
+            cover.x + cover.w + 14.0
+        } else {
+            cover.x
+        };
         // Clear of the scrollbar, which floats in the right-hand margin. A queue row leaves room
         // for its remove button.
-        let end = if queued { trash.x - 12.0 } else { pill.x + pill.w - 16.0 };
+        let end = if queued {
+            trash.x - 12.0
+        } else {
+            pill.x + pill.w - 16.0
+        };
         let duration = Rect::new(end - 56.0, pill.y, 56.0, pill.h);
-        cx.text(duration, row.duration, 12.5, fade(theme::MUTED, a), Align::Right);
+        cx.text(
+            duration,
+            row.duration,
+            12.5,
+            fade(theme::muted(), a),
+            Align::Right,
+        );
 
         let tail = duration.x;
 
@@ -3837,14 +5111,22 @@ fn track_rows(
         // The save button sits right of the names, so the names stop short of it by its width and gap.
         let save_space = 14.0 + SAVE_ROW_R * 2.0;
         let full_w = (tail - 16.0 - text_x - save_space).max(40.0);
-        let title_w = if wide { (album_x - 20.0 - text_x - save_space).max(40.0) } else { full_w };
+        let title_w = if wide {
+            (album_x - 20.0 - text_x - save_space).max(40.0)
+        } else {
+            full_w
+        };
 
         // The save button sits just right of the song and artist names, not out at the far edge.
         let title_text_w = cx.text_width(row.title, 14.5);
         let meta_text_w = if wide {
             cx.text_width(&row.artist, 12.5)
         } else {
-            let sep = if row.artist.is_empty() || row.album.is_empty() { 0.0 } else { cx.text_width(ROW_SEP, 12.5) };
+            let sep = if row.artist.is_empty() || row.album.is_empty() {
+                0.0
+            } else {
+                cx.text_width(ROW_SEP, 12.5)
+            };
             cx.text_width(&row.artist, 12.5) + sep + cx.text_width(row.album, 12.5)
         };
         let names_w = title_text_w.max(meta_text_w).min(title_w);
@@ -3866,7 +5148,7 @@ fn track_rows(
             Rect::new(text_x, pill.y + 8.0, title_w, 22.0),
             row.title,
             14.5,
-            fade(theme::FG, a),
+            fade(theme::fg(), a),
             row.album_id.map(|id| Detail::Album(id.to_owned())),
         );
 
@@ -3919,7 +5201,7 @@ fn track_rows(
                     Rect::new(text_x + artist_w, meta_y, sep_w, 18.0),
                     ROW_SEP,
                     12.5,
-                    fade(theme::MUTED, a),
+                    fade(theme::muted(), a),
                     Align::Left,
                 );
             }
@@ -3928,7 +5210,12 @@ fn track_rows(
                 cx,
                 "link_album",
                 key,
-                Rect::new(album_text_x, meta_y, (text_x + full_w - album_text_x).max(0.0), 18.0),
+                Rect::new(
+                    album_text_x,
+                    meta_y,
+                    (text_x + full_w - album_text_x).max(0.0),
+                    18.0,
+                ),
                 row.album,
                 12.5,
                 a,
@@ -3943,7 +5230,10 @@ fn track_rows(
 
         // A right press on a row opens the track menu for it, at the pointer.
         if pointer_in_view && cx.right_clicked(pill) {
-            actions.push(Action::OpenMenu(TrackMenu { hit: row.song(), at: cx.pointer.pos }));
+            actions.push(Action::OpenMenu(TrackMenu {
+                hit: row.song(),
+                at: cx.pointer.pos,
+            }));
         }
 
         if save_clicked {
@@ -4007,18 +5297,35 @@ fn save_button(
     // the green grows.
     let t = cx
         .anims
-        .spring("save_fill", key, if saved { 1.0 } else { 0.0 }, SAVE_FILL_RATE)
+        .spring(
+            "save_fill",
+            key,
+            if saved { 1.0 } else { 0.0 },
+            SAVE_FILL_RATE,
+        )
         .clamp(0.0, 1.0);
 
-    let idle = mix(mix(theme::FAINT, theme::MUTED, warm), theme::FG, hv);
-    let square = Rect::new(center.0 - radius, center.1 - radius, radius * 2.0, radius * 2.0);
+    let idle = mix(mix(theme::faint(), theme::muted(), warm), theme::fg(), hv);
+    let def_p = theme::Palette::default();
+    let custom_theme = theme::accent() != def_p.accent || theme::bg() != def_p.bg;
+    let save_color = if custom_theme {
+        theme::accent()
+    } else {
+        SAVE_GREEN
+    };
+    let square = Rect::new(
+        center.0 - radius,
+        center.1 - radius,
+        radius * 2.0,
+        radius * 2.0,
+    );
     cx.draw().ring_arc(
         square,
         radius,
         1.5,
         -std::f32::consts::FRAC_PI_2,
         std::f32::consts::TAU,
-        fade(mix(idle, SAVE_GREEN, t), alpha),
+        fade(mix(idle, save_color, t), alpha),
     );
     if t > 0.003 {
         let r = radius * t;
@@ -4031,7 +5338,7 @@ fn save_button(
             r,
             -std::f32::consts::FRAC_PI_2,
             std::f32::consts::TAU,
-            fade(SAVE_GREEN, alpha),
+            fade(save_color, alpha),
         );
     }
     let glyph = ((radius * 1.3) / 2.0).round() * 2.0;
@@ -4041,7 +5348,12 @@ fn save_button(
         cx.icon(Icon::Plus, center, glyph, fade(idle, alpha * plus));
     }
     if check > 0.0 {
-        cx.icon(Icon::Check, center, glyph, fade(theme::ON_ACCENT, alpha * check));
+        cx.icon(
+            Icon::Check,
+            center,
+            glyph,
+            fade(theme::on_accent(), alpha * check),
+        );
     }
     live && cx.clicked(hit)
 }
@@ -4104,11 +5416,24 @@ fn track_menu_entries(state: &State, menu: &TrackMenu) -> Vec<MenuEntry> {
         }
     }
     if state.library.song_saved(&menu.hit.video_id) {
-        entries.push(MenuEntry { label: "Unsave", icon: Icon::Check, command: MenuCommand::Save });
+        entries.push(MenuEntry {
+            label: "Unsave",
+            icon: Icon::Check,
+            command: MenuCommand::Save,
+        });
     } else {
-        entries.push(MenuEntry { label: "Save", icon: Icon::Plus, command: MenuCommand::Save });
+        entries.push(MenuEntry {
+            label: "Save",
+            icon: Icon::Plus,
+            command: MenuCommand::Save,
+        });
     }
-    match state.playlist.queue.iter().position(|hit| hit.video_id == menu.hit.video_id) {
+    match state
+        .playlist
+        .queue
+        .iter()
+        .position(|hit| hit.video_id == menu.hit.video_id)
+    {
         Some(index) => entries.push(MenuEntry {
             label: "Remove from queue",
             icon: Icon::Trash2,
@@ -4142,16 +5467,18 @@ fn draw_track_menu(
     height: f32,
     actions: &mut Vec<Action>,
 ) {
-    let Some(menu) = state.menu.clone() else { return };
+    let Some(menu) = state.menu.clone() else {
+        return;
+    };
     let rect = menu_rect(&menu, entries.len(), width, height);
 
     let previous = cx.draw().set_layer(MENU_LAYER);
     // A thin edge in a lighter tone, then the face inside it.
-    cx.draw().round_rect(rect, 10.0, theme::TRACK);
+    cx.draw().round_rect(rect, 10.0, theme::track());
     cx.draw().round_rect(
         Rect::new(rect.x + 1.0, rect.y + 1.0, rect.w - 2.0, rect.h - 2.0),
         9.0,
-        theme::RAISED,
+        theme::raised(),
     );
 
     for (i, entry) in entries.iter().enumerate() {
@@ -4164,9 +5491,10 @@ fn draw_track_menu(
         let hovered = cx.over_clickable(row);
         let hv = cx.anims.toggle("menu_item", i as u32, hovered, rate::SNAP);
         if hv > 0.002 {
-            cx.draw().round_rect(row, 7.0, mix(theme::RAISED, theme::PRESS, hv));
+            cx.draw()
+                .round_rect(row, 7.0, mix(theme::raised(), theme::press(), hv));
         }
-        let ink = mix(theme::MUTED, theme::FG, hv);
+        let ink = mix(theme::muted(), theme::fg(), hv);
         cx.icon(entry.icon, (row.x + 18.0, row.y + row.h * 0.5), 16.0, ink);
         cx.text(
             Rect::new(row.x + 36.0, row.y, row.w - 44.0, row.h),
@@ -4210,13 +5538,24 @@ fn row_text(
         return None;
     }
     let Some(target) = target else {
-        cx.text_fit(rect, text, size, fade(theme::MUTED, alpha), Align::Left);
+        cx.text_fit(rect, text, size, fade(theme::muted(), alpha), Align::Left);
         return None;
     };
-    let hit = Rect::new(rect.x, rect.y, cx.text_width(text, size).min(rect.w), rect.h);
+    let hit = Rect::new(
+        rect.x,
+        rect.y,
+        cx.text_width(text, size).min(rect.w),
+        rect.h,
+    );
     let hovered = cx.over_clickable(hit);
     let hv = cx.anims.toggle(name, key, hovered, rate::SNAP);
-    cx.text_fit(rect, text, size, fade(mix(theme::MUTED, theme::FG, hv), alpha), Align::Left);
+    cx.text_fit(
+        rect,
+        text,
+        size,
+        fade(mix(theme::muted(), theme::fg(), hv), alpha),
+        Align::Left,
+    );
     cx.clicked(hit).then_some(target)
 }
 
@@ -4243,7 +5582,13 @@ fn artist_text(
             if x >= right {
                 break;
             }
-            cx.text_fit(Rect::new(x, rect.y, right - x, rect.h), ARTIST_SEP, size, fade(theme::MUTED, alpha), Align::Left);
+            cx.text_fit(
+                Rect::new(x, rect.y, right - x, rect.h),
+                ARTIST_SEP,
+                size,
+                fade(theme::muted(), alpha),
+                Align::Left,
+            );
             x += cx.text_width(ARTIST_SEP, size);
         }
         if x >= right {
@@ -4252,7 +5597,16 @@ fn artist_text(
         // Each credit hovers on its own; the first keeps the key a lone artist always had.
         let link_key = key.wrapping_add((i as u32).wrapping_mul(0x9E37_79B9));
         let target = id.map(|id| Detail::Artist(id.to_owned()));
-        let pressed = row_text(cx, name, link_key, Rect::new(x, rect.y, right - x, rect.h), artist, size, alpha, target);
+        let pressed = row_text(
+            cx,
+            name,
+            link_key,
+            Rect::new(x, rect.y, right - x, rect.h),
+            artist,
+            size,
+            alpha,
+            target,
+        );
         opened = opened.or(pressed);
         x += cx.text_width(artist, size);
     }
@@ -4277,7 +5631,12 @@ fn title_link(
         cx.text_fit(rect, text, size, color, Align::Left);
         return None;
     };
-    let hit = Rect::new(rect.x, rect.y, cx.text_width(text, size).min(rect.w), rect.h);
+    let hit = Rect::new(
+        rect.x,
+        rect.y,
+        cx.text_width(text, size).min(rect.w),
+        rect.h,
+    );
     cx.over_clickable(hit);
     cx.text_fit(rect, text, size, color, Align::Left);
     cx.clicked(hit).then_some(target)
@@ -4325,7 +5684,7 @@ fn loading_page(cx: &mut Cx, main: Rect) {
         Rect::new(main.x, main.h * 0.5 - 14.0, main.w, 28.0),
         "Loading…",
         14.5,
-        theme::MUTED,
+        theme::muted(),
         Align::Center,
     );
 }
@@ -4339,18 +5698,9 @@ fn tile_columns(width: f32) -> usize {
     (((width + TILE_GAP) / (TILE + TILE_GAP)).floor() as usize).max(1)
 }
 
-/// Where a detail page's scroll area starts: just under the caption buttons, so its scrollbar
-/// never runs up behind them. The page's own top spacing shrinks by the same amount.
-const SCROLL_TOP: f32 = theme::SEARCH_TOP + (theme::SEARCH_H + theme::CAPTION_H) * 0.5 + 8.0;
-const DETAIL_TOP: f32 = PAGE_TOP - SCROLL_TOP;
-
-fn below_caption(view: Rect) -> Rect {
-    Rect::new(view.x, view.y + SCROLL_TOP, view.w, (view.h - SCROLL_TOP).max(0.0))
-}
-
 /// A section heading on a page, in the text colour, as the page words it.
 fn section_heading(cx: &mut Cx, rect: Rect, text: &str) {
-    cx.text_fit(rect, text, 16.0, theme::FG, Align::Left);
+    cx.text_fit(rect, text, 16.0, theme::fg(), Align::Left);
 }
 
 /// An artist's channel: the round picture and name, the songs, then each shelf of albums as a grid.
@@ -4363,7 +5713,6 @@ fn artist_page(
     view: Rect,
     actions: &mut Vec<Action>,
 ) {
-    let view = below_caption(view);
     let columns = tile_columns(view.w - 44.0);
     // The songs are rows of this artist's own page, so they show their album, not the artist.
     let songs: Vec<Row> = page
@@ -4380,7 +5729,7 @@ fn artist_page(
         })
         .collect();
 
-    let mut content_h = DETAIL_TOP + PICTURE + 40.0;
+    let mut content_h = PAGE_TOP + PICTURE + 40.0;
     if !songs.is_empty() {
         content_h += SECTION_H + songs.len() as f32 * theme::ROW_H + 24.0;
     }
@@ -4391,7 +5740,7 @@ fn artist_page(
     let body = cx.ui.scroll_begin(scroll_id, view, content_h);
     let left = body.x + 8.0;
 
-    let picture = Rect::new(left, body.y + DETAIL_TOP, PICTURE, PICTURE);
+    let picture = Rect::new(left, body.y + PAGE_TOP, PICTURE, PICTURE);
     cx.cover(page.thumbnail.as_deref(), picture, PICTURE * 0.5, 1.0);
     let name_x = picture.x + PICTURE + 28.0;
     let name_w = (body.x + body.w - 36.0 - name_x).max(40.0);
@@ -4399,13 +5748,16 @@ fn artist_page(
         Rect::new(name_x, picture.y + PICTURE * 0.5 - 20.0, name_w, 40.0),
         &page.name,
         30.0,
-        theme::FG,
+        theme::fg(),
         Align::Left,
     );
 
     // Saving the artist keeps their page on this device (there is no audio to download).
     let saved = cx.saved.artists.contains(&page.browse_id);
-    let button = (name_x + SAVE_ARTIST_R, picture.y + PICTURE - SAVE_ARTIST_R - 2.0);
+    let button = (
+        name_x + SAVE_ARTIST_R,
+        picture.y + PICTURE - SAVE_ARTIST_R - 2.0,
+    );
     let pointer_in_view = cx.pointer_in(view);
     if save_button(
         cx,
@@ -4420,16 +5772,25 @@ fn artist_page(
         actions.push(Action::SaveArtist(page.clone()));
     }
     cx.text(
-        Rect::new(button.0 + SAVE_ARTIST_R + 12.0, button.1 - 10.0, 160.0, 20.0),
+        Rect::new(
+            button.0 + SAVE_ARTIST_R + 12.0,
+            button.1 - 10.0,
+            160.0,
+            20.0,
+        ),
         if saved { "Saved" } else { "Save" },
         13.0,
-        if saved { theme::FG } else { theme::MUTED },
+        if saved { theme::fg() } else { theme::muted() },
         Align::Left,
     );
 
-    let mut y = body.y + DETAIL_TOP + PICTURE + 40.0;
+    let mut y = body.y + PAGE_TOP + PICTURE + 40.0;
     if !songs.is_empty() {
-        section_heading(cx, Rect::new(left, y, body.w - 16.0, 28.0), &page.songs_title);
+        section_heading(
+            cx,
+            Rect::new(left, y, body.w - 16.0, 28.0),
+            &page.songs_title,
+        );
         let rows_top = y + SECTION_H;
         track_rows(
             cx,
@@ -4454,7 +5815,14 @@ fn artist_page(
         for (k, card) in shelf.albums.iter().enumerate() {
             let x = left + (k % columns) as f32 * (TILE + TILE_GAP);
             let ty = grid_top + (k / columns) as f32 * (TILE + TILE_TEXT_H + TILE_GAP);
-            album_tile(cx, view, actions, (x, ty), card, 9000 + (shelf_index * 100 + k) as u32);
+            album_tile(
+                cx,
+                view,
+                actions,
+                (x, ty),
+                card,
+                9000 + (shelf_index * 100 + k) as u32,
+            );
         }
         let rows = shelf.albums.len().div_ceil(columns) as f32;
         y = grid_top + rows * (TILE + TILE_TEXT_H + TILE_GAP) + 24.0;
@@ -4478,11 +5846,39 @@ fn album_tile(
         view,
         actions,
         origin,
-        (card.title.as_str(), card.meta.as_str(), card.thumbnail.as_deref()),
+        (
+            card.title.as_str(),
+            card.meta.as_str(),
+            card.thumbnail.as_deref(),
+        ),
         false,
         target,
         key,
     );
+}
+
+/// Draws a rounded card background, using frosted-glass translucency (matching the sidebar and
+/// player bar) when a custom background is active.
+fn draw_card_surface(
+    cx: &mut Cx,
+    rect: Rect,
+    radius: f32,
+    opaque_rest: Color,
+    opaque_hover: Color,
+    glass_hover: Color,
+    hv: f32,
+) {
+    if cx.gpu.background.is_some() {
+        cx.draw().backdrop_rounded(rect, Color::WHITE, radius);
+        cx.draw().round_rect(
+            rect,
+            radius,
+            fade(mix(theme::panel(), glass_hover, hv), 0.62 + 0.10 * hv),
+        );
+    } else {
+        cx.draw()
+            .round_rect(rect, radius, mix(opaque_rest, opaque_hover, hv));
+    }
 }
 
 /// A tile for a page: a square cover (round for an artist), then its title and meta. The whole tile
@@ -4499,25 +5895,33 @@ fn media_tile(
     key: u32,
 ) {
     let (x, y) = origin;
-    let pill = Rect::new(x - 10.0, y - 10.0, TILE + 20.0, TILE + TILE_TEXT_H + 8.0);
+    let pill = Rect::new(x - 10.0, y - 10.0, TILE + 20.0, TILE + TILE_TEXT_H + 10.0);
     let pointer_in_view = cx.pointer_in(view);
     let hovered = pointer_in_view && cx.over_clickable(pill);
     let hv = cx.anims.toggle("tile", key, hovered, rate::SNAP);
-    cx.draw().round_rect(pill, 12.0, mix(theme::BG, theme::HOVER, hv));
+    draw_card_surface(
+        cx,
+        pill,
+        12.0,
+        theme::bg(),
+        theme::hover(),
+        theme::panel_hover(),
+        hv,
+    );
     let radius = if round { TILE * 0.5 } else { 10.0 };
     cx.cover(thumbnail, Rect::new(x, y, TILE, TILE), radius, 1.0);
     cx.text_fit(
-        Rect::new(x, y + TILE + 12.0, TILE, 20.0),
+        Rect::new(x, y + TILE + 6.0, TILE, 20.0),
         title,
         14.5,
-        theme::FG,
+        theme::fg(),
         Align::Left,
     );
     cx.text_fit(
-        Rect::new(x, y + TILE + 32.0, TILE, 18.0),
+        Rect::new(x, y + TILE + 26.0, TILE, 18.0),
         meta,
         12.5,
-        theme::MUTED,
+        theme::muted(),
         Align::Left,
     );
     if pointer_in_view && cx.clicked(pill) {
@@ -4537,7 +5941,11 @@ fn search_results(
     age: f32,
     actions: &mut Vec<Action>,
 ) {
-    let rows: Vec<Row> = state.results.iter().map(|hit| Row::from(hit, &state.lengths)).collect();
+    let rows: Vec<Row> = state
+        .results
+        .iter()
+        .map(|hit| Row::from(hit, &state.lengths))
+        .collect();
     let columns = tile_columns(view.w - 44.0);
     let grid_h = |count: usize| count.div_ceil(columns) as f32 * (TILE + TILE_TEXT_H + TILE_GAP);
     let tab = state.results_tab;
@@ -4545,8 +5953,12 @@ fn search_results(
     // The chosen tab's part: its height, or a line of 'nothing here' when it is empty.
     let part_h = match tab {
         ResultsTab::Songs if !rows.is_empty() => rows.len() as f32 * theme::ROW_H + 24.0,
-        ResultsTab::Artists if !state.result_artists.is_empty() => grid_h(state.result_artists.len()) + 24.0,
-        ResultsTab::Albums if !state.result_albums.is_empty() => grid_h(state.result_albums.len()) + 24.0,
+        ResultsTab::Artists if !state.result_artists.is_empty() => {
+            grid_h(state.result_artists.len()) + 24.0
+        }
+        ResultsTab::Albums if !state.result_albums.is_empty() => {
+            grid_h(state.result_albums.len()) + 24.0
+        }
         _ => EMPTY_PART_H,
     };
     let mut content_h = theme::TOP_H + TAB_ROW_H + part_h;
@@ -4565,7 +5977,10 @@ fn search_results(
     }
 
     let labels = ResultsTab::ALL.map(|kind| (kind.label(), kind.icon()));
-    let current = ResultsTab::ALL.iter().position(|kind| *kind == tab).unwrap_or(0);
+    let current = ResultsTab::ALL
+        .iter()
+        .position(|kind| *kind == tab)
+        .unwrap_or(0);
     if let Some(index) = tab_pills(cx, &labels, current, left, y, &RESULT_PILLS) {
         actions.push(Action::ResultsTab(ResultsTab::ALL[index]));
     }
@@ -4573,7 +5988,21 @@ fn search_results(
 
     match tab {
         ResultsTab::Songs if !rows.is_empty() => {
-            track_rows(cx, track, &rows, view, body, y, 0, age, true, false, Action::Play, 0, actions);
+            track_rows(
+                cx,
+                track,
+                &rows,
+                view,
+                body,
+                y,
+                0,
+                age,
+                true,
+                false,
+                Action::Play,
+                0,
+                actions,
+            );
         }
         ResultsTab::Artists if !state.result_artists.is_empty() => {
             for (k, artist) in state.result_artists.iter().enumerate() {
@@ -4584,7 +6013,11 @@ fn search_results(
                     view,
                     actions,
                     (x, ty),
-                    (artist.name.as_str(), artist.meta.as_str(), artist.thumbnail.as_deref()),
+                    (
+                        artist.name.as_str(),
+                        artist.meta.as_str(),
+                        artist.thumbnail.as_deref(),
+                    ),
                     true,
                     Detail::Artist(artist.browse_id.clone()),
                     7000 + k as u32,
@@ -4604,7 +6037,13 @@ fn search_results(
                 ResultsTab::Artists => "No artists matched.",
                 ResultsTab::Albums => "No albums matched.",
             };
-            cx.text(Rect::new(left, y + 12.0, body.w - 16.0, 24.0), hint, 14.0, theme::MUTED, Align::Left);
+            cx.text(
+                Rect::new(left, y + 12.0, body.w - 16.0, 24.0),
+                hint,
+                14.0,
+                theme::muted(),
+                Align::Left,
+            );
         }
     }
     cx.ui.scroll_end();
@@ -4644,14 +6083,21 @@ fn cover_overlay(
         .round_rect(cover, radius, Color::rgba(0, 0, 0, (130.0 * dim * a) as u8));
     let center = (cover.x + cover.w * 0.5, cover.y + cover.h * 0.5);
     if loading {
-        draw_spinner(cx, center, 12.0, fade(theme::FG, a));
+        draw_spinner(cx, center, 12.0, fade(theme::fg(), a));
     } else if audible {
-        icons::equalizer(cx.draw(), center, 16.0, mix(theme::BG, theme::FG, a), levels, true);
+        icons::equalizer(
+            cx.draw(),
+            center,
+            16.0,
+            mix(theme::bg(), theme::fg(), a),
+            levels,
+            true,
+        );
     } else if playing {
         // Playing but silent (or paused): nothing over the cover.
     } else if hv > 0.5 {
         // Opaque and fixed size; shown once hover is well under way, so no dark ghost lingers.
-        cx.icon(Icon::Play, center, 18.0, theme::FG);
+        cx.icon(Icon::Play, center, 18.0, theme::fg());
     }
 }
 
@@ -4669,27 +6115,46 @@ fn top_card(
     let pointer_in_view = cx.pointer_in(view);
     let hovered = pointer_in_view && cx.over_clickable(pill);
     let hv = cx.anims.toggle("top_card", 0, hovered, rate::SNAP);
-    cx.draw().round_rect(pill, 14.0, mix(theme::PANEL, theme::SELECT, hv));
+    draw_card_surface(
+        cx,
+        pill,
+        14.0,
+        theme::panel(),
+        theme::select(),
+        theme::select(),
+        hv,
+    );
 
-    let (title, meta, thumbnail, round, target): (&str, String, Option<&str>, bool, Option<Detail>) =
-        match top {
-            // A song's artists and album are drawn below as links of their own, not as one string.
-            TopResult::Song(hit) => (hit.title.as_str(), String::new(), hit.thumbnail.as_deref(), false, None),
-            TopResult::Artist(artist) => (
-                artist.name.as_str(),
-                artist.meta.clone(),
-                artist.thumbnail.as_deref(),
-                true,
-                Some(Detail::Artist(artist.browse_id.clone())),
-            ),
-            TopResult::Album(album) => (
-                album.title.as_str(),
-                album.meta.clone(),
-                album.thumbnail.as_deref(),
-                false,
-                Some(Detail::Album(album.browse_id.clone())),
-            ),
-        };
+    let (title, meta, thumbnail, round, target): (
+        &str,
+        String,
+        Option<&str>,
+        bool,
+        Option<Detail>,
+    ) = match top {
+        // A song's artists and album are drawn below as links of their own, not as one string.
+        TopResult::Song(hit) => (
+            hit.title.as_str(),
+            String::new(),
+            hit.thumbnail.as_deref(),
+            false,
+            None,
+        ),
+        TopResult::Artist(artist) => (
+            artist.name.as_str(),
+            artist.meta.clone(),
+            artist.thumbnail.as_deref(),
+            true,
+            Some(Detail::Artist(artist.browse_id.clone())),
+        ),
+        TopResult::Album(album) => (
+            album.title.as_str(),
+            album.meta.clone(),
+            album.thumbnail.as_deref(),
+            false,
+            Some(Detail::Album(album.browse_id.clone())),
+        ),
+    };
 
     let cover = Rect::new(pill.x + 16.0, pill.y + 16.0, TOP_COVER, TOP_COVER);
     let radius = if round { TOP_COVER * 0.5 } else { 12.0 };
@@ -4704,14 +6169,14 @@ fn top_card(
         Rect::new(text_x, pill.y + 34.0, text_w, 18.0),
         "Top result",
         12.5,
-        theme::MUTED,
+        theme::muted(),
         Align::Left,
     );
     cx.text_fit(
         Rect::new(text_x, pill.y + 56.0, text_w, 36.0),
         title,
         26.0,
-        theme::FG,
+        theme::fg(),
         Align::Left,
     );
     // The meta line. A song's artist credits are links of their own, as a row's are, followed by
@@ -4722,7 +6187,8 @@ fn top_card(
         let credits_w = if credits.is_empty() {
             0.0
         } else {
-            cx.text_width(&hit.artists.join(ARTIST_SEP), 13.0).min(text_w)
+            cx.text_width(&hit.artists.join(ARTIST_SEP), 13.0)
+                .min(text_w)
         };
         let mut opened = artist_text(
             cx,
@@ -4735,28 +6201,50 @@ fn top_card(
         );
         let mut x = text_x + credits_w;
         if let Some(album) = hit.album.as_deref().filter(|album| !album.is_empty()) {
-            let sep_w = if credits.is_empty() { 0.0 } else { cx.text_width(ROW_SEP, 13.0) };
+            let sep_w = if credits.is_empty() {
+                0.0
+            } else {
+                cx.text_width(ROW_SEP, 13.0)
+            };
             if sep_w > 0.0 {
                 cx.text_fit(
                     Rect::new(x, meta_rect.y, sep_w, meta_rect.h),
                     ROW_SEP,
                     13.0,
-                    theme::MUTED,
+                    theme::muted(),
                     Align::Left,
                 );
             }
             x += sep_w;
-            let room = Rect::new(x, meta_rect.y, (meta_rect.x + meta_rect.w - x).max(0.0), meta_rect.h);
-            match hit.album_id.as_deref().map(|id| Detail::Album(id.to_owned())) {
+            let room = Rect::new(
+                x,
+                meta_rect.y,
+                (meta_rect.x + meta_rect.w - x).max(0.0),
+                meta_rect.h,
+            );
+            match hit
+                .album_id
+                .as_deref()
+                .map(|id| Detail::Album(id.to_owned()))
+            {
                 Some(target) => {
-                    opened = opened.or(row_text(cx, "link_top_album", 0, room, album, 13.0, 1.0, Some(target)));
+                    opened = opened.or(row_text(
+                        cx,
+                        "link_top_album",
+                        0,
+                        room,
+                        album,
+                        13.0,
+                        1.0,
+                        Some(target),
+                    ));
                 }
-                None => cx.text_fit(room, album, 13.0, theme::MUTED, Align::Left),
+                None => cx.text_fit(room, album, 13.0, theme::muted(), Align::Left),
             }
         }
         opened
     } else {
-        cx.text_fit(meta_rect, &meta, 13.0, theme::MUTED, Align::Left);
+        cx.text_fit(meta_rect, &meta, 13.0, theme::muted(), Align::Left);
         None
     };
     if let Some(detail) = opened {
@@ -4801,13 +6289,12 @@ fn album_page(
             row
         })
         .collect();
-    let view = below_caption(view);
-    let rows_top_off = DETAIL_TOP + COVER_BIG + 32.0;
+    let rows_top_off = PAGE_TOP + COVER_BIG + 32.0;
     let content_h = rows_top_off + tracks.len() as f32 * theme::ROW_H + 24.0;
     let body = cx.ui.scroll_begin(scroll_id, view, content_h);
     let left = body.x + 8.0;
 
-    let cover = Rect::new(left, body.y + DETAIL_TOP, COVER_BIG, COVER_BIG);
+    let cover = Rect::new(left, body.y + PAGE_TOP, COVER_BIG, COVER_BIG);
     cx.cover(page.thumbnail.as_deref(), cover, 12.0, 1.0);
 
     // Title, artist and meta, standing centred on the height of the cover.
@@ -4818,7 +6305,7 @@ fn album_page(
         Rect::new(text_x, block_y, text_w, 34.0),
         &page.title,
         26.0,
-        theme::FG,
+        theme::fg(),
         Align::Left,
     );
     let artist = row_text(
@@ -4835,7 +6322,7 @@ fn album_page(
         Rect::new(text_x, block_y + 74.0, text_w, 18.0),
         &page.meta,
         13.0,
-        theme::MUTED,
+        theme::muted(),
         Align::Left,
     );
     if let Some(target) = artist {
@@ -4844,7 +6331,10 @@ fn album_page(
 
     // Saving the album saves every song on it.
     let saved = cx.saved.albums.contains(&page.browse_id);
-    let button = (text_x + SAVE_HEAD_R, cover.y + COVER_BIG - SAVE_HEAD_R - 2.0);
+    let button = (
+        text_x + SAVE_HEAD_R,
+        cover.y + COVER_BIG - SAVE_HEAD_R - 2.0,
+    );
     let pointer_in_view = cx.pointer_in(view);
     if save_button(
         cx,
@@ -4862,7 +6352,7 @@ fn album_page(
         Rect::new(button.0 + SAVE_HEAD_R + 12.0, button.1 - 10.0, 160.0, 20.0),
         if saved { "Saved" } else { "Save" },
         13.0,
-        if saved { theme::FG } else { theme::MUTED },
+        if saved { theme::fg() } else { theme::muted() },
         Align::Left,
     );
 
@@ -4912,23 +6402,24 @@ fn draw_back(cx: &mut Cx, rect: Rect, reveal: f32, actions: &mut Vec<Action>) {
     let cym = rect.y + rect.h * 0.5;
     let drawn = Rect::new(cxm - w * 0.5, cym - h * 0.5, w, h);
 
-    // The glass and the tint are the search field's, so the two read as one bar. Everything that
-    // carries colour is faded by `t` so the button arrives and leaves without a visible edge.
+    // The glass and the tint are the search field's (matching the sidebar and player bar without
+    // accent), so the two read as one bar. Everything that carries colour is faded by `t` so the
+    // button arrives and leaves without a visible edge.
     cx.draw()
         .backdrop_rounded(drawn, fade(Color::rgb(0xff, 0xff, 0xff), t), drawn.h * 0.5);
     cx.draw().round_rect(
         drawn,
         drawn.h * 0.5,
         fade(
-            mix(theme::PANEL_SELECT, theme::PANEL_PRESS, lift),
-            t * (0.5 + 0.1 * lift),
+            mix(theme::panel(), theme::panel_press(), lift),
+            t * (0.62 + 0.12 * lift),
         ),
     );
     cx.icon(
         Icon::ArrowLeft,
         (cxm, cym),
         19.0 * grow,
-        fade(mix(theme::MUTED, theme::FG, lift), t),
+        fade(mix(theme::muted(), theme::fg(), lift), t),
     );
     if live && cx.clicked(rect) {
         actions.push(Action::PageBack);
@@ -4964,7 +6455,12 @@ fn icon_button(
     current: usize,
     size: f32,
 ) -> bool {
-    let hit = Rect::new(center.0 - radius, center.1 - radius, radius * 2.0, radius * 2.0);
+    let hit = Rect::new(
+        center.0 - radius,
+        center.1 - radius,
+        radius * 2.0,
+        radius * 2.0,
+    );
     let hover = enabled && cx.over_clickable(hit);
     let hv = cx.anims.toggle("btn_hv", key, hover, rate::SNAP);
     let live = cx.anims.toggle("btn_on", key, enabled, rate::QUICK);
@@ -4973,7 +6469,11 @@ fn icon_button(
         current,
         center,
         size,
-        mix(theme::PANEL, mix(theme::MUTED, theme::FG, hv), 0.35 + 0.65 * live),
+        mix(
+            theme::panel(),
+            mix(theme::muted(), theme::fg(), hv),
+            0.35 + 0.65 * live,
+        ),
     );
     enabled && cx.clicked(hit)
 }
@@ -5020,9 +6520,15 @@ const SPINNER_TURN: f32 = std::f32::consts::TAU * 1.1;
 /// The loading spinner: an arc of [`SPINNER_SWEEP`] turning at `cx.spin`, `radius` out from
 /// `center`. The bar's play disc and each row's cover both draw it.
 fn draw_spinner(cx: &mut Cx, center: (f32, f32), radius: f32, color: Color) {
-    let rect = Rect::new(center.0 - radius, center.1 - radius, radius * 2.0, radius * 2.0);
+    let rect = Rect::new(
+        center.0 - radius,
+        center.1 - radius,
+        radius * 2.0,
+        radius * 2.0,
+    );
     let angle = cx.spin;
-    cx.draw().ring_arc(rect, radius, SPINNER_THICKNESS, angle, SPINNER_SWEEP, color);
+    cx.draw()
+        .ring_arc(rect, radius, SPINNER_THICKNESS, angle, SPINNER_SWEEP, color);
 }
 
 fn draw_bar(
@@ -5032,7 +6538,13 @@ fn draw_bar(
     bar: Rect,
     actions: &mut Vec<Action>,
 ) {
-    cx.draw().rect(bar, theme::PANEL);
+    if cx.gpu.background.is_some() {
+        cx.draw().backdrop_rect(bar, Color::WHITE);
+        cx.draw()
+            .rect(bar, fade(theme::panel(), ui_panel_alpha(state)));
+    } else {
+        cx.draw().rect(bar, theme::panel());
+    }
     let width = bar.w;
     let has = track.is_some();
 
@@ -5051,7 +6563,12 @@ fn draw_bar(
     let tile_c = (tile_left + 28.0, bar.y + 36.0);
     cx.cover(
         track.and_then(|track| track.thumbnail.as_deref()),
-        Rect::new(tile_c.0 - tile_size * 0.5, tile_c.1 - tile_size * 0.5, tile_size, tile_size),
+        Rect::new(
+            tile_c.0 - tile_size * 0.5,
+            tile_c.1 - tile_size * 0.5,
+            tile_size,
+            tile_size,
+        ),
         8.0,
         1.0,
     );
@@ -5060,10 +6577,15 @@ fn draw_bar(
     let text_w = left_w - 56.0 - 16.0;
     // The bar shows only what is playing. App status ("Loading…", "Searching…") never goes here.
     let (title, sub, title_color) = match track {
-        Some(track) => (track.title.as_str(), track.artist.as_str(), theme::FG),
-        None => ("Nothing playing", "", theme::MUTED),
+        Some(track) => (track.title.as_str(), track.artist.as_str(), theme::fg()),
+        None => ("Nothing playing", "", theme::muted()),
     };
-    cx.clip(Rect::new(tile_left + 56.0 + text_gap, bar.y, text_w + 4.0, bar.h));
+    cx.clip(Rect::new(
+        tile_left + 56.0 + text_gap,
+        bar.y,
+        text_w + 4.0,
+        bar.h,
+    ));
     // The title names the track's album: a press on it opens the album. When the song row did not
     // carry the album's link, ask for it so the link appears once it is found.
     if let Some(hit) = track.and_then(|track| track.hit.as_ref()) {
@@ -5089,7 +6611,16 @@ fn draw_bar(
             Some(hit) => hit
                 .artist_links()
                 .enumerate()
-                .map(|(i, (name, id))| (name, id.or(if i == 0 { track.artist_id.as_deref() } else { None })))
+                .map(|(i, (name, id))| {
+                    (
+                        name,
+                        id.or(if i == 0 {
+                            track.artist_id.as_deref()
+                        } else {
+                            None
+                        }),
+                    )
+                })
                 .collect(),
             None => vec![(sub, track.artist_id.as_deref())],
         },
@@ -5111,7 +6642,10 @@ fn draw_bar(
     // A right press on the track in the bar opens its menu, as a right press on a row does.
     if let Some(hit) = track.and_then(|track| track.hit.as_ref()) {
         if cx.right_clicked(Rect::new(0.0, bar.y, left_w + 24.0, bar.h)) {
-            actions.push(Action::OpenMenu(TrackMenu { hit: hit.clone(), at: cx.pointer.pos }));
+            actions.push(Action::OpenMenu(TrackMenu {
+                hit: hit.clone(),
+                at: cx.pointer.pos,
+            }));
         }
     }
 
@@ -5125,12 +6659,30 @@ fn draw_bar(
     let row = cx.snap(y - 20.0) + 20.0;
     // Back is live while a track is loaded or there is something in the history to go back to.
     let has_back = has || !state.playlist.history.is_empty();
-    if icon_button(cx, 1, (mid_x - 52.0, row), 18.0, has_back, &[Icon::SkipBack], 0, 26.0) {
+    if icon_button(
+        cx,
+        1,
+        (mid_x - 52.0, row),
+        18.0,
+        has_back,
+        &[Icon::SkipBack],
+        0,
+        26.0,
+    ) {
         actions.push(Action::Back);
     }
     // Next is only live when something is queued.
     let has_next = !state.playlist.queue.is_empty();
-    if icon_button(cx, 2, (mid_x + 52.0, row), 18.0, has_next, &[Icon::SkipForward], 0, 26.0) {
+    if icon_button(
+        cx,
+        2,
+        (mid_x + 52.0, row),
+        18.0,
+        has_next,
+        &[Icon::SkipForward],
+        0,
+        26.0,
+    ) {
         actions.push(Action::Next);
     }
 
@@ -5138,23 +6690,30 @@ fn draw_bar(
     let c = (cx.snap(mid_x - 20.0) + 20.0, cx.snap(y - 20.0) + 20.0);
     let play_rect = Rect::new(c.0 - 20.0, c.1 - 20.0, 40.0, 40.0);
     let hover = playable && cx.over_clickable(play_rect);
-    let hover_t = cx.anims.spring("play_hover", 0, if hover { 1.0 } else { 0.0 }, rate::SNAP).clamp(0.0, 1.0);
+    let hover_t = cx
+        .anims
+        .spring("play_hover", 0, if hover { 1.0 } else { 0.0 }, rate::SNAP)
+        .clamp(0.0, 1.0);
     let live = cx.anims.toggle("play_on", 0, has, rate::QUICK);
     let visual = Rect::new(c.0 - 20.0, c.1 - 20.0, 40.0, 40.0);
     // Opaque throughout: the disc's brightness and the glyph's colour carry the state, never alpha.
     // Hover changes the colour in both states, in opposite directions so each stays visible: an idle
     // disc (dark panel tone) lifts toward white, a live one (already white) eases toward grey.
-    let disc = mix(theme::PANEL, theme::FG, 0.22 + 0.78 * live);
-    let idle_hover = mix(disc, theme::FG, hover_t * 0.24);
-    let live_hover = mix(disc, theme::MUTED, hover_t * 0.2);
-    cx.draw().round_rect(visual, 20.0, mix(idle_hover, live_hover, live));
+    let disc = mix(theme::panel(), theme::accent(), 0.22 + 0.78 * live);
+    let idle_hover = mix(disc, theme::fg(), hover_t * 0.24);
+    let live_hover = mix(disc, theme::muted(), hover_t * 0.2);
+    cx.draw()
+        .round_rect(visual, 20.0, mix(idle_hover, live_hover, live));
     // Play and pause swap by scale: the outgoing glyph shrinks to nothing while the incoming one
     // grows from nothing with a slight spring overshoot. Both are opaque, so they never blend.
     let showing_pause = playable && !paused;
-    let ink = mix(theme::MUTED, theme::ON_ACCENT, live);
+    let ink = mix(theme::muted(), theme::on_accent(), live);
     // Glyph and spinner swap with no motion in either direction: the spinner appears and goes at
     // once. Play and pause still swap by scale, but only when neither is a spinner.
-    let glyph_targets = [if showing_pause { 0.0 } else { 1.0 }, if showing_pause { 1.0 } else { 0.0 }];
+    let glyph_targets = [
+        if showing_pause { 0.0 } else { 1.0 },
+        if showing_pause { 1.0 } else { 0.0 },
+    ];
     if loading {
         // The springs are held at the state the song will start in, so the pause glyph is already
         // in place when the spinner gives way to it.
@@ -5186,7 +6745,7 @@ fn draw_bar(
     let seek_x = mid_x - seek_w * 0.5;
     let seek_y = bar.y + 60.0;
     let (position, duration) = track.map_or((0.0, 0.0), |track| (track.position, track.duration));
-    let times = if has { theme::MUTED } else { theme::FAINT };
+    let times = if has { theme::muted() } else { theme::faint() };
     cx.text(
         Rect::new(seek_x, seek_y - 10.0, 40.0, 20.0),
         &clock(position),
@@ -5196,7 +6755,11 @@ fn draw_bar(
     );
     cx.text(
         Rect::new(seek_x + seek_w - 40.0, seek_y - 10.0, 40.0, 20.0),
-        &if duration > 0.0 { clock(duration) } else { "0:00".to_owned() },
+        &if duration > 0.0 {
+            clock(duration)
+        } else {
+            "0:00".to_owned()
+        },
         12.0,
         times,
         Align::Left,
@@ -5220,11 +6783,20 @@ fn draw_bar(
     let full_w = 112.0;
     let slider_right = icon_hit.x - 4.0;
     let region_x = slider_right - full_w - 14.0;
-    let region = Rect::new(region_x, icon_hit.y - 4.0, icon_hit.x + icon_hit.w - region_x, 48.0);
+    let region = Rect::new(
+        region_x,
+        icon_hit.y - 4.0,
+        icon_hit.x + icon_hit.w - region_x,
+        48.0,
+    );
     let near = cx.pointer_in(if state.volume_open { region } else { icon_hit });
     let wanted = near || cx.drag == Some(SliderId::Volume);
     state.volume_open = wanted;
-    let stiffness = if wanted { VOLUME_OPEN_RATE } else { VOLUME_CLOSE_RATE };
+    let stiffness = if wanted {
+        VOLUME_OPEN_RATE
+    } else {
+        VOLUME_CLOSE_RATE
+    };
     let open = cx
         .anims
         .spring("volume_open", 0, if wanted { 1.0 } else { 0.0 }, stiffness)
@@ -5253,9 +6825,8 @@ fn draw_bar(
     // one fade rather than a snap.
     let dim = cx.anims.toggle("volume_muted", 0, muted, rate::QUICK);
 
-    // ---- Lyrics: a microphone just left of the volume icon. It stays put: while the volume slider is
-    // showing, it fades out underneath it and cannot be clicked, so nothing else moves. It is lit
-    // while the lyric menu is open.
+    // ---- Lyrics: a microphone just left of the volume icon. It stays put and is absent while the
+    // volume slider is showing. It is lit while the lyric menu is open.
     let mic_c = (icon_c.0 - 44.0, icon_c.1);
     let mic_hit = Rect::new(mic_c.0 - 20.0, mic_c.1 - 20.0, 40.0, 40.0);
     // Greyed out and unclickable unless the current song has lyrics to show. An open page can always
@@ -5265,15 +6836,19 @@ fn draw_bar(
     let mic_active = mic_enabled && alpha <= 0.002;
     let mic_hover = mic_active && cx.over_clickable(mic_hit);
     let mic_hv = cx.anims.toggle("mic_hv", 0, mic_hover, rate::SNAP);
-    let lit = cx.anims.toggle("mic_lit", 0, state.lyrics_open, rate::QUICK);
+    let lit = cx
+        .anims
+        .toggle("mic_lit", 0, state.lyrics_open, rate::QUICK);
     let mic_colour = if mic_enabled {
-        mix(theme::MUTED, theme::FG, mic_hv.max(lit))
+        mix(theme::muted(), theme::fg(), mic_hv.max(lit))
     } else {
-        theme::FAINT
+        theme::faint()
     };
-    // Fade toward the panel as the slider comes in, so the microphone is gone by the time the
-    // slider is fully open.
-    cx.icon(Icon::Mic, mic_c, 22.0, mix(theme::PANEL, mic_colour, 1.0 - alpha));
+    // Skip drawing it altogether while the slider is visible. Recolouring it toward the panel
+    // leaves a visible glyph over a custom background because the bar is translucent there.
+    if alpha <= 0.002 {
+        cx.icon(Icon::Mic, mic_c, 22.0, mic_colour);
+    }
     if mic_active && cx.clicked(mic_hit) {
         actions.push(Action::ToggleLyrics);
     }
@@ -5305,7 +6880,7 @@ fn draw_bar(
         volume_state,
         icon_c,
         22.0,
-        mix(theme::MUTED, theme::FG, hv),
+        mix(theme::muted(), theme::fg(), hv),
     );
     if cx.clicked(icon_hit) {
         actions.push(Action::Mute);
@@ -5331,4 +6906,1846 @@ fn draw_bar(
             state.volume_before_mute = None;
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Background
+// ---------------------------------------------------------------------------------------------
+
+/// The tint over the picture. Kept subtle so the background's colours and frosted glass shine
+/// through while keeping text over it crisp and readable.
+const BACKGROUND_DIM: f32 = 0.22;
+
+/// The chosen picture or video behind the whole window, aspect-filled (zoomed to fill with no empty
+/// bars at any window size or aspect ratio).
+fn draw_background(ui: &mut Ui, gpu: &Gpu, width: f32, height: f32) {
+    let (Some(texture), (tw, th)) = (gpu.background.as_ref(), gpu.background_size) else {
+        return;
+    };
+    if tw == 0 || th == 0 || width <= 0.0 || height <= 0.0 {
+        return;
+    }
+    let scale = (width / tw as f32).max(height / th as f32);
+    let vis_u = (width / (tw as f32 * scale)).clamp(0.0, 1.0);
+    let vis_v = (height / (th as f32 * scale)).clamp(0.0, 1.0);
+    let u0 = (1.0 - vis_u) * 0.5;
+    let v0 = (1.0 - vis_v) * 0.5;
+    let full = Rect::new(0.0, 0.0, width, height);
+    ui.draw_list_mut().image_uv_rect(
+        full,
+        texture,
+        Color::WHITE,
+        0.0,
+        (u0, v0, 1.0 - u0, 1.0 - v0),
+    );
+    ui.draw_list_mut()
+        .rect(full, fade(theme::bg(), BACKGROUND_DIM));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------------------------
+
+/// Quick-access preset dots inside the full-range colour picker (starts with Default's black,
+/// grey, and off-white so they are always one click away).
+const PICKER_PRESETS: [Color; 8] = [
+    Color::rgb(0x00, 0x00, 0x00),
+    Color::rgb(0x1a, 0x1a, 0x1a),
+    Color::rgb(0x8a, 0x8a, 0x8a),
+    Color::rgb(0xec, 0xec, 0xec),
+    Color::rgb(0xff, 0x5d, 0x8f),
+    Color::rgb(0x7a, 0xa2, 0xff),
+    Color::rgb(0x22, 0xc5, 0x5e),
+    Color::rgb(0xf9, 0x73, 0x16),
+];
+
+const SET_MAX_W: f32 = 700.0;
+const THEME_ROW_H: f32 = 42.0;
+const THEME_GRID_GAP: f32 = 8.0;
+const THEME_PREVIEW_CAP: usize = 8;
+
+fn theme_creator_box_height(width: f32, has_tbg: bool) -> f32 {
+    // Wide layout places Interface and Lyrics groups side-by-side (3 rows each) + theme background row;
+    // narrow layout stacks them (6 rows) + theme background row.
+    let frost_h = if has_tbg { 72.0 } else { 0.0 };
+    if width >= 600.0 {
+        16.0 + 34.0 + 16.0 + 22.0 + 3.0 * 44.0 + 44.0 + frost_h + 12.0
+    } else {
+        16.0 + 34.0 + 16.0 + (22.0 + 3.0 * 44.0) * 2.0 + 14.0 + 44.0 + frost_h + 12.0
+    }
+}
+
+const EQ_PRESETS: [(&str, [f32; 10]); 4] = [
+    ("Flat", [0.0; 10]),
+    ("Bass", [5.5, 4.5, 3.0, 1.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0]),
+    (
+        "Bright",
+        [-1.0, -0.5, 0.0, 0.0, 0.5, 1.5, 3.0, 4.5, 5.0, 4.5],
+    ),
+    (
+        "Vocal",
+        [-2.0, -1.5, -0.5, 1.5, 3.5, 4.0, 3.0, 1.5, 0.5, 0.0],
+    ),
+];
+
+fn filtered_theme_indices(state: &State) -> Vec<usize> {
+    let q = state.settings.theme_query.trim().to_ascii_lowercase();
+    theme_order(&state.themes)
+        .into_iter()
+        .filter(|&i| q.is_empty() || state.themes[i].name.to_ascii_lowercase().contains(&q))
+        .collect()
+}
+
+fn surface_color(cx: &Cx) -> Color {
+    if cx.gpu.background.is_some() {
+        fade(theme::panel(), 0.54)
+    } else {
+        theme::panel()
+    }
+}
+
+/// The Settings page's category tabs (Appearance, Audio, General).
+const SETTINGS_PILLS: PillKeys = PillKeys {
+    hover: "settings_tab_hv",
+    on: "settings_tab_on",
+    glide_x: "settings_tab_glide_x",
+    glide_w: "settings_tab_glide_w",
+};
+
+fn settings_page(cx: &mut Cx, state: &mut State, view: Rect, actions: &mut Vec<Action>) {
+    let left = view.x + 8.0;
+    let width = (view.w - 32.0).clamp(280.0, SET_MAX_W);
+    let top = PAGE_TOP;
+    let body = cx
+        .ui
+        .scroll_begin("settings", view, settings_height(state, width).max(view.h));
+    let mut y = body.y + top;
+
+    cx.text(
+        Rect::new(left, y, width, 32.0),
+        "Settings",
+        24.0,
+        theme::fg(),
+        Align::Left,
+    );
+    y += 42.0;
+
+    let labels = SettingsTab::ALL.map(|tab| (tab.label(), tab.icon()));
+    if let Some(index) = tab_pills(
+        cx,
+        &labels,
+        state.settings.tab.index(),
+        left,
+        y,
+        &SETTINGS_PILLS,
+    ) {
+        state.settings.tab = SettingsTab::ALL[index];
+        state.settings.color_picker = None;
+    }
+    y += COLLECTION_TAB_H + 22.0;
+
+    match state.settings.tab {
+        SettingsTab::Appearance => {
+            // ---- Global Background.
+            let global_bg = state.prefs.background();
+            let has_bg = global_bg.is_some();
+            let bg_enabled = state.prefs.background_enabled();
+            section_heading(
+                cx,
+                Rect::new(left, y, width - 64.0, 30.0),
+                "Global Background",
+            );
+            if switch(
+                cx,
+                1,
+                Rect::new(left + width - 46.0, y + 3.0, 46.0, 24.0),
+                bg_enabled,
+            ) {
+                actions.push(Action::ToggleGlobalBackground(!bg_enabled));
+            }
+            y += 30.0;
+            cx.text_fit(
+                Rect::new(left, y, width, 18.0),
+                "Supports image and video (loops). Overrides theme backgrounds when on.",
+                13.0,
+                theme::muted(),
+                Align::Left,
+            );
+            y += 24.0;
+
+            let card_h = if has_bg { 128.0 } else { 56.0 };
+            let card = Rect::new(left, y, width, card_h);
+            let surf = surface_color(cx);
+            cx.draw().round_rect(card, 12.0, surf);
+
+            let pad = 10.0;
+            let right_reserve = if has_bg { 48.0 } else { 14.0 };
+            let pick_row = Rect::new(
+                card.x + pad,
+                card.y + pad,
+                card.w - pad - right_reserve,
+                36.0,
+            );
+            let pick_hover = cx.over_clickable(pick_row);
+            let pick_hv = cx.anims.toggle("bg_pick", 0, pick_hover, rate::SNAP);
+            if pick_hv > 0.01 {
+                cx.draw()
+                    .round_rect(pick_row, 8.0, fade(theme::panel_hover(), pick_hv));
+            }
+            cx.icon(
+                Icon::Folder,
+                (pick_row.x + 16.0, pick_row.y + 18.0),
+                15.5,
+                mix(theme::muted(), theme::fg(), pick_hv.max(0.45)),
+            );
+            if cx.clicked(pick_row) {
+                actions.push(Action::PickBackground);
+            }
+
+            let text_rect = Rect::new(pick_row.x + 34.0, pick_row.y, pick_row.w - 40.0, 36.0);
+            if let Some(err) = state
+                .background_prep_error
+                .as_deref()
+                .or(state.background.error.as_deref())
+            {
+                cx.text_fit(text_rect, err, 12.5, theme::CLOSE_RED, Align::Left);
+            } else if let Some(path) = global_bg {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Background");
+                cx.text_fit(
+                    text_rect,
+                    name,
+                    13.0,
+                    if bg_enabled {
+                        theme::fg()
+                    } else {
+                        theme::muted()
+                    },
+                    Align::Left,
+                );
+            } else {
+                cx.text_fit(
+                    text_rect,
+                    "No background selected",
+                    13.0,
+                    mix(theme::muted(), theme::fg(), pick_hv),
+                    Align::Left,
+                );
+            }
+
+            if has_bg {
+                let trash_rect = Rect::new(card.x + card.w - 42.0, pick_row.y + 2.0, 32.0, 32.0);
+                let trash_hover = cx.over_clickable(trash_rect);
+                let trash_hv = cx.anims.toggle("bg_trash", 0, trash_hover, rate::SNAP);
+                if trash_hv > 0.01 {
+                    cx.draw()
+                        .round_rect(trash_rect, 8.0, fade(theme::panel_hover(), trash_hv));
+                }
+                cx.icon(
+                    Icon::Trash2,
+                    (trash_rect.x + 16.0, trash_rect.y + 16.0),
+                    15.0,
+                    mix(theme::muted(), theme::CLOSE_RED, trash_hv),
+                );
+                if cx.clicked(trash_rect) {
+                    actions.push(Action::ConfirmDialog(Some(ConfirmDialog::RemoveBackground)));
+                }
+
+                let fy = pick_row.y + pick_row.h + 10.0;
+                cx.text(
+                    Rect::new(card.x + 14.0, fy, 46.0, 28.0),
+                    "Frost",
+                    13.0,
+                    theme::muted(),
+                    Align::Left,
+                );
+                let mut strength = state.background.strength;
+                if cx.slider(
+                    SliderId::Blur,
+                    Rect::new(card.x + 64.0, fy + 6.0, (card.w - 128.0).max(100.0), 16.0),
+                    &mut strength,
+                    true,
+                    1.0,
+                ) {
+                    actions.push(Action::BlurStrength(strength));
+                }
+                cx.text(
+                    Rect::new(card.x + card.w - 56.0, fy, 42.0, 28.0),
+                    &format!("{}%", (strength * 100.0).round() as i32),
+                    12.0,
+                    theme::muted(),
+                    Align::Right,
+                );
+
+                let ty = fy + 34.0;
+                cx.text(
+                    Rect::new(card.x + 14.0, ty, 88.0, 28.0),
+                    "Transparency",
+                    13.0,
+                    theme::muted(),
+                    Align::Left,
+                );
+                let mut transparency = state.prefs.background_transparency();
+                if cx.slider(
+                    SliderId::Transparency,
+                    Rect::new(card.x + 106.0, ty + 6.0, (card.w - 170.0).max(100.0), 16.0),
+                    &mut transparency,
+                    true,
+                    1.0,
+                ) {
+                    actions.push(Action::BackgroundTransparency(transparency));
+                }
+                cx.text(
+                    Rect::new(card.x + card.w - 56.0, ty, 42.0, 28.0),
+                    &format!("{}%", (transparency * 100.0).round() as i32),
+                    12.0,
+                    theme::muted(),
+                    Align::Right,
+                );
+            }
+            y += card_h + 28.0;
+
+            // ---- Themes.
+            section_heading(cx, Rect::new(left, y, width - 124.0, 30.0), "Themes");
+            let creator_label = if state.settings.creator_open {
+                "Cancel"
+            } else {
+                "New theme"
+            };
+            let creator_icon = if state.settings.creator_open {
+                Icon::X
+            } else {
+                Icon::Plus
+            };
+            if pill_button(
+                cx,
+                Rect::new(left + width - 112.0, y, 112.0, 30.0),
+                creator_label,
+                Some(creator_icon),
+                true,
+                10,
+            ) {
+                if state.settings.creator_open {
+                    state.settings.creator_open = false;
+                    state.settings.editing_theme = None;
+                    state.settings.color_picker = None;
+                } else {
+                    state.settings.editing_theme = None;
+                    state.settings.name.clear();
+                    state.background_editor_generation =
+                        state.background_editor_generation.wrapping_add(1);
+                    state.settings.creator_open = true;
+                }
+            }
+            y += 38.0;
+
+            let show_search = state.themes.len() > 5;
+            if show_search {
+                let mut s_style = TextFieldStyle::new(cx.font);
+                s_style.size = 13.0;
+                s_style.text = theme::fg();
+                s_style.normal = surface_color(cx);
+                s_style.hover = mix(surface_color(cx), theme::panel_hover(), 0.65);
+                s_style.accent = theme::accent();
+                s_style.selection_alpha = 56;
+                s_style.corner_radius = 10.0;
+                s_style.border_width = 0.0;
+                s_style.caret = theme::fg();
+                s_style.caret_width = 1.5;
+                s_style.caret_inset = 9.0;
+                s_style.selection_inset = 9.0;
+                s_style.text_inset = 34.0;
+                let filter_rect = Rect::new(left, y, width, 34.0);
+                cx.ui.text_field(
+                    "theme_filter",
+                    filter_rect,
+                    &mut state.settings.theme_query,
+                    s_style,
+                );
+                cx.icon(
+                    Icon::Search,
+                    (filter_rect.x + 17.0, filter_rect.y + 17.0),
+                    14.0,
+                    theme::muted(),
+                );
+                if state.settings.theme_query.is_empty() {
+                    cx.text(
+                        Rect::new(
+                            filter_rect.x + 34.0,
+                            filter_rect.y,
+                            filter_rect.w - 46.0,
+                            filter_rect.h,
+                        ),
+                        "Filter themes",
+                        12.5,
+                        theme::muted(),
+                        Align::Left,
+                    );
+                }
+                y += 44.0;
+            }
+
+            let raw_active = state.prefs.active_theme().map(str::to_owned);
+            let active = match raw_active.as_deref() {
+                Some(name) if state.themes.iter().any(|t| t.name == name) => Some(name.to_owned()),
+                _ => None,
+            };
+
+            let filtered = filtered_theme_indices(state);
+            let searching = !state.settings.theme_query.trim().is_empty();
+            let total_entries = 1 + filtered.len();
+            let capped =
+                !searching && !state.settings.show_all_themes && total_entries > THEME_PREVIEW_CAP;
+            let visible_entries = if capped {
+                THEME_PREVIEW_CAP
+            } else {
+                total_entries
+            };
+            let cols = if width >= 460.0 { 2 } else { 1 };
+            let grid_rows = visible_entries.div_ceil(cols);
+            let cell_w = (width - THEME_GRID_GAP * (cols.saturating_sub(1) as f32)) / cols as f32;
+            let place = |slot: usize, base_y: f32| -> Rect {
+                let col = slot % cols;
+                let row = slot / cols;
+                Rect::new(
+                    left + col as f32 * (cell_w + THEME_GRID_GAP),
+                    base_y + row as f32 * (THEME_ROW_H + THEME_GRID_GAP),
+                    cell_w,
+                    THEME_ROW_H,
+                )
+            };
+
+            let def_p = theme::Palette::default();
+            if theme_row(
+                cx,
+                place(0, y),
+                "Default",
+                (def_p.bg, def_p.panel, def_p.accent),
+                active.is_none(),
+                None,
+                false,
+                0,
+            ) == ThemePress::Apply
+            {
+                actions.push(Action::SetTheme(None));
+            }
+
+            let visible_saved = visible_entries.saturating_sub(1);
+            for (offset, &index) in filtered.iter().take(visible_saved).enumerate() {
+                let slot = offset + 1;
+                let (name, colors, favorite) = {
+                    let t = &state.themes[index];
+                    let pal = theme::Palette::from_colors(
+                        rgb_color(t.primary),
+                        rgb_color(t.secondary),
+                        rgb_color(t.accent),
+                    );
+                    (t.name.clone(), (pal.bg, pal.panel, pal.accent), t.favorite)
+                };
+                let chosen = active.as_deref() == Some(name.as_str());
+                match theme_row(
+                    cx,
+                    place(slot, y),
+                    &name,
+                    colors,
+                    chosen,
+                    Some(favorite),
+                    true,
+                    index as u32 + 1,
+                ) {
+                    ThemePress::Apply => actions.push(Action::SetTheme(Some(name))),
+                    ThemePress::Favorite => actions.push(Action::FavoriteTheme(name)),
+                    ThemePress::Edit => actions.push(Action::EditTheme(name)),
+                    ThemePress::Delete => actions.push(Action::ConfirmDialog(Some(
+                        ConfirmDialog::DeleteTheme(name),
+                    ))),
+                    ThemePress::None => {}
+                }
+            }
+            y += grid_rows as f32 * (THEME_ROW_H + THEME_GRID_GAP);
+
+            if !searching && total_entries > THEME_PREVIEW_CAP {
+                let label = if state.settings.show_all_themes {
+                    "Show fewer".to_owned()
+                } else {
+                    format!("Show all ({total_entries})")
+                };
+                if text_button(cx, Rect::new(left, y, 120.0, 26.0), &label, false) {
+                    state.settings.show_all_themes = !state.settings.show_all_themes;
+                }
+                y += 30.0;
+            }
+
+            if state.settings.creator_open {
+                y += 8.0;
+                draw_theme_builder(cx, state, left, y, width, actions);
+            }
+        }
+        SettingsTab::Audio => {
+            // ---- Equalizer.
+            section_heading(cx, Rect::new(left, y, width, 30.0), "Equalizer");
+            y += 36.0;
+
+            let mut px = left;
+            let reset_w = 88.0;
+            for (idx, (label, preset)) in EQ_PRESETS.iter().enumerate() {
+                let is_active = state
+                    .eq
+                    .iter()
+                    .zip(preset.iter())
+                    .all(|(a, b)| (a - b).abs() < 0.25);
+                let pw = (label.len() as f32 * 7.2 + 24.0).max(52.0);
+                if px + pw <= left + width - reset_w - 8.0 {
+                    let rect = Rect::new(px, y, pw, 28.0);
+                    let hover = cx.over_clickable(rect);
+                    let hv = cx.anims.toggle("eq_preset", idx as u32, hover, rate::SNAP);
+                    let bg = if is_active {
+                        theme::accent()
+                    } else {
+                        mix(surface_color(cx), theme::panel_hover(), hv)
+                    };
+                    let fg = if is_active {
+                        theme::on_accent()
+                    } else {
+                        mix(theme::muted(), theme::fg(), hv)
+                    };
+                    cx.draw().round_rect(rect, 14.0, bg);
+                    cx.text(rect, label, 12.0, fg, Align::Center);
+                    if cx.clicked(rect) {
+                        actions.push(Action::SetEq(*preset));
+                    }
+                    px += pw + 8.0;
+                }
+            }
+            if pill_button(
+                cx,
+                Rect::new(left + width - reset_w, y - 1.0, reset_w, 30.0),
+                "Reset",
+                Some(Icon::Reset),
+                true,
+                12,
+            ) {
+                actions.push(Action::ResetEq);
+            }
+            y += 38.0;
+
+            let deck = Rect::new(left, y, width, 162.0);
+            let surf = surface_color(cx);
+            cx.draw().round_rect(deck, 12.0, surf);
+            let bands = crate::prefs::EQ_BANDS.len();
+            let pad_x = 14.0;
+            let step_w = (deck.w - pad_x * 2.0) / bands as f32;
+            let fader_top = deck.y + 30.0;
+            let fader_h = 98.0;
+
+            for index in 0..bands {
+                let cx_band = deck.x + pad_x + step_w * (index as f32 + 0.5);
+                let gain = state.eq[index];
+                let db_text = if gain.abs() < 0.25 {
+                    "0".to_owned()
+                } else {
+                    format!("{gain:+.1}")
+                };
+                cx.text(
+                    Rect::new(cx_band - step_w * 0.5, deck.y + 10.0, step_w, 16.0),
+                    &db_text,
+                    10.5,
+                    if gain.abs() >= 0.25 {
+                        theme::accent()
+                    } else {
+                        theme::faint()
+                    },
+                    Align::Center,
+                );
+
+                let fader_rect = Rect::new(cx_band - 12.0, fader_top, 24.0, fader_h);
+                let mut value = (gain + EQ_RANGE_DB) / (2.0 * EQ_RANGE_DB);
+                if cx.vertical_slider(SliderId::Eq(index), fader_rect, &mut value, true) {
+                    let mut gains = state.eq;
+                    let db = value * 2.0 * EQ_RANGE_DB - EQ_RANGE_DB;
+                    gains[index] = (db * 2.0).round() / 2.0;
+                    actions.push(Action::SetEq(gains));
+                }
+
+                let label = crate::prefs::eq_band_label(index);
+                cx.text(
+                    Rect::new(
+                        cx_band - step_w * 0.5,
+                        fader_top + fader_h + 8.0,
+                        step_w,
+                        16.0,
+                    ),
+                    &label,
+                    11.0,
+                    theme::muted(),
+                    Align::Center,
+                );
+            }
+        }
+        SettingsTab::General => {
+            // ---- Downloads.
+            let enabled = state.prefs.downloads();
+            section_heading(cx, Rect::new(left, y, width - 64.0, 26.0), "Downloads");
+            if switch(
+                cx,
+                0,
+                Rect::new(left + width - 46.0, y + 4.0, 46.0, 24.0),
+                enabled,
+            ) {
+                if enabled {
+                    let has_saved =
+                        !state.library.ids().songs.is_empty() || state.library.album_count() > 0;
+                    actions.push(if has_saved {
+                        Action::ConfirmDialog(Some(ConfirmDialog::Downloads))
+                    } else {
+                        Action::SetDownloads(false)
+                    });
+                } else {
+                    actions.push(Action::SetDownloads(true));
+                }
+            }
+            y += 28.0;
+            cx.text_fit(
+                Rect::new(left, y, width - 64.0, 18.0),
+                "Download songs in collections locally. Turning this off deletes local copies.",
+                13.0,
+                theme::muted(),
+                Align::Left,
+            );
+        }
+    }
+
+    cx.ui.scroll_end();
+}
+
+/// The settings column's height, matching [`settings_page`].
+fn settings_height(state: &State, width: f32) -> f32 {
+    let top = PAGE_TOP;
+    let header_h = 42.0 + COLLECTION_TAB_H + 22.0;
+    let body_h = match state.settings.tab {
+        SettingsTab::Appearance => {
+            let has_bg = state.background.path.is_some();
+            let bg_h = 30.0 + 24.0 + if has_bg { 94.0 } else { 56.0 } + 28.0;
+
+            let show_search = state.themes.len() > 5;
+            let total_entries = 1 + filtered_theme_indices(state).len();
+            let searching = !state.settings.theme_query.trim().is_empty();
+            let capped =
+                !searching && !state.settings.show_all_themes && total_entries > THEME_PREVIEW_CAP;
+            let visible_entries = if capped {
+                THEME_PREVIEW_CAP
+            } else {
+                total_entries
+            };
+            let cols = if width >= 460.0 { 2 } else { 1 };
+            let grid_rows = visible_entries.div_ceil(cols);
+            let show_all_h = if !searching && total_entries > THEME_PREVIEW_CAP {
+                30.0
+            } else {
+                0.0
+            };
+            let creator_h = if state.settings.creator_open {
+                theme_creator_box_height(width, state.settings.theme_background.is_some()) + 16.0
+            } else {
+                0.0
+            };
+            let themes_h = 38.0
+                + if show_search { 44.0 } else { 0.0 }
+                + grid_rows as f32 * (THEME_ROW_H + THEME_GRID_GAP)
+                + show_all_h
+                + creator_h
+                + 32.0;
+            bg_h + themes_h
+        }
+        SettingsTab::Audio => 36.0 + 38.0 + 162.0 + 36.0,
+        SettingsTab::General => 28.0 + 48.0,
+    };
+
+    top + header_h + body_h
+}
+
+/// What a press on a theme row asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemePress {
+    None,
+    Apply,
+    Favorite,
+    Edit,
+    Delete,
+}
+
+/// One compact borderless row in the theme grid: subtle 3-dot palette preview, name, and star/delete.
+#[allow(clippy::too_many_arguments)]
+fn theme_row(
+    cx: &mut Cx,
+    row: Rect,
+    name: &str,
+    swatches: (Color, Color, Color),
+    active: bool,
+    favorite: Option<bool>,
+    deletable: bool,
+    key: u32,
+) -> ThemePress {
+    let hover = cx.over_clickable(row);
+    let hv = cx.anims.toggle("theme_row", key, hover, rate::SNAP);
+    let has_bg = cx.gpu.background.is_some();
+    let bg = if active {
+        if has_bg {
+            fade(theme::panel_select(), 0.78)
+        } else {
+            theme::panel_select()
+        }
+    } else {
+        mix(surface_color(cx), theme::panel_hover(), hv)
+    };
+    cx.draw().round_rect(row, 10.0, bg);
+
+    // 3 compact 10px colour dots instead of oversized bordered tiles.
+    let dot_y = row.y + (row.h - 10.0) * 0.5;
+    let mut dx = row.x + 12.0;
+    for c in [swatches.0, swatches.1, swatches.2] {
+        cx.draw()
+            .round_rect(Rect::new(dx, dot_y, 10.0, 10.0), 5.0, c);
+        dx += 13.0;
+    }
+
+    let text_x = dx + 6.0;
+    let actions_w = match (favorite.is_some(), deletable) {
+        (true, true) => 86.0,
+        (true, false) | (false, true) => 34.0,
+        (false, false) => 12.0,
+    };
+    let ink = mix(
+        theme::muted(),
+        theme::fg(),
+        if active { 1.0 } else { hv.max(0.62) },
+    );
+    cx.text_fit(
+        Rect::new(
+            text_x,
+            row.y,
+            (row.x + row.w - actions_w - text_x).max(20.0),
+            row.h,
+        ),
+        name,
+        13.5,
+        ink,
+        Align::Left,
+    );
+
+    let mut ax = row.x + row.w - 32.0;
+    if deletable {
+        let bin = Rect::new(ax, row.y + row.h * 0.5 - 14.0, 28.0, 28.0);
+        let b_hover = cx.over_clickable(bin);
+        let bhv = cx.anims.toggle("theme_bin", key, b_hover, rate::SNAP);
+        cx.icon(
+            Icon::Trash2,
+            (bin.x + 14.0, bin.y + 14.0),
+            13.5,
+            mix(theme::faint(), theme::CLOSE_RED, bhv),
+        );
+        if cx.clicked(bin) {
+            return ThemePress::Delete;
+        }
+        ax -= 26.0;
+
+        let edit = Rect::new(ax, row.y + row.h * 0.5 - 14.0, 28.0, 28.0);
+        let e_hover = cx.over_clickable(edit);
+        let ehv = cx.anims.toggle("theme_edit", key, e_hover, rate::SNAP);
+        cx.icon(
+            Icon::Settings,
+            (edit.x + 14.0, edit.y + 14.0),
+            13.5,
+            mix(theme::faint(), theme::fg(), ehv),
+        );
+        if cx.clicked(edit) {
+            return ThemePress::Edit;
+        }
+        ax -= 26.0;
+    }
+    if let Some(favorite) = favorite {
+        let star = Rect::new(ax, row.y + row.h * 0.5 - 14.0, 28.0, 28.0);
+        let s_hover = cx.over_clickable(star);
+        let shv = cx.anims.toggle("theme_star", key, s_hover, rate::SNAP);
+        let color = if favorite {
+            Color::rgb(0xfb, 0xbf, 0x24)
+        } else {
+            mix(theme::faint(), theme::fg(), shv)
+        };
+        let icon = if favorite {
+            Icon::StarFilled
+        } else {
+            Icon::Star
+        };
+        cx.icon(icon, (star.x + 14.0, star.y + 14.0), 14.5, color);
+        if cx.clicked(star) {
+            return ThemePress::Favorite;
+        }
+    }
+    if cx.clicked(row) {
+        ThemePress::Apply
+    } else {
+        ThemePress::None
+    }
+}
+
+fn format_hex(c: Color) -> String {
+    format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b)
+}
+
+fn parse_hex(input: &str) -> Option<Color> {
+    let s = input.trim().strip_prefix('#').unwrap_or(input.trim());
+    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(Color::rgb(r, g, b))
+}
+
+fn settings_slot_color(settings: &Settings, slot: ColorSlot) -> Color {
+    match slot {
+        ColorSlot::Primary => settings.primary,
+        ColorSlot::Secondary => settings.secondary,
+        ColorSlot::Accent => settings.accent,
+        ColorSlot::LyricsFill => settings.lyrics_fill,
+        ColorSlot::LyricsOutline => settings.lyrics_outline,
+        ColorSlot::Visualizer => settings.visualizer_color,
+    }
+}
+
+fn set_settings_slot_color(settings: &mut Settings, slot: ColorSlot, color: Color) {
+    match slot {
+        ColorSlot::Primary => settings.primary = color,
+        ColorSlot::Secondary => settings.secondary = color,
+        ColorSlot::Accent => settings.accent = color,
+        ColorSlot::LyricsFill => settings.lyrics_fill = color,
+        ColorSlot::LyricsOutline => settings.lyrics_outline = color,
+        ColorSlot::Visualizer => settings.visualizer_color = color,
+    }
+}
+
+fn open_color_picker(settings: &mut Settings, slot: ColorSlot, anchor: Rect) {
+    let color = settings_slot_color(settings, slot);
+    let toggle_off = settings
+        .color_picker
+        .as_ref()
+        .is_some_and(|p| p.slot == slot);
+    if toggle_off {
+        settings.color_picker = None;
+    } else {
+        settings.color_picker = Some(ColorPickerState {
+            slot,
+            anchor,
+            hsv: theme::rgb_to_hsv(color),
+            hex: format_hex(color),
+            last_color: color,
+            just_opened: true,
+        });
+    }
+}
+
+/// The theme builder card: name + Reset/Save, and two clear groups (Interface | Lyrics)
+/// side-by-side on wide windows or stacked on narrow ones.
+fn draw_theme_builder(
+    cx: &mut Cx,
+    state: &mut State,
+    left: f32,
+    y: f32,
+    width: f32,
+    actions: &mut Vec<Action>,
+) {
+    let box_h = theme_creator_box_height(width, state.settings.theme_background.is_some());
+    let box_rect = Rect::new(left, y, width, box_h);
+    let surf = surface_color(cx);
+    cx.draw().round_rect(box_rect, 12.0, surf);
+    let pad = 16.0;
+    let cx0 = box_rect.x + pad;
+    let cw = box_rect.w - pad * 2.0;
+    let mut cy = box_rect.y + pad;
+
+    // ---- Row 1: Name field + Default reset + Save/Update.
+    let reset_w = 88.0;
+    let save_w = 98.0;
+    let field_w = (cw - reset_w - save_w - 18.0).max(120.0);
+    let mut style = TextFieldStyle::new(cx.font);
+    style.size = 13.5;
+    style.text = theme::fg();
+    style.normal = theme::raised();
+    style.hover = mix(theme::raised(), theme::panel_press(), 0.5);
+    style.accent = theme::accent();
+    style.selection_alpha = 56;
+    style.corner_radius = 9.0;
+    style.border_width = 0.0;
+    style.caret = theme::fg();
+    style.caret_width = 1.5;
+    style.caret_inset = 10.0;
+    style.selection_inset = 10.0;
+    style.text_inset = 12.0;
+    let field = Rect::new(cx0, cy, field_w, 34.0);
+    cx.ui
+        .text_field("theme_name", field, &mut state.settings.name, style);
+    if state.settings.name.is_empty() {
+        cx.text(
+            Rect::new(field.x + 12.0, field.y, field.w - 24.0, field.h),
+            "Theme name",
+            13.0,
+            theme::muted(),
+            Align::Left,
+        );
+    }
+
+    if pill_button(
+        cx,
+        Rect::new(field.x + field.w + 9.0, cy, reset_w, 34.0),
+        "Default",
+        Some(Icon::Reset),
+        true,
+        12,
+    ) {
+        state.settings.primary = Color::rgb(0x00, 0x00, 0x00);
+        state.settings.secondary = Color::rgb(0xec, 0xec, 0xec);
+        state.settings.accent = Color::rgb(0xec, 0xec, 0xec);
+        state.settings.lyrics_fill = Color::rgb(0xec, 0xec, 0xec);
+        state.settings.lyrics_outline = Color::rgb(0x00, 0x00, 0x00);
+        state.settings.visualizer_mode = VisualizerColorRec::AlbumArt;
+        state.settings.visualizer_color = Color::rgb(0xec, 0xec, 0xec);
+        state.settings.color_picker = None;
+    }
+
+    let ready = !state.settings.name.trim().is_empty();
+    let save_label = if state.settings.editing_theme.is_some() {
+        "Update"
+    } else {
+        "Save"
+    };
+    if pill_button(
+        cx,
+        Rect::new(field.x + field.w + 9.0 + reset_w + 9.0, cy, save_w, 34.0),
+        save_label,
+        Some(Icon::Check),
+        ready,
+        11,
+    ) && ready
+    {
+        actions.push(Action::CreateTheme);
+    }
+    cy += 50.0;
+
+    // ---- Two clean groups: Interface & Lyrics.
+    let side_by_side = width >= 600.0;
+    let group_gap = 24.0;
+    let group_w = if side_by_side {
+        (cw - group_gap) * 0.5
+    } else {
+        cw
+    };
+    let left_x = cx0;
+    let right_x = if side_by_side {
+        cx0 + group_w + group_gap
+    } else {
+        cx0
+    };
+    let left_y = cy;
+    let right_y = if side_by_side {
+        cy
+    } else {
+        cy + 22.0 + 3.0 * 44.0 + 14.0
+    };
+
+    // Left group: Interface
+    cx.text(
+        Rect::new(left_x, left_y, group_w, 18.0),
+        "Interface",
+        11.5,
+        theme::muted(),
+        Align::Left,
+    );
+    let iface_slots = [
+        (ColorSlot::Primary, "Background"),
+        (ColorSlot::Secondary, "Text"),
+        (ColorSlot::Accent, "Accent"),
+    ];
+    for (idx, (slot, label)) in iface_slots.into_iter().enumerate() {
+        let ry = left_y + 22.0 + idx as f32 * 44.0;
+        let rect = Rect::new(left_x, ry, group_w, 36.0);
+        let current = settings_slot_color(&state.settings, slot);
+        let active = state
+            .settings
+            .color_picker
+            .as_ref()
+            .is_some_and(|p| p.slot == slot);
+        if color_slot_button(cx, rect, label, current, active, slot as u32) {
+            open_color_picker(&mut state.settings, slot, rect);
+        }
+    }
+
+    // Right group: Lyrics
+    cx.text(
+        Rect::new(right_x, right_y, group_w, 18.0),
+        "Lyrics",
+        11.5,
+        theme::muted(),
+        Align::Left,
+    );
+    let lyric_slots = [
+        (ColorSlot::LyricsFill, "Text"),
+        (ColorSlot::LyricsOutline, "Outline"),
+    ];
+    for (idx, (slot, label)) in lyric_slots.into_iter().enumerate() {
+        let ry = right_y + 22.0 + idx as f32 * 44.0;
+        let rect = Rect::new(right_x, ry, group_w, 36.0);
+        let current = settings_slot_color(&state.settings, slot);
+        let active = state
+            .settings
+            .color_picker
+            .as_ref()
+            .is_some_and(|p| p.slot == slot);
+        if color_slot_button(cx, rect, label, current, active, slot as u32) {
+            open_color_picker(&mut state.settings, slot, rect);
+        }
+    }
+
+    // Visualizer row inside Lyrics group: label + mode pills (+ swatch when Custom).
+    let viz_y = right_y + 22.0 + 2.0 * 44.0;
+    let viz_row = Rect::new(right_x, viz_y, group_w, 36.0);
+    cx.draw().round_rect(viz_row, 9.0, theme::raised());
+    let label_w = 72.0;
+    cx.text(
+        Rect::new(viz_row.x + 10.0, viz_row.y, label_w, viz_row.h),
+        "Visualizer",
+        12.5,
+        theme::muted(),
+        Align::Left,
+    );
+
+    let custom_swatch_w = if state.settings.visualizer_mode == VisualizerColorRec::Custom {
+        34.0
+    } else {
+        0.0
+    };
+    let pills_x = viz_row.x + label_w + 10.0;
+    let pills_w = (viz_row.w - label_w - 18.0 - custom_swatch_w).max(120.0);
+    let pill_gap = 4.0;
+    let each_w = (pills_w - pill_gap * 2.0) / 3.0;
+    let modes = [
+        (VisualizerColorRec::AlbumArt, "Album Cover"),
+        (VisualizerColorRec::Accent, "Accent"),
+        (VisualizerColorRec::Custom, "Custom"),
+    ];
+    for (idx, (mode, label)) in modes.into_iter().enumerate() {
+        let pill = Rect::new(
+            pills_x + idx as f32 * (each_w + pill_gap),
+            viz_row.y + 4.0,
+            each_w,
+            28.0,
+        );
+        let selected = state.settings.visualizer_mode == mode;
+        let hover = cx.over_clickable(pill);
+        let hv = cx.anims.toggle("viz_mode", idx as u32, hover, rate::SNAP);
+        let bg = if selected {
+            theme::accent()
+        } else {
+            mix(theme::panel(), theme::panel_hover(), hv)
+        };
+        let fg = if selected {
+            theme::on_accent()
+        } else {
+            mix(theme::muted(), theme::fg(), hv)
+        };
+        cx.draw().round_rect(pill, 7.0, bg);
+        cx.text_fit(pill, label, 11.5, fg, Align::Center);
+        if cx.clicked(pill) {
+            state.settings.visualizer_mode = mode;
+            if mode != VisualizerColorRec::Custom
+                && state
+                    .settings
+                    .color_picker
+                    .as_ref()
+                    .is_some_and(|p| p.slot == ColorSlot::Visualizer)
+            {
+                state.settings.color_picker = None;
+            }
+        }
+    }
+
+    if state.settings.visualizer_mode == VisualizerColorRec::Custom {
+        let sw_rect = Rect::new(viz_row.x + viz_row.w - 32.0, viz_row.y + 4.0, 28.0, 28.0);
+        let active = state
+            .settings
+            .color_picker
+            .as_ref()
+            .is_some_and(|p| p.slot == ColorSlot::Visualizer);
+        let sw_hover = cx.over_clickable(sw_rect);
+        cx.draw()
+            .round_rect(sw_rect, 7.0, state.settings.visualizer_color);
+        cx.draw().round_ring(
+            sw_rect,
+            7.0,
+            if active { 1.5 } else { 1.0 },
+            if active {
+                theme::accent()
+            } else {
+                fade(theme::fg(), if sw_hover { 0.55 } else { 0.28 })
+            },
+        );
+        if cx.clicked(sw_rect) {
+            open_color_picker(&mut state.settings, ColorSlot::Visualizer, sw_rect);
+        }
+    }
+
+    // ---- Per-theme Background row.
+    let bg_y = right_y + 22.0 + 3.0 * 44.0 + 4.0;
+    let bg_row = Rect::new(cx0, bg_y, cw, 36.0);
+    cx.draw().round_rect(bg_row, 9.0, theme::raised());
+    let has_tbg = state.settings.theme_background.is_some();
+    let tbg_hit = Rect::new(
+        bg_row.x,
+        bg_row.y,
+        bg_row.w - if has_tbg { 38.0 } else { 0.0 },
+        bg_row.h,
+    );
+    let tbg_hover = cx.over_clickable(tbg_hit);
+    let tbg_hv = cx.anims.toggle("theme_bg_pick", 0, tbg_hover, rate::SNAP);
+    if tbg_hv > 0.01 {
+        cx.draw()
+            .round_rect(tbg_hit, 9.0, fade(theme::panel_hover(), tbg_hv));
+    }
+    cx.icon(
+        Icon::Folder,
+        (bg_row.x + 16.0, bg_row.y + 18.0),
+        15.0,
+        mix(theme::muted(), theme::fg(), tbg_hv.max(0.45)),
+    );
+    cx.text(
+        Rect::new(bg_row.x + 34.0, bg_row.y, 82.0, bg_row.h),
+        "Background",
+        12.5,
+        theme::muted(),
+        Align::Left,
+    );
+    let tbg_label = state
+        .settings
+        .theme_background
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("None (click to choose)");
+    cx.text_fit(
+        Rect::new(
+            bg_row.x + 120.0,
+            bg_row.y,
+            (tbg_hit.w - 132.0).max(40.0),
+            bg_row.h,
+        ),
+        tbg_label,
+        12.5,
+        if has_tbg { theme::fg() } else { theme::faint() },
+        Align::Left,
+    );
+    if cx.clicked(tbg_hit) {
+        actions.push(Action::PickThemeBackground);
+    }
+    if has_tbg {
+        let trash = Rect::new(bg_row.x + bg_row.w - 34.0, bg_row.y + 4.0, 28.0, 28.0);
+        let thover = cx.over_clickable(trash);
+        let thv = cx.anims.toggle("theme_bg_trash", 0, thover, rate::SNAP);
+        cx.icon(
+            Icon::Trash2,
+            (trash.x + 14.0, trash.y + 14.0),
+            13.5,
+            mix(theme::faint(), theme::CLOSE_RED, thv),
+        );
+        if cx.clicked(trash) {
+            state.cancel_background_prep();
+            state.settings.theme_background = None;
+        }
+    }
+    if has_tbg {
+        let fy = bg_row.y + bg_row.h + 10.0;
+        cx.text(
+            Rect::new(cx0, fy, 46.0, 28.0),
+            "Frost",
+            13.0,
+            theme::muted(),
+            Align::Left,
+        );
+        let mut strength = state.settings.theme_background_blur;
+        if cx.slider(
+            SliderId::ThemeBlur,
+            Rect::new(cx0 + 50.0, fy + 6.0, (cw - 106.0).max(100.0), 16.0),
+            &mut strength,
+            true,
+            1.0,
+        ) {
+            actions.push(Action::ThemeBlurStrength(strength));
+        }
+        cx.text(
+            Rect::new(cx0 + cw - 42.0, fy, 42.0, 28.0),
+            &format!("{}%", (strength * 100.0).round() as i32),
+            12.0,
+            theme::muted(),
+            Align::Right,
+        );
+
+        let ty = fy + 34.0;
+        cx.text(
+            Rect::new(cx0, ty, 88.0, 28.0),
+            "Transparency",
+            13.0,
+            theme::muted(),
+            Align::Left,
+        );
+        let mut transparency = state.settings.theme_background_transparency;
+        if cx.slider(
+            SliderId::ThemeTransparency,
+            Rect::new(cx0 + 92.0, ty + 6.0, (cw - 148.0).max(100.0), 16.0),
+            &mut transparency,
+            true,
+            1.0,
+        ) {
+            actions.push(Action::ThemeBackgroundTransparency(transparency));
+        }
+        cx.text(
+            Rect::new(cx0 + cw - 42.0, ty, 42.0, 28.0),
+            &format!("{}%", (transparency * 100.0).round() as i32),
+            12.0,
+            theme::muted(),
+            Align::Right,
+        );
+    }
+}
+
+/// A compact clickable colour button showing label, live swatch dot with border, and hex code.
+fn color_slot_button(
+    cx: &mut Cx,
+    rect: Rect,
+    label: &str,
+    color: Color,
+    active: bool,
+    key: u32,
+) -> bool {
+    let hover = cx.over_clickable(rect);
+    let hv = cx.anims.toggle("color_slot", key, hover, rate::SNAP);
+    let bg = if active {
+        theme::panel_select()
+    } else {
+        mix(theme::raised(), theme::panel_hover(), hv)
+    };
+    cx.draw().round_rect(rect, 9.0, bg);
+    if active {
+        cx.draw().round_ring(rect, 9.0, 1.5, theme::accent());
+    }
+
+    let swatch = Rect::new(rect.x + 8.0, rect.y + (rect.h - 20.0) * 0.5, 20.0, 20.0);
+    cx.draw().round_rect(swatch, 6.0, color);
+    // Subtle 1px ring so #000000 or #ECECEC always has a crisp edge against any surface.
+    cx.draw()
+        .round_ring(swatch, 6.0, 1.0, fade(theme::fg(), 0.28));
+
+    let hex = format_hex(color);
+    let hex_w = 62.0;
+    cx.text_fit(
+        Rect::new(
+            rect.x + 36.0,
+            rect.y,
+            (rect.w - 44.0 - hex_w).max(20.0),
+            rect.h,
+        ),
+        label,
+        12.5,
+        mix(
+            theme::muted(),
+            theme::fg(),
+            if active { 1.0 } else { hv.max(0.65) },
+        ),
+        Align::Left,
+    );
+    cx.text(
+        Rect::new(rect.x + rect.w - hex_w - 8.0, rect.y, hex_w, rect.h),
+        &hex,
+        11.5,
+        theme::faint(),
+        Align::Right,
+    );
+    cx.clicked(rect)
+}
+
+/// Floating in-app full-range HSV + Hex colour picker popup.
+fn draw_color_picker(cx: &mut Cx, state: &mut State, width: f32, height: f32) {
+    let Some(picker) = state.settings.color_picker.as_mut() else {
+        return;
+    };
+    let pop_w = 256.0;
+    let pop_h = 312.0;
+    let margin = 14.0;
+    let px = (picker.anchor.x).clamp(margin, (width - pop_w - margin).max(margin));
+    let below = picker.anchor.y + picker.anchor.h + 8.0;
+    let py = if below + pop_h <= height - margin {
+        below
+    } else {
+        (picker.anchor.y - pop_h - 8.0).max(margin)
+    };
+    let popup = Rect::new(px.round(), py.round(), pop_w, pop_h);
+
+    // Click outside the popup closes it (skip on the exact frame it was opened).
+    let just_opened = picker.just_opened;
+    picker.just_opened = false;
+    if !just_opened && cx.pointer.pressed && !popup.contains(cx.pointer.pos) && cx.drag.is_none() {
+        state.settings.color_picker = None;
+        return;
+    }
+
+    let previous = cx.draw().set_layer(MENU_LAYER + 1);
+    cx.draw().box_shadow(
+        popup,
+        12.0,
+        (0.0, 8.0),
+        22.0,
+        0.0,
+        Color::rgba(0, 0, 0, 130),
+    );
+    cx.draw().round_rect(popup, 12.0, theme::track());
+    cx.draw()
+        .round_rect(popup.inset(1.0), 11.0, theme::raised());
+
+    let pad = 16.0;
+    let ix = popup.x + pad;
+    let iw = popup.w - pad * 2.0;
+    let mut iy = popup.y + 12.0;
+
+    // Header: preview dot + slot title + close button.
+    let current_color = theme::hsv_to_rgb(picker.hsv.0, picker.hsv.1, picker.hsv.2);
+    cx.draw()
+        .round_rect(Rect::new(ix, iy + 5.0, 14.0, 14.0), 4.0, current_color);
+    cx.draw().round_ring(
+        Rect::new(ix, iy + 5.0, 14.0, 14.0),
+        4.0,
+        1.0,
+        fade(theme::fg(), 0.25),
+    );
+    cx.text(
+        Rect::new(ix + 22.0, iy, iw - 50.0, 24.0),
+        picker.slot.label(),
+        13.0,
+        theme::fg(),
+        Align::Left,
+    );
+    let close_rect = Rect::new(popup.x + popup.w - 36.0, iy - 2.0, 26.0, 26.0);
+    let close_hover = cx.over_clickable(close_rect);
+    cx.icon(
+        Icon::X,
+        (close_rect.x + 13.0, close_rect.y + 13.0),
+        14.0,
+        if close_hover {
+            theme::fg()
+        } else {
+            theme::muted()
+        },
+    );
+    let close_clicked = cx.clicked(close_rect);
+    iy += 30.0;
+
+    // 2D Saturation / Value square.
+    let sv_rect = Rect::new(ix, iy, iw, 144.0);
+    let pure_hue = theme::hsv_to_rgb(picker.hsv.0, 1.0, 1.0);
+    cx.draw().round_rect_gradient(
+        sv_rect,
+        8.0,
+        [Color::WHITE, pure_hue, pure_hue, Color::WHITE],
+    );
+    cx.draw().round_rect_gradient(
+        sv_rect,
+        8.0,
+        [
+            Color::TRANSPARENT,
+            Color::TRANSPARENT,
+            Color::BLACK,
+            Color::BLACK,
+        ],
+    );
+    cx.draw()
+        .round_ring(sv_rect, 8.0, 1.0, fade(theme::fg(), 0.14));
+
+    if sv_rect.contains(cx.pointer.pos) {
+        cx.hand = true;
+        if cx.pointer.pressed {
+            cx.drag = Some(SliderId::ColorSv);
+        }
+    }
+    let mut hsv_changed = false;
+    if cx.drag == Some(SliderId::ColorSv) {
+        if cx.pointer.down {
+            let s = ((cx.pointer.pos.0 - sv_rect.x) / sv_rect.w.max(1.0)).clamp(0.0, 1.0);
+            let v = 1.0 - ((cx.pointer.pos.1 - sv_rect.y) / sv_rect.h.max(1.0)).clamp(0.0, 1.0);
+            picker.hsv.1 = s;
+            picker.hsv.2 = v;
+            hsv_changed = true;
+        } else {
+            cx.drag = None;
+        }
+    }
+
+    let sv_thumb = (
+        sv_rect.x + picker.hsv.1 * sv_rect.w,
+        sv_rect.y + (1.0 - picker.hsv.2) * sv_rect.h,
+    );
+    cx.draw().fill_circle(sv_thumb, 7.0, Color::WHITE);
+    cx.draw().stroke_circle(sv_thumb, 7.0, 1.5, Color::BLACK);
+    cx.draw().fill_circle(
+        sv_thumb,
+        4.5,
+        theme::hsv_to_rgb(picker.hsv.0, picker.hsv.1, picker.hsv.2),
+    );
+    iy += 156.0;
+
+    // Hue bar (6 smooth rainbow segments).
+    let hue_rect = Rect::new(ix, iy, iw, 14.0);
+    let stops = [
+        Color::rgb(255, 0, 0),
+        Color::rgb(255, 255, 0),
+        Color::rgb(0, 255, 0),
+        Color::rgb(0, 255, 255),
+        Color::rgb(0, 0, 255),
+        Color::rgb(255, 0, 255),
+        Color::rgb(255, 0, 0),
+    ];
+    cx.draw().push_clip_rounded(hue_rect, 7.0);
+    let seg_w = hue_rect.w / 6.0;
+    for i in 0..6 {
+        let seg = Rect::new(
+            hue_rect.x + i as f32 * seg_w,
+            hue_rect.y,
+            seg_w + 0.5,
+            hue_rect.h,
+        );
+        cx.draw()
+            .gradient_corners(seg, [stops[i], stops[i + 1], stops[i + 1], stops[i]]);
+    }
+    cx.draw().pop_clip();
+    cx.draw()
+        .round_ring(hue_rect, 7.0, 1.0, fade(theme::fg(), 0.14));
+
+    let hue_hit = hue_rect.expand(4.0);
+    if hue_hit.contains(cx.pointer.pos) {
+        cx.hand = true;
+        if cx.pointer.pressed {
+            cx.drag = Some(SliderId::ColorHue);
+        }
+    }
+    if cx.drag == Some(SliderId::ColorHue) {
+        if cx.pointer.down {
+            let h = ((cx.pointer.pos.0 - hue_rect.x) / hue_rect.w.max(1.0)).clamp(0.0, 0.9999);
+            picker.hsv.0 = h;
+            hsv_changed = true;
+        } else {
+            cx.drag = None;
+        }
+    }
+    let hue_thumb = (
+        hue_rect.x + picker.hsv.0 * hue_rect.w,
+        hue_rect.y + hue_rect.h * 0.5,
+    );
+    cx.draw().fill_circle(hue_thumb, 8.0, Color::WHITE);
+    cx.draw().stroke_circle(hue_thumb, 8.0, 1.5, Color::BLACK);
+    cx.draw()
+        .fill_circle(hue_thumb, 5.0, theme::hsv_to_rgb(picker.hsv.0, 1.0, 1.0));
+    iy += 26.0;
+
+    let mut pending_color: Option<(ColorSlot, Color)> = None;
+
+    // Quick preset dots (including Default #000000, #1A1A1A, #8A8A8A, #ECECEC).
+    let dot_step = (iw - 20.0) / (PICKER_PRESETS.len() - 1) as f32;
+    for (idx, preset) in PICKER_PRESETS.into_iter().enumerate() {
+        let dc = (ix + 10.0 + idx as f32 * dot_step, iy + 10.0);
+        let drect = Rect::new(dc.0 - 10.0, dc.1 - 10.0, 20.0, 20.0);
+        if cx.over_clickable(drect) {
+            cx.draw().fill_circle(dc, 10.0, fade(theme::fg(), 0.25));
+        }
+        cx.draw().fill_circle(dc, 8.0, preset);
+        cx.draw()
+            .stroke_circle(dc, 8.0, 1.0, fade(theme::fg(), 0.25));
+        if cx.clicked(drect) {
+            picker.hsv = theme::rgb_to_hsv(preset);
+            picker.hex = format_hex(preset);
+            picker.last_color = preset;
+            hsv_changed = false;
+            pending_color = Some((picker.slot, preset));
+        }
+    }
+    iy += 30.0;
+
+    if hsv_changed {
+        let c = theme::hsv_to_rgb(picker.hsv.0, picker.hsv.1, picker.hsv.2);
+        picker.hex = format_hex(c);
+        picker.last_color = c;
+        pending_color = Some((picker.slot, c));
+    }
+
+    // Editable #RRGGBB hex field + Done button.
+    let mut style = TextFieldStyle::new(cx.font);
+    style.size = 13.0;
+    style.text = theme::fg();
+    style.normal = theme::panel();
+    style.hover = theme::panel_hover();
+    style.accent = theme::accent();
+    style.selection_alpha = 56;
+    style.corner_radius = 8.0;
+    style.border_width = 0.0;
+    style.caret = theme::fg();
+    style.caret_width = 1.5;
+    style.caret_inset = 8.0;
+    style.selection_inset = 8.0;
+    style.text_inset = 10.0;
+    let hex_rect = Rect::new(ix, iy, iw - 76.0, 32.0);
+    cx.ui
+        .text_field("color_hex", hex_rect, &mut picker.hex, style);
+    if let Some(parsed) = parse_hex(&picker.hex) {
+        if parsed != picker.last_color {
+            picker.last_color = parsed;
+            picker.hsv = theme::rgb_to_hsv(parsed);
+            pending_color = Some((picker.slot, parsed));
+        }
+    }
+
+    let done_clicked = pill_button(
+        cx,
+        Rect::new(ix + iw - 68.0, iy, 68.0, 32.0),
+        "Done",
+        None,
+        true,
+        13,
+    );
+
+    cx.draw().set_layer(previous);
+    if let Some((slot, color)) = pending_color {
+        set_settings_slot_color(&mut state.settings, slot, color);
+    }
+    if close_clicked || done_clicked {
+        state.settings.color_picker = None;
+    }
+}
+
+/// A small filled pill with an optional icon. Dimmed and inert when `enabled` is false.
+fn pill_button(
+    cx: &mut Cx,
+    rect: Rect,
+    label: &str,
+    icon: Option<Icon>,
+    enabled: bool,
+    key: u32,
+) -> bool {
+    let hover = enabled && cx.over_clickable(rect);
+    let hv = cx.anims.toggle("pill_hv", key, hover, rate::SNAP);
+    cx.draw().round_rect(
+        rect,
+        rect.h * 0.5,
+        mix(theme::raised(), theme::panel_press(), hv),
+    );
+    let color = if enabled {
+        mix(theme::muted(), theme::fg(), hv.max(0.35))
+    } else {
+        theme::faint()
+    };
+    let mut text = rect;
+    if let Some(icon) = icon {
+        cx.icon(icon, (rect.x + 18.0, rect.y + rect.h * 0.5), 15.0, color);
+        text = Rect::new(rect.x + 30.0, rect.y, rect.w - 36.0, rect.h);
+    }
+    cx.text(text, label, 12.5, color, Align::Center);
+    enabled && cx.clicked(rect)
+}
+
+/// A switch: the knob slides and the track lights as it is turned on.
+fn switch(cx: &mut Cx, key: u32, rect: Rect, on: bool) -> bool {
+    let t = cx
+        .anims
+        .spring("switch", key, if on { 1.0 } else { 0.0 }, 620.0)
+        .clamp(0.0, 1.0);
+    let hit = Rect::new(rect.x - 6.0, rect.y - 6.0, rect.w + 12.0, rect.h + 12.0);
+    let hover = cx.over_clickable(hit);
+    let hv = cx.anims.toggle("switch_hv", key, hover, rate::SNAP);
+    let off = mix(theme::raised_top(), theme::fg(), 0.12 * hv);
+    cx.draw()
+        .round_rect(rect, rect.h * 0.5, mix(off, theme::accent(), t));
+    let r = rect.h * 0.5 - 3.0;
+    let x = rect.x + r + 3.0 + t * (rect.w - 2.0 * (r + 3.0));
+    let knob = if t > 0.5 {
+        theme::on_accent()
+    } else {
+        mix(theme::muted(), theme::fg(), hv)
+    };
+    cx.draw()
+        .round_rect(Rect::new(x - r, rect.y + 3.0, r * 2.0, r * 2.0), r, knob);
+    cx.clicked(hit)
+}
+
+/// Confirmation dialog for destructive actions. Its buttons are live while the page under it is not.
+fn draw_confirm_dialog(
+    cx: &mut Cx,
+    dialog: &ConfirmDialog,
+    width: f32,
+    height: f32,
+    actions: &mut Vec<Action>,
+) {
+    let (title, body) = match dialog {
+        ConfirmDialog::Downloads => (
+            "Delete downloaded songs?",
+            "This will delete all of the local copies of your albums and songs saved to Collections.",
+        ),
+        ConfirmDialog::DeleteTheme(_) => (
+            "Delete theme?",
+            "This will permanently delete this theme.",
+        ),
+        ConfirmDialog::RemoveBackground => (
+            "Delete background?",
+            "This will permanently delete this background.",
+        ),
+    };
+    cx.draw().rect(
+        Rect::new(0.0, 0.0, width, height),
+        Color::rgba(0, 0, 0, 150),
+    );
+    let w = 420.0f32.min(width - 40.0);
+    let h = 184.0;
+    let panel = Rect::new(
+        ((width - w) * 0.5).round(),
+        ((height - h) * 0.5).round(),
+        w,
+        h,
+    );
+    let layer = cx.draw().set_layer(MENU_LAYER + 1);
+    cx.draw().backdrop_rounded(panel, Color::WHITE, 16.0);
+    cx.draw().round_rect(panel, 16.0, theme::panel());
+    cx.text(
+        Rect::new(panel.x + 24.0, panel.y + 22.0, w - 48.0, 26.0),
+        title,
+        17.0,
+        theme::fg(),
+        Align::Center,
+    );
+    let body_h = cx.text_block_height(w - 48.0, body, 13.0, 1.35);
+    cx.text_block(
+        Rect::new(panel.x + 24.0, panel.y + 56.0, w - 48.0, body_h),
+        body,
+        13.0,
+        theme::muted(),
+        1.35,
+        Align::Center,
+    );
+    let by = panel.y + h - 54.0;
+    let cancel_w = 92.0;
+    let delete_w = 92.0;
+    let gap = 10.0;
+    let bx = panel.x + (w - (cancel_w + gap + delete_w)) * 0.5;
+    if dialog_button(cx, Rect::new(bx, by, cancel_w, 34.0), "Cancel", None, false) {
+        actions.push(Action::ConfirmDialog(None));
+    }
+    if dialog_button(
+        cx,
+        Rect::new(bx + cancel_w + gap, by, delete_w, 34.0),
+        "Delete",
+        None,
+        true,
+    ) {
+        match dialog {
+            ConfirmDialog::Downloads => actions.push(Action::SetDownloads(false)),
+            ConfirmDialog::DeleteTheme(name) => actions.push(Action::DeleteTheme(name.clone())),
+            ConfirmDialog::RemoveBackground => actions.push(Action::RemoveBackground),
+        }
+    }
+    cx.draw().set_layer(layer);
+}
+
+fn dialog_button(cx: &mut Cx, rect: Rect, label: &str, icon: Option<Icon>, danger: bool) -> bool {
+    let hover = cx.over_clickable(rect);
+    let hv = cx
+        .anims
+        .toggle("dlg_btn", hash(label) % 512, hover, rate::SNAP);
+    cx.draw()
+        .round_rect(rect, 9.0, mix(theme::raised(), theme::panel_hover(), hv));
+    let base = if danger {
+        theme::CLOSE_RED
+    } else {
+        theme::muted()
+    };
+    let hot = if danger {
+        mix(theme::CLOSE_RED, theme::fg(), 0.3)
+    } else {
+        theme::fg()
+    };
+    let ink = mix(base, hot, hv);
+    if let Some(icon) = icon {
+        cx.icon(icon, (rect.x + 18.0, rect.y + rect.h * 0.5), 14.0, ink);
+        cx.text(
+            Rect::new(rect.x + 28.0, rect.y, rect.w - 34.0, rect.h),
+            label,
+            13.0,
+            ink,
+            Align::Center,
+        );
+    } else {
+        cx.text(rect, label, 13.0, ink, Align::Center);
+    }
+    cx.clicked(rect)
+}
+
+fn text_button(cx: &mut Cx, rect: Rect, label: &str, danger: bool) -> bool {
+    let hover = cx.over_clickable(rect);
+    let hv = cx
+        .anims
+        .toggle("text_btn", hash(label) % 512, hover, rate::SNAP);
+    if hv > 0.0 {
+        cx.draw()
+            .round_rect(rect, 8.0, fade(theme::panel_hover(), hv));
+    }
+    let base = if danger {
+        theme::CLOSE_RED
+    } else {
+        theme::muted()
+    };
+    let hot = if danger {
+        mix(theme::CLOSE_RED, theme::fg(), 0.3)
+    } else {
+        theme::fg()
+    };
+    cx.text(rect, label, 13.0, mix(base, hot, hv), Align::Center);
+    cx.clicked(rect)
+}
+
+/// Saved themes, favourites first, each group in the order it was made.
+fn theme_order(themes: &[ThemeRec]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..themes.len()).collect();
+    order.sort_by_key(|index| (!themes[*index].favorite, *index));
+    order
+}
+
+/// A name not already taken, so two themes never collide in the list.
+fn unique_theme_name(base: &str, themes: &[ThemeRec]) -> String {
+    let base = if base.is_empty() { "My theme" } else { base };
+    // `Default` belongs to the built-in theme, so saved ones may not take it.
+    let taken = |name: &str| {
+        name.eq_ignore_ascii_case("Default") || themes.iter().any(|theme| theme.name == name)
+    };
+    if !taken(base) {
+        return base.to_owned();
+    }
+    let mut number = 2;
+    loop {
+        let candidate = format!("{base} {number}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+        number += 1;
+    }
+}
+
+fn rgb_color(value: u32) -> Color {
+    Color::rgb((value >> 16) as u8, (value >> 8) as u8, value as u8)
+}
+
+fn rgb_value(color: Color) -> u32 {
+    (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)
+}
+
+/// The palette a theme name stands for.
+fn theme_palette(active: Option<&str>, themes: &[ThemeRec]) -> theme::Palette {
+    match active.and_then(|name| themes.iter().find(|theme| theme.name == name)) {
+        Some(theme) => {
+            let viz = match theme.visualizer_mode {
+                VisualizerColorRec::AlbumArt => theme::VisualizerColor::AlbumArt,
+                VisualizerColorRec::Accent => theme::VisualizerColor::Accent,
+                VisualizerColorRec::Custom => theme::VisualizerColor::Custom(
+                    theme
+                        .visualizer_color
+                        .map(rgb_color)
+                        .unwrap_or_else(|| rgb_color(theme.accent)),
+                ),
+            };
+            theme::Palette::from_theme(
+                rgb_color(theme.primary),
+                rgb_color(theme.secondary),
+                rgb_color(theme.accent),
+                theme.lyrics_fill.map(rgb_color),
+                theme.lyrics_outline.map(rgb_color),
+                viz,
+            )
+        }
+        None => theme::Palette::default(),
+    }
+}
+
+fn effective_background_path(prefs: &Prefs, themes: &[ThemeRec]) -> Option<std::path::PathBuf> {
+    if prefs.background_enabled() {
+        if let Some(global) = prefs.background() {
+            return Some(global.to_path_buf());
+        }
+    }
+    prefs
+        .active_theme()
+        .and_then(|name| themes.iter().find(|t| t.name == name))
+        .and_then(|t| t.background.as_deref())
+        .map(std::path::PathBuf::from)
+}
+
+fn effective_background_transparency(state: &State) -> f32 {
+    let global_active = state.prefs.background_enabled() && state.prefs.background().is_some();
+    if global_active {
+        return state.prefs.background_transparency();
+    }
+    if state.settings.creator_open
+        && state.settings.editing_theme.as_deref().is_some()
+        && state.settings.editing_theme.as_deref() == state.prefs.active_theme()
+    {
+        return state.settings.theme_background_transparency;
+    }
+    state
+        .prefs
+        .active_theme()
+        .and_then(|name| state.themes.iter().find(|t| t.name == name))
+        .filter(|t| t.background.is_some())
+        .map(|t| t.background_transparency)
+        .unwrap_or_else(|| state.prefs.background_transparency())
+}
+
+fn ui_panel_alpha(state: &State) -> f32 {
+    (1.0 - effective_background_transparency(state)).clamp(0.0, 1.0)
+}
+
+fn effective_background_blur(prefs: &Prefs, themes: &[crate::prefs::ThemeRec]) -> f32 {
+    if prefs.background_enabled() && prefs.background().is_some() {
+        return prefs.background_blur();
+    }
+    prefs
+        .active_theme()
+        .and_then(|name| themes.iter().find(|t| t.name == name))
+        .filter(|t| t.background.is_some())
+        .map(|t| t.background_blur)
+        .unwrap_or_else(|| prefs.background_blur())
+}
+
+fn sync_background(state: &mut State) {
+    state
+        .background
+        .set_strength(effective_background_blur(&state.prefs, &state.themes));
+    let target = effective_background_path(&state.prefs, &state.themes);
+    if state.background.path == target {
+        return;
+    }
+    match target {
+        Some(path) => state.background.choose(path),
+        None => {
+            state.background.clear();
+            state.gpu.clear_background();
+        }
+    }
+}
+
+fn set_theme(state: &mut State, name: Option<String>) {
+    state.prefs.set_active_theme(name.as_deref());
+    theme::set_palette(theme_palette(name.as_deref(), &state.themes));
+    sync_background(state);
 }

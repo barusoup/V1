@@ -115,6 +115,9 @@ pub struct Library {
     ids: Arc<SavedIds>,
     /// Songs with a download under way.
     inflight: HashSet<String>,
+    /// Whether saved songs are kept on this device. Off means no new downloads, and the files
+    /// already here were removed when it was turned off.
+    downloading: bool,
     /// Failed downloads: how many times, and when to try again.
     retry: HashMap<String, (u32, Instant)>,
     /// Bumped on every change, so cached orderings know when to rebuild.
@@ -138,6 +141,7 @@ impl Library {
             vault: ArtistVault::in_memory(),
             ids: Arc::new(SavedIds::default()),
             inflight: HashSet::new(),
+            downloading: true,
             retry: HashMap::new(),
             version: 0,
             song_order: Vec::new(),
@@ -223,7 +227,9 @@ impl Library {
         let missing: Vec<String> = self
             .songs
             .values()
-            .filter(|rec| rec.downloaded && !present.contains(&format!("{}.opus", rec.hit.video_id)))
+            .filter(|rec| {
+                rec.downloaded && !present.contains(&format!("{}.opus", rec.hit.video_id))
+            })
             .map(|rec| rec.hit.video_id.clone())
             .collect();
         for id in missing {
@@ -284,14 +290,22 @@ impl Library {
                 .values()
                 .filter(|rec| rec.direct || ghosts.contains(&rec.hit.video_id))
                 .collect();
-            recs.extend(self.limbo.values().map(|(rec, _)| rec).filter(|rec| ghosts.contains(&rec.hit.video_id)));
+            recs.extend(
+                self.limbo
+                    .values()
+                    .map(|(rec, _)| rec)
+                    .filter(|rec| ghosts.contains(&rec.hit.video_id)),
+            );
             recs.sort_by(|a, b| {
                 b.saved_at
                     .cmp(&a.saved_at)
                     .then_with(|| a.hit.title.cmp(&b.hit.title))
                     .then_with(|| a.hit.video_id.cmp(&b.hit.video_id))
             });
-            self.song_order = recs.into_iter().map(|rec| rec.hit.video_id.clone()).collect();
+            self.song_order = recs
+                .into_iter()
+                .map(|rec| rec.hit.video_id.clone())
+                .collect();
             self.song_order_key = Some(key);
         }
         &self.song_order
@@ -330,7 +344,11 @@ impl Library {
 
     /// A length fetched for a song: kept on a saved song whose list gave none.
     pub fn set_length(&mut self, id: &str, text: &str) {
-        let Some(rec) = self.songs.get_mut(id).filter(|rec| rec.hit.duration.is_none()) else {
+        let Some(rec) = self
+            .songs
+            .get_mut(id)
+            .filter(|rec| rec.hit.duration.is_none())
+        else {
             return;
         };
         rec.hit.duration = Some(text.to_owned());
@@ -353,12 +371,19 @@ impl Library {
     /// Albums list asks every frame, and sorting the lot every frame is wasted work.
     pub fn albums_between(&mut self, from: usize, to: usize) -> Vec<&AlbumRec> {
         if self.album_order_key != Some(self.version) {
-            self.album_order = self.albums().into_iter().map(|rec| rec.page.browse_id.clone()).collect();
+            self.album_order = self
+                .albums()
+                .into_iter()
+                .map(|rec| rec.page.browse_id.clone())
+                .collect();
             self.album_order_key = Some(self.version);
         }
         let to = to.min(self.album_order.len());
         let from = from.min(to);
-        self.album_order[from..to].iter().filter_map(|id| self.albums.get(id)).collect()
+        self.album_order[from..to]
+            .iter()
+            .filter_map(|id| self.albums.get(id))
+            .collect()
     }
 
     pub fn album_page(&self, id: &str) -> Option<&AlbumPage> {
@@ -387,7 +412,12 @@ impl Library {
 
     fn refresh_ids(&mut self) {
         self.ids = Arc::new(SavedIds {
-            songs: self.songs.values().filter(|rec| rec.direct).map(|rec| rec.hit.video_id.clone()).collect(),
+            songs: self
+                .songs
+                .values()
+                .filter(|rec| rec.direct)
+                .map(|rec| rec.hit.video_id.clone())
+                .collect(),
             albums: self.albums.keys().cloned().collect(),
             artists: self.vault.ids().cloned().collect(),
         });
@@ -461,7 +491,7 @@ impl Library {
 
     fn job_for(&mut self, rec: &SongRec) -> Option<Job> {
         let id = &rec.hit.video_id;
-        if self.inflight.contains(id) || self.root.as_os_str().is_empty() {
+        if !self.downloading || self.inflight.contains(id) || self.root.as_os_str().is_empty() {
             return None;
         }
         self.inflight.insert(id.clone());
@@ -518,15 +548,26 @@ impl Library {
         }
         fx.covers.extend(page.thumbnail.clone());
         // Saving again (to fill in a page that was stored without its tracks) keeps its place.
-        let saved_at = self.albums.get(&page.browse_id).map_or_else(now_secs, |rec| rec.saved_at);
-        self.albums.insert(page.browse_id.clone(), AlbumRec { page: page.clone(), saved_at });
+        let saved_at = self
+            .albums
+            .get(&page.browse_id)
+            .map_or_else(now_secs, |rec| rec.saved_at);
+        self.albums.insert(
+            page.browse_id.clone(),
+            AlbumRec {
+                page: page.clone(),
+                saved_at,
+            },
+        );
         self.changed();
         fx
     }
 
     /// Unsave an album, and with it the songs that were saved only for its sake.
     pub fn unsave_album(&mut self, id: &str, now: Instant) {
-        let Some(rec) = self.albums.remove(id) else { return };
+        let Some(rec) = self.albums.remove(id) else {
+            return;
+        };
         for track in &rec.page.tracks {
             let orphan = match self.songs.get_mut(&track.video_id) {
                 Some(song) => {
@@ -545,7 +586,10 @@ impl Library {
     pub fn save_artist(&mut self, page: &ArtistPage) -> Effects {
         let cover = self.vault.save(page, self.writer.as_ref());
         self.changed();
-        Effects { downloads: Vec::new(), covers: cover.into_iter().collect() }
+        Effects {
+            downloads: Vec::new(),
+            covers: cover.into_iter().collect(),
+        }
     }
 
     pub fn unsave_artist(&mut self, id: &str) {
@@ -565,9 +609,48 @@ impl Library {
 
     // ---- Downloads ----------------------------------------------------------------------------
 
+    /// Turn local downloads on or off. Turning it on does not fetch anything by itself: the caller
+    /// asks for [`Self::resume`] once the backend is ready.
+    pub fn set_downloading(&mut self, enabled: bool) {
+        if self.downloading == enabled {
+            return;
+        }
+        self.downloading = enabled;
+        if !enabled {
+            self.inflight.clear();
+            self.retry.clear();
+        }
+    }
+
+    /// Delete every downloaded file. The songs stay in the collection, and are downloaded again if
+    /// local downloads are turned back on. This is final: there is no undo.
+    pub fn clear_downloads(&mut self) {
+        self.inflight.clear();
+        self.retry.clear();
+        // Songs waiting out the grace minute go too, with their files.
+        self.limbo.clear();
+        // A library with no disk behind it has no folder to clear (and must never sweep the
+        // working directory, which an empty root would resolve to).
+        if !self.root.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(self.downloads_dir());
+        }
+        for rec in self.songs.values_mut() {
+            rec.downloaded = false;
+        }
+        self.changed();
+    }
+
     /// Downloads for every saved song that has no file yet, for when the backend is ready.
     pub fn resume(&mut self) -> Effects {
-        let pending: Vec<SongRec> = self.songs.values().filter(|r| !r.downloaded).cloned().collect();
+        if !self.downloading {
+            return Effects::default();
+        }
+        let pending: Vec<SongRec> = self
+            .songs
+            .values()
+            .filter(|r| !r.downloaded)
+            .cloned()
+            .collect();
         let mut fx = Effects::default();
         for rec in pending {
             fx.downloads.extend(self.job_for(&rec));
@@ -579,6 +662,13 @@ impl Library {
     pub fn downloaded(&mut self, id: &str, loudness_db: Option<f64>, duration_secs: Option<f64>) {
         self.inflight.remove(id);
         self.retry.remove(id);
+        // A download that was already in the backend when the listener turned local downloads off
+        // lands after the folder was cleared. It is not wanted: delete it rather than keep a file
+        // that the setting says does not exist.
+        if !self.downloading {
+            self.remove_file(id);
+            return;
+        }
         if let Some(rec) = self.songs.get_mut(id) {
             rec.downloaded = true;
             rec.loudness_db = loudness_db.or(rec.loudness_db);
@@ -747,8 +837,14 @@ mod tests {
         assert_eq!(song.album_id.as_deref(), Some("MPREb_disc"));
         assert_eq!(song.duration.as_deref(), Some("5:20"));
         assert_eq!(song.title, "Song a");
-        assert!(!fill_gaps(&mut song, &fresher), "a second pass changes nothing");
-        assert!(!fill_gaps(&mut song, &hit("b")), "another song is never used");
+        assert!(
+            !fill_gaps(&mut song, &fresher),
+            "a second pass changes nothing"
+        );
+        assert!(
+            !fill_gaps(&mut song, &hit("b")),
+            "another song is never used"
+        );
     }
 
     #[test]
@@ -815,7 +911,10 @@ mod tests {
         assert_eq!(fx.downloads.len(), 1);
         assert!(lib.song_saved("aaa") && lib.ids().songs.contains("aaa"));
         let again = lib.save_song(&hit("aaa"), now);
-        assert!(again.downloads.is_empty(), "already saved, already downloading");
+        assert!(
+            again.downloads.is_empty(),
+            "already saved, already downloading"
+        );
     }
 
     #[test]
@@ -828,7 +927,10 @@ mod tests {
         assert!(!lib.song_saved("aaa"), "gone from the collection at once");
         assert!(lib.next_wake().is_some(), "but its file is waiting");
         let fx = lib.save_song(&hit("aaa"), t0 + Duration::from_secs(59));
-        assert!(fx.downloads.is_empty(), "the file was kept, so nothing is fetched");
+        assert!(
+            fx.downloads.is_empty(),
+            "the file was kept, so nothing is fetched"
+        );
         assert!(lib.songs["aaa"].downloaded);
         assert!(lib.next_wake().is_none());
     }
@@ -863,8 +965,14 @@ mod tests {
         lib.save_song(&hit("b"), now); // saved on its own as well
         let fx = lib.save_album(&album("MPREb_x", &["a", "b", "c"]), now);
         assert_eq!(fx.downloads.len(), 2, "b was already on its way");
-        assert!(["a", "b", "c"].iter().all(|id| lib.songs.contains_key(*id)), "all downloaded");
-        assert!(!lib.song_saved("a") && !lib.song_saved("c"), "but not liked");
+        assert!(
+            ["a", "b", "c"].iter().all(|id| lib.songs.contains_key(*id)),
+            "all downloaded"
+        );
+        assert!(
+            !lib.song_saved("a") && !lib.song_saved("c"),
+            "but not liked"
+        );
         assert!(lib.song_saved("b"), "b was liked on its own too");
         assert!(lib.ids().albums.contains("MPREb_x"));
 
@@ -911,7 +1019,10 @@ mod tests {
         lib.sweep(t0 + Duration::from_secs(61));
         assert!(lib.songs.contains_key("a"));
         lib.unsave_album("one", t0);
-        assert!(lib.next_wake().is_some(), "now nothing holds it: it waits to go");
+        assert!(
+            lib.next_wake().is_some(),
+            "now nothing holds it: it waits to go"
+        );
     }
 
     #[test]
@@ -942,10 +1053,21 @@ mod tests {
         let t0 = Instant::now();
         lib.save_song(&hit("a"), t0);
         lib.download_failed("a", t0);
-        assert!(lib.tick(t0 + Duration::from_secs(10)).downloads.is_empty(), "too soon");
-        assert_eq!(lib.tick(t0 + RETRY_FIRST + Duration::from_secs(1)).downloads.len(), 1);
+        assert!(
+            lib.tick(t0 + Duration::from_secs(10)).downloads.is_empty(),
+            "too soon"
+        );
+        assert_eq!(
+            lib.tick(t0 + RETRY_FIRST + Duration::from_secs(1))
+                .downloads
+                .len(),
+            1
+        );
         lib.downloaded("a", None, None);
-        assert!(lib.tick(t0 + Duration::from_secs(99_999)).downloads.is_empty());
+        assert!(lib
+            .tick(t0 + Duration::from_secs(99_999))
+            .downloads
+            .is_empty());
     }
 
     #[test]

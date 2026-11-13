@@ -59,7 +59,9 @@ impl Prober for HttpProber {
             Ok(resp) => {
                 let ok = matches!(
                     resp.status(),
-                    StatusCode::OK | StatusCode::PARTIAL_CONTENT | StatusCode::RANGE_NOT_SATISFIABLE
+                    StatusCode::OK
+                        | StatusCode::PARTIAL_CONTENT
+                        | StatusCode::RANGE_NOT_SATISFIABLE
                 );
                 if !ok {
                     tracing::debug!(status = %resp.status(), "stream URL refused past the cap");

@@ -1164,8 +1164,7 @@ pub(crate) mod tests {
                     env!("CARGO_MANIFEST_DIR"),
                     "/fixtures/DamagedHelmet.glb"
                 ))
-                .expect("helmet")
-                .into(),
+                .expect("helmet"),
                 128,
             ),
         ];
@@ -1942,7 +1941,7 @@ pub(crate) mod tests {
         });
         let layer = material_layer(&mat, 0, 1);
         for (a, b) in layer.pixels.iter().zip([200, 50, 50, 255]) {
-            assert!((*a as i32 - b as i32).abs() <= 1, "{a} vs {b}");
+            assert!((*a as i32 - b).abs() <= 1, "{a} vs {b}");
         }
     }
 }

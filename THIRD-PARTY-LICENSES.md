@@ -1,8 +1,7 @@
 # Third-party licenses
 
-Rust dependencies compiled into V1, with the license each one declares in its manifest.
-Generated from `cargo metadata` for the `x86_64-pc-windows-msvc` target. Regenerate it when `Cargo.lock` changes.
-Components vendored in `vendor/` and the bundled fonts and icons are listed in [NOTICE](NOTICE).
+Rust dependencies compiled into V1 for Windows and Apple Silicon macOS, with the license each one declares in its manifest.
+Generated from the resolved `v1-app` dependency closure via `cargo metadata --filter-platform` for `x86_64-pc-windows-msvc` and `aarch64-apple-darwin`. Components vendored in `vendor/` and bundled fonts and icons are listed in [NOTICE](NOTICE).
 
 | Crate | Version | License |
 |---|---|---|
@@ -25,7 +24,10 @@ Components vendored in `vendor/` and the bundled fonts and icons are listed in [
 | bit-vec | 0.8.0 | Apache-2.0 OR MIT |
 | bitflags | 1.3.2 | MIT/Apache-2.0 |
 | bitflags | 2.13.2 | MIT OR Apache-2.0 |
+| block | 0.1.6 | MIT |
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 |
+| block2 | 0.5.1 | MIT |
+| block2 | 0.6.2 | MIT |
 | brotli | 9.1.1 | BSD-3-Clause AND MIT |
 | brotli-decompressor | 6.2.0 | BSD-3-Clause/MIT |
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT |
@@ -34,13 +36,20 @@ Components vendored in `vendor/` and the bundled fonts and icons are listed in [
 | byteorder-lite | 0.1.0 | Unlicense OR MIT |
 | bytes | 1.12.1 | MIT |
 | cc | 1.10.0 | MIT OR Apache-2.0 |
-| cfg_aliases | 0.2.2 | MIT |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 |
+| cfg_aliases | 0.2.2 | MIT |
 | chacha20 | 0.10.2 | MIT OR Apache-2.0 |
+| cocoa | 0.25.0 | MIT OR Apache-2.0 |
+| cocoa-foundation | 0.1.2 | MIT OR Apache-2.0 |
 | codespan-reporting | 0.12.0 | Apache-2.0 |
 | compression-codecs | 0.4.46 | MIT OR Apache-2.0 |
 | compression-core | 0.4.34 | MIT OR Apache-2.0 |
+| core-foundation | 0.9.4 | MIT OR Apache-2.0 |
+| core-foundation-sys | 0.8.7 | MIT OR Apache-2.0 |
+| core-graphics | 0.23.2 | MIT OR Apache-2.0 |
+| core-graphics-types | 0.1.3 | MIT OR Apache-2.0 |
 | core_detect | 1.0.0 | MIT/Apache-2.0 |
+| coreaudio-rs | 0.13.0 | MIT/Apache-2.0 |
 | cpal | 0.16.0 | Apache-2.0 |
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 |
 | cpufeatures | 0.3.1 | MIT OR Apache-2.0 |
@@ -49,6 +58,8 @@ Components vendored in `vendor/` and the bundled fonts and icons are listed in [
 | cursor-icon | 1.2.0 | MIT OR Apache-2.0 OR Zlib |
 | dasp_sample | 0.11.0 | MIT OR Apache-2.0 |
 | digest | 0.10.7 | MIT OR Apache-2.0 |
+| dispatch | 0.2.0 | MIT |
+| dispatch2 | 0.3.1 | Zlib OR Apache-2.0 OR MIT |
 | displaydoc | 0.2.7 | MIT OR Apache-2.0 |
 | dpi | 0.1.2 | Apache-2.0 AND MIT |
 | encoding_rs | 0.8.44 | (Apache-2.0 OR MIT) AND BSD-3-Clause |
@@ -60,6 +71,9 @@ Components vendored in `vendor/` and the bundled fonts and icons are listed in [
 | fnv | 1.0.7 | Apache-2.0 / MIT |
 | foldhash | 0.2.0 | Zlib |
 | fontdue | 0.8.0 | MIT OR Apache-2.0 OR Zlib |
+| foreign-types | 0.5.0 | MIT/Apache-2.0 |
+| foreign-types-macros | 0.2.4 | MIT/Apache-2.0 |
+| foreign-types-shared | 0.3.1 | MIT/Apache-2.0 |
 | form_urlencoded | 1.2.2 | MIT OR Apache-2.0 |
 | futures-channel | 0.3.34 | MIT OR Apache-2.0 |
 | futures-core | 0.3.34 | MIT OR Apache-2.0 |
@@ -113,6 +127,8 @@ Components vendored in `vendor/` and the bundled fonts and icons are listed in [
 | litemap | 0.8.3 | Unicode-3.0 |
 | log | 0.4.35 | MIT OR Apache-2.0 |
 | lru-slab | 0.1.3 | MIT OR Apache-2.0 OR Zlib |
+| mach2 | 0.4.3 | BSD-2-Clause OR MIT OR Apache-2.0 |
+| malloc_buf | 0.0.6 | MIT |
 | memchr | 2.8.3 | Unlicense OR MIT |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 |
@@ -121,6 +137,28 @@ Components vendored in `vendor/` and the bundled fonts and icons are listed in [
 | multiversion_no_op | 1.0.0 | Apache-2.0 OR MIT |
 | naga | 27.0.3 | MIT OR Apache-2.0 |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |
+| objc | 0.2.7 | MIT |
+| objc-sys | 0.3.5 | MIT |
+| objc2 | 0.5.3 | MIT |
+| objc2 | 0.6.5 | MIT |
+| objc2-app-kit | 0.2.2 | MIT |
+| objc2-app-kit | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
+| objc2-audio-toolbox | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
+| objc2-core-audio | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
+| objc2-core-audio-types | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
+| objc2-core-data | 0.2.2 | MIT |
+| objc2-core-foundation | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
+| objc2-core-graphics | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
+| objc2-core-image | 0.2.2 | MIT |
+| objc2-core-video | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
+| objc2-encode | 4.1.0 | MIT |
+| objc2-foundation | 0.2.2 | MIT |
+| objc2-foundation | 0.3.2 | MIT |
+| objc2-io-surface | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
+| objc2-metal | 0.2.2 | MIT |
+| objc2-metal | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
+| objc2-quartz-core | 0.2.2 | MIT |
+| objc2-quartz-core | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 |
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 |
 | pin-project-lite | 0.2.17 | Apache-2.0 OR MIT |
@@ -142,10 +180,12 @@ Components vendored in `vendor/` and the bundled fonts and icons are listed in [
 | rand_core | 0.6.4 | MIT OR Apache-2.0 |
 | rand_pcg | 0.10.2 | MIT OR Apache-2.0 |
 | raw-window-handle | 0.6.2 | MIT OR Apache-2.0 OR Zlib |
+| raw-window-metal | 0.4.0 | MIT OR Apache-2.0 |
 | regex | 1.13.1 | MIT OR Apache-2.0 |
 | regex-automata | 0.4.18 | MIT OR Apache-2.0 |
 | regex-syntax | 0.8.11 | MIT OR Apache-2.0 |
 | reqwest | 0.12.28 | MIT OR Apache-2.0 |
+| rfd | 0.15.4 | MIT |
 | ring | 0.17.14 | Apache-2.0 AND ISC |
 | rquickjs | 0.9.0 | MIT |
 | rquickjs-core | 0.9.0 | MIT |
@@ -214,14 +254,13 @@ Components vendored in `vendor/` and the bundled fonts and icons are listed in [
 | untrusted | 0.9.0 | ISC |
 | url | 2.5.8 | MIT OR Apache-2.0 |
 | urlencoding | 2.1.3 | MIT |
-| utf_types | 1.0.0 | Apache-2.0 OR MIT |
 | utf8_iter | 1.1.0 | Apache-2.0 OR MIT |
+| utf_types | 1.0.0 | Apache-2.0 OR MIT |
 | version_check | 0.9.5 | MIT/Apache-2.0 |
 | want | 0.3.2 | MIT |
 | webpki-roots | 1.0.11 | CDLA-Permissive-2.0 |
 | windows | 0.54.0 | MIT OR Apache-2.0 |
 | windows | 0.58.0 | MIT OR Apache-2.0 |
-| windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 |
 | windows-core | 0.54.0 | MIT OR Apache-2.0 |
 | windows-core | 0.58.0 | MIT OR Apache-2.0 |
 | windows-implement | 0.58.0 | MIT OR Apache-2.0 |
@@ -231,8 +270,10 @@ Components vendored in `vendor/` and the bundled fonts and icons are listed in [
 | windows-result | 0.2.0 | MIT OR Apache-2.0 |
 | windows-strings | 0.1.0 | MIT OR Apache-2.0 |
 | windows-sys | 0.52.0 | MIT OR Apache-2.0 |
+| windows-sys | 0.59.0 | MIT OR Apache-2.0 |
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 |
 | windows-targets | 0.52.6 | MIT OR Apache-2.0 |
+| windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 |
 | winit | 0.30.13 | Apache-2.0 |
 | winres | 0.1.12 | MIT |
 | writeable | 0.6.4 | Unicode-3.0 |

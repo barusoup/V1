@@ -241,7 +241,7 @@ pub fn face_uv(view: &View, extent: glam::Vec3, p: glam::Vec3, c: glam::Vec3) ->
 /// are shading captures and do not constrain the hull.
 pub fn view_axis(view: usize) -> (usize, f32) {
     assert!(view < AXIS_COUNT * 2, "view {view} is not a hull slab view");
-    (view / 2, if view % 2 == 0 { 1.0 } else { -1.0 })
+    (view / 2, if view.is_multiple_of(2) { 1.0 } else { -1.0 })
 }
 
 /// Why a model cannot be impostor-baked (returned by the baker and
@@ -1623,7 +1623,7 @@ fn source_dda_scale_invariance() {
     // same barycentrics; no size-dependent floors.
     for scale in [1e-3f32, 1.0, 1e3] {
         let res = 4u32;
-        let gmin = Vec3::splat(-1.0 * scale);
+        let gmin = Vec3::splat(-scale);
         let cell = Vec3::splat(0.5 * scale);
         // x-plane triangle at x=-0.2s; ray hits (y,z)=(0.1s,0). With
         // v0=(-0.2s,0,-0.05s), e1=(0,s,0), e2=(0,0,0.5s): u=0.1, v=0.1, w=0.8.

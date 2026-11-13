@@ -831,6 +831,129 @@ impl DrawList {
         self.push_shape_image(rect, CmdTexture::Backdrop, tint, radius, uv);
     }
 
+    /// Axis-aligned frosted-glass fill with no outward anti-aliasing pad, so tiled chrome surfaces
+    /// meet flush along internal edges without leaking untinted backdrop pixels past `rect`.
+    pub fn backdrop_rect(&mut self, rect: Rect, tint: Color) {
+        if tint.a == 0 || rect.w <= 0.0 || rect.h <= 0.0 || self.culled(rect) {
+            return;
+        }
+        let (w, h) = self.size;
+        let (w, h) = (w.max(1.0), h.max(1.0));
+        let (u0, v0, u1, v1) = (
+            rect.x / w,
+            rect.y / h,
+            (rect.x + rect.w) / w,
+            (rect.y + rect.h) / h,
+        );
+        let c = tint.to_array();
+        let params = [0.0; 4];
+        let extra = [0.0; 2];
+        let base = self.vertices.len() as u32;
+        self.vertices.extend_from_slice(&[
+            UiVertex {
+                pos: [rect.x, rect.y],
+                uv: [u0, v0],
+                color: c,
+                params,
+                extra,
+            },
+            UiVertex {
+                pos: [rect.x + rect.w, rect.y],
+                uv: [u1, v0],
+                color: c,
+                params,
+                extra,
+            },
+            UiVertex {
+                pos: [rect.x + rect.w, rect.y + rect.h],
+                uv: [u1, v1],
+                color: c,
+                params,
+                extra,
+            },
+            UiVertex {
+                pos: [rect.x, rect.y + rect.h],
+                uv: [u0, v1],
+                color: c,
+                params,
+                extra,
+            },
+        ]);
+        self.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        self.push_cmd(CmdTexture::Backdrop, 6);
+    }
+
+    /// A concave corner fillet inside `rect`: draws every pixel outside the circle at
+    /// `circle_center` with `radius`, anti-aliased along the curve, using either the captured
+    /// frosted backdrop or a solid tint.
+    pub fn concave_corner(
+        &mut self,
+        rect: Rect,
+        circle_center: (f32, f32),
+        radius: f32,
+        tint: Color,
+        backdrop: bool,
+    ) {
+        if tint.a == 0 || rect.w <= 0.0 || rect.h <= 0.0 || radius <= 0.0 || self.culled(rect) {
+            return;
+        }
+        let (u0, v0, u1, v1) = if backdrop {
+            let (w, h) = self.size;
+            let (w, h) = (w.max(1.0), h.max(1.0));
+            (
+                rect.x / w,
+                rect.y / h,
+                (rect.x + rect.w) / w,
+                (rect.y + rect.h) / h,
+            )
+        } else {
+            (0.0, 0.0, 1.0, 1.0)
+        };
+        let texture = if backdrop {
+            CmdTexture::Backdrop
+        } else {
+            CmdTexture::White
+        };
+        let c = tint.to_array();
+        let params = [circle_center.0, circle_center.1, radius, 0.35];
+        let extra = [0.0; 2];
+        let base = self.vertices.len() as u32;
+        self.vertices.extend_from_slice(&[
+            UiVertex {
+                pos: [rect.x, rect.y],
+                uv: [u0, v0],
+                color: c,
+                params,
+                extra,
+            },
+            UiVertex {
+                pos: [rect.x + rect.w, rect.y],
+                uv: [u1, v0],
+                color: c,
+                params,
+                extra,
+            },
+            UiVertex {
+                pos: [rect.x + rect.w, rect.y + rect.h],
+                uv: [u1, v1],
+                color: c,
+                params,
+                extra,
+            },
+            UiVertex {
+                pos: [rect.x, rect.y + rect.h],
+                uv: [u0, v1],
+                color: c,
+                params,
+                extra,
+            },
+        ]);
+        self.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        self.push_cmd(texture, 6);
+    }
+
     /// Geometry behind [`Self::image_uv_rect`], over any texture so the
     /// vertex layout can be tested without a GPU.
     fn push_shape_image(
@@ -1697,6 +1820,10 @@ impl DrawList {
                     // Origin pad (see mode 2): a length.
                     vertex.extra[0] *= scale;
                     vertex.extra[1] *= scale;
+                } else if vertex.params[3] > 0.25 && vertex.params[3] < 0.5 {
+                    vertex.params[0] *= scale;
+                    vertex.params[1] *= scale;
+                    vertex.params[2] *= scale;
                 } else if vertex.params[3] == ARC_MODE {
                     // Arc stroke: the mid radius and half thickness are
                     // lengths and uv is the centre-relative position. The

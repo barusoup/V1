@@ -67,8 +67,12 @@ impl InnerTube {
             video_id,
             ..Default::default()
         };
-        let resp = self.player(ClientKind::VisionOs, Auth::Anonymous, req).await?;
-        Ok(resp.video_details.and_then(|details| details.length_seconds))
+        let resp = self
+            .player(ClientKind::VisionOs, Auth::Anonymous, req)
+            .await?;
+        Ok(resp
+            .video_details
+            .and_then(|details| details.length_seconds))
     }
 
     /// Songs matching `query`. Always anonymous: a search carries no account, so typing does not
@@ -107,7 +111,12 @@ impl InnerTube {
             auth,
             json!({ "query": query, "params": SONGS_FILTER }),
         );
-        let mixed = self.post("search", ClientKind::WebRemix, auth, json!({ "query": query }));
+        let mixed = self.post(
+            "search",
+            ClientKind::WebRemix,
+            auth,
+            json!({ "query": query }),
+        );
         let (songs, mixed) = tokio::join!(songs, mixed);
         let songs = parse_song_hits(&songs?);
         let mixed = mixed.map(|value| parse_mixed(&value)).unwrap_or_default();
@@ -437,17 +446,20 @@ fn run_page(run: &Value) -> Option<(&str, Option<&str>)> {
 
 /// A row's length, when it is in the fixed columns (album tracks put it there, not beside the title).
 fn fixed_duration(row: &Value) -> Option<String> {
-    row.get("fixedColumns")?.as_array()?.iter().find_map(|column| {
-        let text = column
-            .get("musicResponsiveListItemFixedColumnRenderer")?
-            .get("text")?
-            .get("runs")?
-            .as_array()?
-            .first()?
-            .get("text")?
-            .as_str()?;
-        is_duration(text).then(|| text.to_owned())
-    })
+    row.get("fixedColumns")?
+        .as_array()?
+        .iter()
+        .find_map(|column| {
+            let text = column
+                .get("musicResponsiveListItemFixedColumnRenderer")?
+                .get("text")?
+                .get("runs")?
+                .as_array()?
+                .first()?
+                .get("text")?
+                .as_str()?;
+            is_duration(text).then(|| text.to_owned())
+        })
 }
 
 /// One song row. `None` for a row that plays nothing, and for a video: videos never leave this
@@ -652,7 +664,7 @@ fn read_credits_line(runs: &[Value], first_line: bool) -> Credits {
             credits.push_artist(&plain, None);
         } else if linked_artist {
             // Inside the artist part, so the unlinked run is another credit, not the album.
-            if !(album_part && !first_line) {
+            if !album_part || first_line {
                 credits.push_artist(&plain, None);
             }
         } else if album_part || !first_line {
@@ -691,7 +703,16 @@ fn is_stat(text: &str) -> bool {
 fn is_kind(text: &str) -> bool {
     matches!(
         text.trim(),
-        "Song" | "Video" | "Album" | "Single" | "EP" | "Playlist" | "Profile" | "Artist" | "Podcast" | "Episode"
+        "Song"
+            | "Video"
+            | "Album"
+            | "Single"
+            | "EP"
+            | "Playlist"
+            | "Profile"
+            | "Artist"
+            | "Podcast"
+            | "Episode"
     )
 }
 
@@ -796,7 +817,10 @@ mod tests {
         let links: Vec<_> = hit.artist_links().collect();
         assert_eq!(
             links,
-            vec![("Daft Punk", Some("UCdaftpunk")), ("Julian Casablancas", Some("UCjulian"))]
+            vec![
+                ("Daft Punk", Some("UCdaftpunk")),
+                ("Julian Casablancas", Some("UCjulian"))
+            ]
         );
         assert_eq!(hit.artist_id.as_deref(), Some("UCdaftpunk"));
     }
@@ -1107,7 +1131,10 @@ mod tests {
             top: Some(TopResult::Artist(artist.clone())),
             artists: vec![
                 artist,
-                ArtistCard { browse_id: "UClYV6hHlupm".to_owned(), ..Default::default() },
+                ArtistCard {
+                    browse_id: "UClYV6hHlupm".to_owned(),
+                    ..Default::default()
+                },
             ],
             albums: Vec::new(),
         };
@@ -1115,7 +1142,11 @@ mod tests {
         let results = assemble(songs, mixed);
         assert_eq!(results.artists.len(), 1);
         assert_eq!(results.artists[0].browse_id, "UClYV6hHlupm");
-        assert_eq!(results.songs.len(), 2, "an artist on top takes no song off the list");
+        assert_eq!(
+            results.songs.len(),
+            2,
+            "an artist on top takes no song off the list"
+        );
     }
 
     #[test]
@@ -1161,7 +1192,10 @@ mod tests {
             row_of_kind("someday", Some("MUSIC_VIDEO_TYPE_SOMETHING_NEW")),
             row_of_kind("untyped", None),
         ] });
-        let ids: Vec<String> = parse_song_hits(&root).into_iter().map(|h| h.video_id).collect();
+        let ids: Vec<String> = parse_song_hits(&root)
+            .into_iter()
+            .map(|h| h.video_id)
+            .collect();
         assert_eq!(ids, vec!["song".to_owned(), "upload".to_owned()]);
     }
 
@@ -1186,7 +1220,11 @@ mod tests {
             "title": { "runs": [ { "text": "Get Lucky" } ] },
             "onTap": { "watchEndpoint": { "videoId": "x" } }
         });
-        assert_eq!(top_result(&untyped), None, "a card that does not say song is not one");
+        assert_eq!(
+            top_result(&untyped),
+            None,
+            "a card that does not say song is not one"
+        );
 
         let mixed = parse_mixed(&json!({ "musicCardShelfRenderer": card }));
         assert_eq!(mixed.top, None);

@@ -116,10 +116,11 @@ impl Anims {
         ratio: f32,
     ) -> f32 {
         let (dt, frame) = (self.dt, self.frame);
-        let slot = self
-            .slots
-            .entry((name, index))
-            .or_insert(Slot { x: target, v: 0.0, seen: frame });
+        let slot = self.slots.entry((name, index)).or_insert(Slot {
+            x: target,
+            v: 0.0,
+            seen: frame,
+        });
         slot.seen = frame;
         let damping = 2.0 * ratio * stiffness.sqrt();
         let mut left = dt;
@@ -144,9 +145,21 @@ impl Anims {
         self.spring(name, index, if on { 1.0 } else { 0.0 }, stiffness)
     }
 
+    /// Read a spring's last value without advancing it.
+    pub fn value(&self, name: &'static str, index: u32) -> Option<f32> {
+        self.slots.get(&(name, index)).map(|slot| slot.x)
+    }
+
     /// Set a value outright, with no motion, for a change that must not animate.
     pub fn snap(&mut self, name: &'static str, index: u32, value: f32) {
-        self.slots.insert((name, index), Slot { x: value, v: 0.0, seen: self.frame });
+        self.slots.insert(
+            (name, index),
+            Slot {
+                x: value,
+                v: 0.0,
+                seen: self.frame,
+            },
+        );
     }
 }
 
@@ -198,8 +211,15 @@ mod tests {
         for stiffness in [rate::SNAP, rate::QUICK, rate::SMOOTH] {
             let values = run(&mut anims, 1.0, stiffness, 240, 1.0 / 60.0);
             assert!(values.iter().all(|v| *v <= 1.0), "overshot at {stiffness}");
-            assert!(values.windows(2).all(|w| w[1] >= w[0] - 1e-6), "not monotonic");
-            assert_eq!(*values.last().unwrap(), 1.0, "did not settle at {stiffness}");
+            assert!(
+                values.windows(2).all(|w| w[1] >= w[0] - 1e-6),
+                "not monotonic"
+            );
+            assert_eq!(
+                *values.last().unwrap(),
+                1.0,
+                "did not settle at {stiffness}"
+            );
             let back = run(&mut anims, 0.0, stiffness, 240, 1.0 / 60.0);
             assert!(back.iter().all(|v| *v >= 0.0), "undershot at {stiffness}");
             assert_eq!(*back.last().unwrap(), 0.0);

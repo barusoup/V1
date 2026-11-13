@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 /// The standard texture descriptor set: binding 0, combined image sampler,
 /// visible to the fragment stage. Any pipeline whose set layout matches this
-/// structure can bind [`GpuTexture::descriptor_set`] at that set index.
+/// structure can bind `GpuTexture::descriptor_set` at that set index.
 pub const TEXTURE_SET_BINDINGS: [vk::DescriptorSetLayoutBinding<'static>; 1] =
     [vk::DescriptorSetLayoutBinding {
         binding: 0,
@@ -21,7 +21,7 @@ pub const TEXTURE_SET_BINDINGS: [vk::DescriptorSetLayoutBinding<'static>; 1] =
     }];
 
 /// Create a descriptor set layout structurally identical to the one every
-/// [`GpuTexture`] is allocated from, for use in custom pipelines.
+/// `GpuTexture` is allocated from, for use in custom pipelines.
 pub fn create_texture_set_layout(ctx: &GpuContext) -> vk::DescriptorSetLayout {
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&TEXTURE_SET_BINDINGS);
     unsafe { ctx.device().create_descriptor_set_layout(&info, None) }
@@ -31,7 +31,7 @@ pub fn create_texture_set_layout(ctx: &GpuContext) -> vk::DescriptorSetLayout {
 /// The engine's WGSL texture contract: naga emits a WGSL `texture_2d` and
 /// `sampler` as *separate* SPIR-V resources — a sampled image at binding 0
 /// and a sampler at binding 1. Pipelines compiled from the engine's own
-/// shaders bind [`GpuTexture::sampled_descriptor_set`], whose sets are
+/// shaders bind `GpuTexture::sampled_descriptor_set`, whose sets are
 /// allocated against this layout.
 pub const SAMPLED_TEXTURE_SET_BINDINGS: [vk::DescriptorSetLayoutBinding<'static>; 2] = [
     vk::DescriptorSetLayoutBinding {
@@ -52,7 +52,7 @@ pub const SAMPLED_TEXTURE_SET_BINDINGS: [vk::DescriptorSetLayoutBinding<'static>
     },
 ];
 
-/// The layout matching [`SAMPLED_TEXTURE_SET_BINDINGS`], for engine
+/// The layout matching `SAMPLED_TEXTURE_SET_BINDINGS`, for engine
 /// pipelines (`ui.wgsl`, `model.wgsl`) built on the texture set.
 pub fn create_sampled_texture_set_layout(ctx: &GpuContext) -> vk::DescriptorSetLayout {
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&SAMPLED_TEXTURE_SET_BINDINGS);
@@ -71,7 +71,7 @@ pub struct GpuTexture {
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
     /// Engine-WGSL set: `SAMPLED_IMAGE` at 0, `SAMPLER` at 1 — see
-    /// [`SAMPLED_TEXTURE_SET_BINDINGS`].
+    /// `SAMPLED_TEXTURE_SET_BINDINGS`.
     sampled_set: vk::DescriptorSet,
     pub(super) width: u32,
     pub(super) height: u32,

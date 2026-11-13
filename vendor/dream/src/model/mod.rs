@@ -339,11 +339,11 @@ mod tests {
     /// GLB wrapping a JSON doc + binary chunk.
     fn glb_of(json: &str, bin: &[u8]) -> Vec<u8> {
         let mut json_bytes = json.as_bytes().to_vec();
-        while json_bytes.len() % 4 != 0 {
+        while !json_bytes.len().is_multiple_of(4) {
             json_bytes.push(b' ');
         }
         let mut bin = bin.to_vec();
-        while bin.len() % 4 != 0 {
+        while !bin.len().is_multiple_of(4) {
             bin.push(0);
         }
         let total = 12 + 8 + json_bytes.len() + 8 + bin.len();

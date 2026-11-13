@@ -493,6 +493,7 @@ impl ImpostorRenderer {
     ///
     /// Panics on contract violations; use [`Self::try_draw`] to get the
     /// [`ImpostorDrawError`] instead.
+    #[allow(clippy::too_many_arguments)] // Keep the established rendering API.
     pub fn draw(
         &mut self,
         ctx: &mut DrawCtx<'_>,
@@ -510,6 +511,7 @@ impl ImpostorRenderer {
     /// Validating version of [`Self::draw`]: every contract failure returns
     /// an [`ImpostorDrawError`] instead of panicking or producing invalid
     /// Vulkan state.
+    #[allow(clippy::too_many_arguments)] // Keep the established rendering API.
     pub fn try_draw(
         &mut self,
         ctx: &mut DrawCtx<'_>,
@@ -693,6 +695,7 @@ impl ImpostorRenderer {
     /// range is the exact batch stride (never WHOLE_SIZE, which would
     /// violate maxStorageBufferRange on the grown ring); the params buffer
     /// offset is this draw's uniform-aligned ring entry.
+    #[allow(clippy::too_many_arguments)] // Keep the established rendering API.
     fn write_draw_sets(
         &self,
         instance_set: vk::DescriptorSet,

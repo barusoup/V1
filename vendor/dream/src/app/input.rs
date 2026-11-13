@@ -181,16 +181,15 @@ impl App {
                     self.close_settings();
                 }
             }
-            Key::Enter => {
+            Key::Enter
                 // If creating a scene while field is focused, submit it —
                 // never mid-composition: Enter belongs to the IME.
                 if self.main_pane_page == MainPanePage::SceneManager
                     && self.ui.focused("new_scene_input")
                     && !self.composing()
-                {
+                => {
                     self.create_new_scene();
                 }
-            }
             _ => {}
         }
     }

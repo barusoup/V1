@@ -9,6 +9,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+
+use crate::equalizer::{Eq, EqGains};
 use std::time::Duration;
 
 /// Decoded audio that may wait in the ring: 0.75 seconds. Small enough that a
@@ -207,6 +209,10 @@ pub(crate) struct AudioShared {
     muted: AtomicBool,
     /// Filter state for the meters. Touched only by the device callback.
     meters: Mutex<Meters>,
+    /// The five-band equalizer's gains, published by the UI thread.
+    eq: EqGains,
+    /// The filter bank itself, touched only by the device callback.
+    equalizer: Mutex<Eq>,
     /// Latest band levels in 0..=1, as `f32` bits. Written by the callback,
     /// read by the UI, so neither side takes a lock to read or write them.
     levels: [AtomicU32; BANDS],
@@ -344,7 +350,11 @@ impl Meters {
             let rms = (sum / frames as f32).sqrt();
             let db = 20.0 * rms.max(1e-9).log10();
             let target = ((db - METER_FLOOR_DB) / (METER_CEIL_DB - METER_FLOOR_DB)).clamp(0.0, 1.0);
-            let k = if target > self.smoothed[band] { attack } else { release };
+            let k = if target > self.smoothed[band] {
+                attack
+            } else {
+                release
+            };
             self.smoothed[band] += k * (target - self.smoothed[band]);
         }
         self.smoothed
@@ -384,6 +394,8 @@ impl AudioShared {
             running: AtomicBool::new(false),
             volume: AtomicU32::new(1.0f32.to_bits()),
             muted: AtomicBool::new(false),
+            eq: EqGains::new(),
+            equalizer: Mutex::new(Eq::new(rate.max(1) as f32)),
             meters: Mutex::new(Meters::new(rate)),
             levels: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
             scope: Mutex::new(Scope {
@@ -421,6 +433,12 @@ impl AudioShared {
         self.volume.store(volume.to_bits(), Ordering::Relaxed);
     }
 
+    /// Set the five band gains, in dB, from the UI thread. The callback picks them up on its next
+    /// block.
+    pub(crate) fn set_equalizer(&self, gains: [f32; crate::equalizer::EQ_BANDS]) {
+        self.eq.store(gains);
+    }
+
     pub(crate) fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Relaxed);
     }
@@ -438,6 +456,11 @@ impl AudioShared {
         ring.played_frames = 0;
         ring.finished = false;
         ring.generation += 1;
+        // A seek starts a new signal: the old filter state must not ring into it.
+        self.equalizer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
         ring.generation
     }
 
@@ -520,18 +543,35 @@ impl AudioShared {
             self.measure(out);
             return;
         }
-        let gain = if self.muted.load(Ordering::Relaxed) {
-            0.0
-        } else {
-            f32::from_bits(self.volume.load(Ordering::Relaxed))
-        };
+        let gain = f32::from_bits(self.volume.load(Ordering::Relaxed));
         let mut ring = self.lock();
         let channels = usize::from(self.channels);
         ring.read_into(out, gain, channels);
         drop(ring);
         self.space.notify_all();
-        // After gain, so the meters show what is heard: silence when muted.
+        // The equalizer shapes what leaves the device, after the gain and before the meters, so
+        // the bars and the spectrum show the sound as it is heard.
+        let gains = self.eq.take();
+        if gains.is_some() || self.eq.live() {
+            let mut equalizer = self
+                .equalizer
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(gains) = gains {
+                equalizer.set(gains);
+            }
+            if self.eq.live() {
+                equalizer.apply(out, channels);
+            } else {
+                // Flat again: drop the old tail rather than resume from it later.
+                equalizer.clear();
+            }
+        }
+        // Publish the spectrum before silencing the device output.
         self.measure(out);
+        if self.muted.load(Ordering::Relaxed) {
+            out.fill(0.0);
+        }
     }
 
     /// Feed the samples about to leave the device into the meters and publish
@@ -691,6 +731,12 @@ mod tests {
         shared.fill(&mut out);
         assert_eq!(out, [0.0; 4]);
         assert_eq!(shared.played_frames(), 4);
+        let mut scope = [0.0; 4];
+        shared.scope(&mut scope);
+        assert_eq!(scope, [0.5; 4]);
+        shared.set_muted(false);
+        shared.fill(&mut out);
+        assert_eq!(out, [0.5; 4]);
     }
 
     #[test]
@@ -790,7 +836,10 @@ mod tests {
             assert!(levels[band] > 0.9, "{hz} Hz: {levels:?}");
             for (other, level) in levels.iter().enumerate() {
                 if other != band {
-                    assert!(*level < levels[band] - 0.5, "{hz} Hz leaks into {other}: {levels:?}");
+                    assert!(
+                        *level < levels[band] - 0.5,
+                        "{hz} Hz leaks into {other}: {levels:?}"
+                    );
                 }
             }
         }

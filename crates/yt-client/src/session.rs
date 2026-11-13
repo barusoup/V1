@@ -113,7 +113,11 @@ impl CookieJar {
 
     /// Whether the jar carries the cookies a signed-in InnerTube request needs.
     pub fn is_signed_in(&self) -> bool {
-        self.sapisid().is_some() && self.get("SID").or_else(|| self.get("__Secure-1PSID")).is_some()
+        self.sapisid().is_some()
+            && self
+                .get("SID")
+                .or_else(|| self.get("__Secure-1PSID"))
+                .is_some()
     }
 }
 

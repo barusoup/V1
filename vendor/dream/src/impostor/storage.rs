@@ -961,7 +961,6 @@ impl ImpostorAsset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn gpu_ctx() -> Option<Arc<GpuContext>> {
         std::panic::catch_unwind(|| {
@@ -993,7 +992,7 @@ mod tests {
         for bpp in ATLAS_BPP {
             let mut blob =
                 vec![0xABu8; image_blob_bytes(res, VIEW_COUNT as u64, bpp as u64) as usize];
-            if bpp as usize == ATLAS_BPP[0] {
+            if bpp == ATLAS_BPP[0] {
                 blob[3] = 255; // real albedo coverage
             }
             blobs.push(blob);
@@ -1039,7 +1038,7 @@ mod tests {
         assert_eq!(header.len(), HEADER_LEN);
         let mut out = header;
         for b in &blobs {
-            out.extend_from_slice(&b);
+            out.extend_from_slice(b);
         }
         out
     }
@@ -1132,7 +1131,7 @@ mod tests {
         words.push(1); // ref count
         words.push(1); // ref -> triangle 1
         let triangle_base = words.len() as u32;
-        words.extend(std::iter::repeat(0u32).take(TRIANGLE_WORDS));
+        words.extend(std::iter::repeat_n(0u32, TRIANGLE_WORDS));
         let voxel_bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let build = |voxel: &[u8], mask: u32| -> Vec<u8> {
@@ -1189,7 +1188,7 @@ mod tests {
             }
             let mut out = header;
             for b in &blobs {
-                out.extend_from_slice(&b);
+                out.extend_from_slice(b);
             }
             out
         };
@@ -1251,7 +1250,10 @@ mod tests {
         // records (refs capped at 64 each).
         let triangle_base = words.len() as u32;
         let tricount = 64u32;
-        words.extend(std::iter::repeat(0u32).take(TRIANGLE_WORDS * tricount as usize));
+        words.extend(std::iter::repeat_n(
+            0u32,
+            TRIANGLE_WORDS * tricount as usize,
+        ));
         let voxel_bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let build_with = |voxel: &[u8], tb: u32, tc: u32| -> Vec<u8> {
@@ -1303,7 +1305,7 @@ mod tests {
             }
             let mut out = header;
             for b in &blobs {
-                out.extend_from_slice(&b);
+                out.extend_from_slice(b);
             }
             out
         };
@@ -1327,7 +1329,10 @@ mod tests {
             w41.push(t % 64 + 1);
         }
         let tb41 = w41.len() as u32;
-        w41.extend(std::iter::repeat(0u32).take(TRIANGLE_WORDS * tricount as usize));
+        w41.extend(std::iter::repeat_n(
+            0u32,
+            TRIANGLE_WORDS * tricount as usize,
+        ));
         let v41: Vec<u8> = w41.iter().flat_map(|w| w.to_le_bytes()).collect();
         let bytes41 = build_with(&v41, tb41, tricount);
         decode(&bytes41, &ImpostorAssetLimits::default()).expect("41 refs allowed");
@@ -1394,7 +1399,7 @@ mod tests {
         }
         let mut out = header;
         for b in &blobs {
-            out.extend_from_slice(&b);
+            out.extend_from_slice(b);
         }
         let r = decode(&out, &ImpostorAssetLimits::default());
         assert!(matches!(r, Err(ImpostorAssetError::InvalidData(_))));

@@ -24,6 +24,7 @@ impl Ui {
     /// [`Self::menu`] with input optionally suppressed. An animated popup keeps
     /// drawing itself (and keeps its focus highlight) while it plays its exit,
     /// which is why the input gate is a parameter rather than a separate path.
+    #[allow(clippy::too_many_arguments)] // Keep the established rendering API.
     fn menu_inner(
         &mut self,
         label: &str,

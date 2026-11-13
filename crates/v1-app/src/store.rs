@@ -35,7 +35,9 @@ impl Job {
                 let mut temporary = path.clone().into_os_string();
                 temporary.push(".tmp");
                 let temporary = PathBuf::from(temporary);
-                if std::fs::write(&temporary, bytes).is_ok() && std::fs::rename(&temporary, &path).is_err() {
+                if std::fs::write(&temporary, bytes).is_ok()
+                    && std::fs::rename(&temporary, &path).is_err()
+                {
                     let _ = std::fs::remove_file(&temporary);
                 }
             }
@@ -79,7 +81,10 @@ impl Writer {
                 }
             })
             .ok();
-        Writer { tx: Some(tx), thread }
+        Writer {
+            tx: Some(tx),
+            thread,
+        }
     }
 
     pub fn put(&self, path: PathBuf, bytes: Vec<u8>) {
@@ -106,7 +111,9 @@ impl Drop for Writer {
 
 /// Seconds since the Unix epoch.
 pub fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// The file name a kept cover is stored under: a hash of its URL that does not change between runs
@@ -125,5 +132,7 @@ pub fn cover_key(url: &str) -> String {
 pub fn safe_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }

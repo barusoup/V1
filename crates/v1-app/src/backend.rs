@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{watch, Semaphore};
-use yt_client::{connect, AlbumPage, ArtistPage, InnerTube, SearchResults, TransportConfig, WebConfig};
+use yt_client::{
+    connect, AlbumPage, ArtistPage, InnerTube, SearchResults, TransportConfig, WebConfig,
+};
 use yt_js::Player;
 use yt_lyrics::{Lookup, Query, Service as LyricsService};
 use yt_proxy::{Config as ProxyConfig, Proxy};
@@ -118,16 +120,31 @@ pub enum Event {
     /// A cover could not be fetched or decoded. Without this the UI would wait for it for good.
     CoverFailed(String),
     /// The answer to a [`Command::Lyrics`], keyed by the track it was asked for.
-    Lyrics { video_id: String, lookup: Lookup },
+    Lyrics {
+        video_id: String,
+        lookup: Lookup,
+    },
     /// The answer to a [`Command::Artist`]: the page, or why it could not be read.
-    Artist { id: String, result: Result<ArtistPage, String> },
+    Artist {
+        id: String,
+        result: Result<ArtistPage, String>,
+    },
     /// The answer to a [`Command::Album`].
-    Album { id: String, result: Result<AlbumPage, String> },
+    Album {
+        id: String,
+        result: Result<AlbumPage, String>,
+    },
     /// The answer to a [`Command::Length`]: the length in seconds, if YouTube gave one.
-    Length { video_id: String, seconds: Option<u64> },
+    Length {
+        video_id: String,
+        seconds: Option<u64>,
+    },
     /// The answer to a [`Command::SongMeta`]: the song as it is now known, or `None` when the
     /// missing fields could not be found.
-    SongMeta { video_id: String, hit: Option<yt_client::SongHit> },
+    SongMeta {
+        video_id: String,
+        hit: Option<yt_client::SongHit>,
+    },
     /// A [`Command::Download`] finished: the file is in place.
     Downloaded {
         video_id: String,
@@ -135,7 +152,10 @@ pub enum Event {
         duration_secs: Option<f64>,
     },
     /// A [`Command::Download`] failed. The library tries again later.
-    DownloadFailed { video_id: String, message: String },
+    DownloadFailed {
+        video_id: String,
+        message: String,
+    },
 }
 
 /// How many length lookups run at once.
@@ -165,7 +185,12 @@ fn encode(ffmpeg: &Path, url: &str, part: &Path, done: &Path, job: &Job) -> Resu
         .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y"])
         .args(["-protocol_whitelist", "file,http,https,tcp,tls"])
         .args(["-reconnect", "1", "-reconnect_streamed", "1"])
-        .args(["-reconnect_on_network_error", "1", "-reconnect_delay_max", "2"])
+        .args([
+            "-reconnect_on_network_error",
+            "1",
+            "-reconnect_delay_max",
+            "2",
+        ])
         .args(["-i", url, "-vn", "-map", "0:a:0", "-map_metadata", "-1"])
         .args(["-metadata", &format!("title={}", job.title)])
         .args(["-metadata", &format!("artist={}", job.artist)]);
@@ -173,7 +198,16 @@ fn encode(ffmpeg: &Path, url: &str, part: &Path, done: &Path, job: &Job) -> Resu
         command.args(["-metadata", &format!("album={album}")]);
     }
     command
-        .args(["-c:a", "libopus", "-b:a", DOWNLOAD_BITRATE, "-vbr", "on", "-application", "audio"])
+        .args([
+            "-c:a",
+            "libopus",
+            "-b:a",
+            DOWNLOAD_BITRATE,
+            "-vbr",
+            "on",
+            "-application",
+            "audio",
+        ])
         .args(["-f", "ogg"])
         .arg(part)
         .stdin(std::process::Stdio::null())
@@ -185,11 +219,18 @@ fn encode(ffmpeg: &Path, url: &str, part: &Path, done: &Path, job: &Job) -> Resu
         // CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS
         command.creation_flags(0x0800_0000 | 0x0000_4000);
     }
-    let output = command.output().map_err(|error| format!("could not run ffmpeg: {error}"))?;
+    let output = command
+        .output()
+        .map_err(|error| format!("could not run ffmpeg: {error}"))?;
     if !output.status.success() {
         let _ = std::fs::remove_file(part);
         let text = String::from_utf8_lossy(&output.stderr);
-        let last = text.lines().last().unwrap_or("ffmpeg failed").trim().to_owned();
+        let last = text
+            .lines()
+            .last()
+            .unwrap_or("ffmpeg failed")
+            .trim()
+            .to_owned();
         return Err(last);
     }
     let _ = std::fs::remove_file(done);
@@ -212,7 +253,11 @@ fn cover_url(url: &str) -> String {
     }
 }
 
-async fn fetch_cover(http: &reqwest::Client, data_dir: &Path, url: &str) -> Option<(u32, u32, Vec<u8>)> {
+async fn fetch_cover(
+    http: &reqwest::Client,
+    data_dir: &Path,
+    url: &str,
+) -> Option<(u32, u32, Vec<u8>)> {
     // A cover kept for a saved item is read from disk, so it shows offline and without a request.
     let bytes = match tokio::fs::read(kept_cover_path(data_dir, url)).await {
         Ok(bytes) => bytes,
@@ -230,7 +275,11 @@ async fn fetch_cover(http: &reqwest::Client, data_dir: &Path, url: &str) -> Opti
     };
     tokio::task::spawn_blocking(move || {
         let image = image::load_from_memory(&bytes).ok()?;
-        let square = image.resize_to_fill(COVER_SIZE, COVER_SIZE, image::imageops::FilterType::Triangle);
+        let square = image.resize_to_fill(
+            COVER_SIZE,
+            COVER_SIZE,
+            image::imageops::FilterType::Triangle,
+        );
         Some((COVER_SIZE, COVER_SIZE, square.to_rgba8().into_raw()))
     })
     .await
@@ -371,16 +420,27 @@ impl Net {
 
     async fn preload(&self, video_id: String) {
         tokio::time::sleep(Duration::from_millis(800)).await;
-        let Ok(_turn) = self.preload_gate.acquire().await else { return };
-        let Ok(resolver) = self.resolver().await else { return };
+        let Ok(_turn) = self.preload_gate.acquire().await else {
+            return;
+        };
+        let Ok(resolver) = self.resolver().await else {
+            return;
+        };
         // The result lands in the resolver's cache; nothing is sent back.
         let _ = resolver.resolve(&video_id).await;
     }
 
     async fn cover(&self, url: String) {
-        let Ok(_turn) = self.cover_gate.acquire().await else { return };
+        let Ok(_turn) = self.cover_gate.acquire().await else {
+            return;
+        };
         let event = match fetch_cover(&self.http, &self.data_dir, &url).await {
-            Some((width, height, rgba)) => Event::Cover { url, width, height, rgba },
+            Some((width, height, rgba)) => Event::Cover {
+                url,
+                width,
+                height,
+                rgba,
+            },
             None => Event::CoverFailed(url),
         };
         let _ = self.events.send(event);
@@ -393,7 +453,9 @@ impl Net {
     }
 
     async fn length(&self, video_id: String) {
-        let Ok(_turn) = self.length_gate.acquire().await else { return };
+        let Ok(_turn) = self.length_gate.acquire().await else {
+            return;
+        };
         let seconds = self.tube.track_length(&video_id).await.ok().flatten();
         let _ = self.events.send(Event::Length { video_id, seconds });
     }
@@ -403,7 +465,9 @@ impl Net {
     /// is searched for by name and artist; when it did not, the song itself is searched for by title
     /// and artist, since that finds its exact video. Only empty fields are filled.
     async fn song_meta(&self, song: yt_client::SongHit) {
-        let Ok(_turn) = self.meta_gate.acquire().await else { return };
+        let Ok(_turn) = self.meta_gate.acquire().await else {
+            return;
+        };
         let mut updated = song.clone();
         // A row that names the album but does not link it is the common case: one album search
         // finds its browse id. Only when no album name is known is the song itself searched for.
@@ -425,14 +489,18 @@ impl Net {
             }
             if !query.is_empty() {
                 if let Ok(hits) = self.tube.search_songs(&query, false).await {
-                    if let Some(found) = hits.into_iter().find(|hit| hit.video_id == song.video_id) {
+                    if let Some(found) = hits.into_iter().find(|hit| hit.video_id == song.video_id)
+                    {
                         fill_meta(&mut updated, &found);
                     }
                 }
             }
         }
         let hit = (updated != song).then_some(updated);
-        let _ = self.events.send(Event::SongMeta { video_id: song.video_id, hit });
+        let _ = self.events.send(Event::SongMeta {
+            video_id: song.video_id,
+            hit,
+        });
     }
 
     async fn keep_cover(&self, url: String) {
@@ -440,9 +508,15 @@ impl Net {
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return;
         }
-        let Ok(response) = self.http.get(cover_url(&url)).send().await else { return };
-        let Ok(response) = response.error_for_status() else { return };
-        let Ok(bytes) = response.bytes().await else { return };
+        let Ok(response) = self.http.get(cover_url(&url)).send().await else {
+            return;
+        };
+        let Ok(response) = response.error_for_status() else {
+            return;
+        };
+        let Ok(bytes) = response.bytes().await else {
+            return;
+        };
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -451,24 +525,36 @@ impl Net {
 
     async fn download(&self, job: Job) {
         let video_id = job.video_id.clone();
-        let Ok(turn) = self.download_gate.acquire().await else { return };
+        let Ok(turn) = self.download_gate.acquire().await else {
+            return;
+        };
         let for_lyrics = job.clone();
         let outcome: Result<(Option<f64>, Option<f64>), String> = async {
             if !safe_id(&video_id) {
                 return Err("unusable video id".to_owned());
             }
             let resolver = self.resolver().await?;
-            let resolved = resolver.resolve(&video_id).await.map_err(|e| e.to_string())?;
+            let resolved = resolver
+                .resolve(&video_id)
+                .await
+                .map_err(|e| e.to_string())?;
             let url = self.proxy.register(&resolved.url, resolved.headers.clone());
             let dir = self.data_dir.join("downloads");
-            tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .map_err(|e| e.to_string())?;
             let done = dir.join(format!("{video_id}.opus"));
             let part = dir.join(format!("{video_id}.opus.part"));
-            let ffmpeg = dream_media::Tools::discover().map_err(|e| e.to_string())?.ffmpeg;
+            let ffmpeg = dream_media::Tools::discover()
+                .map_err(|e| e.to_string())?
+                .ffmpeg;
             tokio::task::spawn_blocking(move || encode(&ffmpeg, &url, &part, &done, &job))
                 .await
                 .map_err(|e| e.to_string())??;
-            Ok((resolved.loudness_db, resolved.length_seconds.map(|s| s as f64)))
+            Ok((
+                resolved.loudness_db,
+                resolved.length_seconds.map(|s| s as f64),
+            ))
         }
         .await;
         // The download slot is free before the lyrics go out, so a lyric lookup never holds it.
@@ -479,7 +565,10 @@ impl Net {
                 loudness_db: *loudness_db,
                 duration_secs: *duration_secs,
             },
-            Err(message) => Event::DownloadFailed { video_id: video_id.clone(), message: message.clone() },
+            Err(message) => Event::DownloadFailed {
+                video_id: video_id.clone(),
+                message: message.clone(),
+            },
         });
         // A saved song keeps its lyrics with it: fetch them now, while the length is known, so they
         // play offline. The lookup caches what it finds under the video id (see `yt_lyrics::Cache`).
@@ -514,11 +603,26 @@ fn refuse(command: Command, events: &Sender<Event>, message: &str) {
             video_id: query.video_id,
             lookup: Lookup::Unavailable(message),
         }),
-        Command::Artist(id) => events.send(Event::Artist { id, result: Err(message) }),
-        Command::Album(id) => events.send(Event::Album { id, result: Err(message) }),
-        Command::Length(video_id) => events.send(Event::Length { video_id, seconds: None }),
-        Command::SongMeta(song) => events.send(Event::SongMeta { video_id: song.video_id, hit: None }),
-        Command::Download(job) => events.send(Event::DownloadFailed { video_id: job.video_id, message }),
+        Command::Artist(id) => events.send(Event::Artist {
+            id,
+            result: Err(message),
+        }),
+        Command::Album(id) => events.send(Event::Album {
+            id,
+            result: Err(message),
+        }),
+        Command::Length(video_id) => events.send(Event::Length {
+            video_id,
+            seconds: None,
+        }),
+        Command::SongMeta(song) => events.send(Event::SongMeta {
+            video_id: song.video_id,
+            hit: None,
+        }),
+        Command::Download(job) => events.send(Event::DownloadFailed {
+            video_id: job.video_id,
+            message,
+        }),
         Command::Cover(url) => events.send(Event::CoverFailed(url)),
         Command::Preload(_) | Command::KeepCover(_) | Command::Shutdown => Ok(()),
     };
@@ -609,7 +713,9 @@ async fn serve(
         connect_with_retry(commands, &events)
     );
     let proxy = proxy?;
-    let Some((tube, web)) = connected else { return Ok(()) };
+    let Some((tube, web)) = connected else {
+        return Ok(());
+    };
 
     // For covers and lyrics. Their hosts take HTTP/2, so a screenful of covers shares a connection.
     // A total timeout: a cover or a lyric that stalls would otherwise hold its task, and whatever
@@ -649,13 +755,14 @@ async fn serve(
     tokio::spawn({
         let events = events.clone();
         async move {
-            let state = match build_resolver(&script_http, &data_dir, tube, web.player_js_path).await {
-                Ok(resolver) => PlayerState::Ready(Arc::new(resolver)),
-                Err(message) => {
-                    let _ = events.send(Event::Fatal(message.clone()));
-                    PlayerState::Failed(message)
-                }
-            };
+            let state =
+                match build_resolver(&script_http, &data_dir, tube, web.player_js_path).await {
+                    Ok(resolver) => PlayerState::Ready(Arc::new(resolver)),
+                    Err(message) => {
+                        let _ = events.send(Event::Fatal(message.clone()));
+                        PlayerState::Failed(message)
+                    }
+                };
             let _ = player_tx.send(state);
         }
     });
@@ -672,13 +779,15 @@ async fn serve(
                 if let Some(old) = search_task.take() {
                     old.abort();
                 }
-                search_task = Some(tokio::spawn(async move { net.search(query).await }).abort_handle());
+                search_task =
+                    Some(tokio::spawn(async move { net.search(query).await }).abort_handle());
             }
             Command::Play(video_id) => {
                 if let Some(old) = play_task.take() {
                     old.abort();
                 }
-                play_task = Some(tokio::spawn(async move { net.play(video_id).await }).abort_handle());
+                play_task =
+                    Some(tokio::spawn(async move { net.play(video_id).await }).abort_handle());
             }
             Command::Preload(video_id) => {
                 tokio::spawn(async move { net.preload(video_id).await });
@@ -693,13 +802,21 @@ async fn serve(
             // Pages are fetched alongside whatever else is happening, like covers and lyrics.
             Command::Artist(id) => {
                 tokio::spawn(async move {
-                    let result = net.tube.artist_page(&id).await.map_err(|error| error.to_string());
+                    let result = net
+                        .tube
+                        .artist_page(&id)
+                        .await
+                        .map_err(|error| error.to_string());
                     let _ = net.events.send(Event::Artist { id, result });
                 });
             }
             Command::Album(id) => {
                 tokio::spawn(async move {
-                    let result = net.tube.album_page(&id).await.map_err(|error| error.to_string());
+                    let result = net
+                        .tube
+                        .album_page(&id)
+                        .await
+                        .map_err(|error| error.to_string());
                     let _ = net.events.send(Event::Album { id, result });
                 });
             }

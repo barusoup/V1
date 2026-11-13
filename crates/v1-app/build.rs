@@ -13,7 +13,10 @@ fn main() {
             .set("ProductName", "V1")
             .set("FileDescription", "V1")
             .set("CompanyName", "Barusoup")
-            .set("LegalCopyright", "Copyright (c) 2026 Hunter Lehr (Barusoup)")
+            .set(
+                "LegalCopyright",
+                "Copyright (c) 2026 Hunter Lehr (Barusoup)",
+            )
             .set("OriginalFilename", "v1.exe")
             .set("InternalName", "V1")
             .compile()

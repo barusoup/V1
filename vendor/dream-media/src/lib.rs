@@ -32,7 +32,7 @@
 //! # #[cfg(feature = "gpu")] {
 //! use std::sync::Arc;
 //! use std::time::Instant;
-//! use dream::gfx::vulkan::GpuContext;
+//! use dream::gfx::GpuContext;
 //! use dream_media::{PlayerOptions, VideoPlayer};
 //!
 //! fn open(ctx: Arc<GpuContext>) -> dream_media::Result<VideoPlayer> {
@@ -63,6 +63,7 @@
 
 mod audio;
 mod clock;
+mod equalizer;
 mod error;
 mod geom;
 mod image;

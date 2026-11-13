@@ -16,6 +16,7 @@ use dream::ui::{Color, Rect};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Icon {
+    #[cfg(test)]
     House,
     Book,
     Disc,
@@ -36,17 +37,25 @@ pub enum Icon {
     Music,
     Mic,
     Minus,
+    Fullscreen,
+    ExitFullscreen,
     Plus,
     Check,
     User,
     GripVertical,
     Trash2,
+    Settings,
+    Star,
+    StarFilled,
+    Image,
+    Folder,
+    Reset,
 }
 
 impl Icon {
     /// Every icon, for the tests that check each one parses and rasterizes.
-    #[allow(dead_code)]
-    pub const ALL: [Icon; 25] = [
+    #[cfg(test)]
+    pub const ALL: [Icon; 33] = [
         Icon::House,
         Icon::Book,
         Icon::Disc,
@@ -67,15 +76,24 @@ impl Icon {
         Icon::Music,
         Icon::Mic,
         Icon::Minus,
+        Icon::Fullscreen,
+        Icon::ExitFullscreen,
         Icon::Plus,
         Icon::Check,
         Icon::User,
         Icon::GripVertical,
         Icon::Trash2,
+        Icon::Settings,
+        Icon::Star,
+        Icon::StarFilled,
+        Icon::Image,
+        Icon::Folder,
+        Icon::Reset,
     ];
 
     fn svg(self) -> &'static str {
         match self {
+            #[cfg(test)]
             Icon::House => include_str!("../assets/icons/house.svg"),
             Icon::Book => include_str!("../assets/icons/book.svg"),
             Icon::Disc => include_str!("../assets/icons/disc-3.svg"),
@@ -96,11 +114,24 @@ impl Icon {
             Icon::Music => include_str!("../assets/icons/music.svg"),
             Icon::Mic => include_str!("../assets/icons/mic.svg"),
             Icon::Minus => include_str!("../assets/icons/minus.svg"),
+            // Caption corners use the same 24-unit grid, stroke and rasterizer as the other
+            // window controls. Their 14-unit extent matches the minimize glyph.
+            Icon::Fullscreen => {
+                r#"<svg><path d="M9 5H5v4 M15 5h4v4 M5 15v4h4 M19 15v4h-4" /></svg>"#
+            }
+            Icon::ExitFullscreen => {
+                r#"<svg><path d="M5 9h4V5 M19 9h-4V5 M5 15h4v4 M19 15h-4v4" /></svg>"#
+            }
             Icon::Plus => include_str!("../assets/icons/plus.svg"),
             Icon::Check => include_str!("../assets/icons/check.svg"),
             Icon::User => include_str!("../assets/icons/user.svg"),
             Icon::GripVertical => include_str!("../assets/icons/grip-vertical.svg"),
             Icon::Trash2 => include_str!("../assets/icons/trash-2.svg"),
+            Icon::Settings => include_str!("../assets/icons/settings.svg"),
+            Icon::Star | Icon::StarFilled => include_str!("../assets/icons/star.svg"),
+            Icon::Image => include_str!("../assets/icons/image.svg"),
+            Icon::Folder => include_str!("../assets/icons/folder.svg"),
+            Icon::Reset => include_str!("../assets/icons/rotate-ccw.svg"),
         }
     }
 
@@ -108,7 +139,7 @@ impl Icon {
     fn filled(self) -> bool {
         matches!(
             self,
-            Icon::Play | Icon::Pause | Icon::SkipBack | Icon::SkipForward
+            Icon::Play | Icon::Pause | Icon::SkipBack | Icon::SkipForward | Icon::StarFilled
         )
     }
 
@@ -163,14 +194,18 @@ fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
 }
 
 fn number_attr(tag: &str, name: &str) -> f32 {
-    attr(tag, name).and_then(|v| v.trim().parse().ok()).unwrap_or(0.0)
+    attr(tag, name)
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0.0)
 }
 
 fn parse_svg(svg: &str) -> Vec<Shape> {
     let mut shapes = Vec::new();
     let mut rest = svg;
     while let Some(open) = rest.find('<') {
-        let Some(close) = rest[open..].find('>') else { break };
+        let Some(close) = rest[open..].find('>') else {
+            break;
+        };
         let tag = &rest[open + 1..open + close];
         rest = &rest[open + close + 1..];
         let name = tag.split_whitespace().next().unwrap_or("");
@@ -180,7 +215,9 @@ fn parse_svg(svg: &str) -> Vec<Shape> {
         match name {
             "path" => {
                 if let Some(d) = attr(&flat, "d") {
-                    shapes.push(Shape { polys: flatten_path(d) });
+                    shapes.push(Shape {
+                        polys: flatten_path(d),
+                    });
                 }
             }
             "circle" => {
@@ -196,7 +233,12 @@ fn parse_svg(svg: &str) -> Vec<Shape> {
                         (cx + r * a.cos(), cy + r * a.sin())
                     })
                     .collect();
-                shapes.push(Shape { polys: vec![Poly { points, closed: true }] });
+                shapes.push(Shape {
+                    polys: vec![Poly {
+                        points,
+                        closed: true,
+                    }],
+                });
             }
             "rect" => {
                 let (x, y, w, h) = (
@@ -206,12 +248,19 @@ fn parse_svg(svg: &str) -> Vec<Shape> {
                     number_attr(&flat, "height"),
                 );
                 let rx = number_attr(&flat, "rx").min(w * 0.5).min(h * 0.5);
-                shapes.push(Shape { polys: vec![rounded_rect(x, y, w, h, rx)] });
+                shapes.push(Shape {
+                    polys: vec![rounded_rect(x, y, w, h, rx)],
+                });
             }
             "line" => {
                 let a = (number_attr(&flat, "x1"), number_attr(&flat, "y1"));
                 let b = (number_attr(&flat, "x2"), number_attr(&flat, "y2"));
-                shapes.push(Shape { polys: vec![Poly { points: vec![a, b], closed: false }] });
+                shapes.push(Shape {
+                    polys: vec![Poly {
+                        points: vec![a, b],
+                        closed: false,
+                    }],
+                });
             }
             _ => {}
         }
@@ -237,7 +286,10 @@ fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Poly {
             points.push((cx + r * a.cos(), cy + r * a.sin()));
         }
     }
-    Poly { points, closed: true }
+    Poly {
+        points,
+        closed: true,
+    }
 }
 
 /// A scanner over SVG path data.
@@ -248,7 +300,9 @@ struct Scan<'a> {
 
 impl Scan<'_> {
     fn skip(&mut self) {
-        while self.i < self.s.len() && (self.s[self.i] == b' ' || self.s[self.i] == b',' || self.s[self.i] == b'\n') {
+        while self.i < self.s.len()
+            && (self.s[self.i] == b' ' || self.s[self.i] == b',' || self.s[self.i] == b'\n')
+        {
             self.i += 1;
         }
     }
@@ -309,7 +363,10 @@ impl Scan<'_> {
 }
 
 fn flatten_path(d: &str) -> Vec<Poly> {
-    let mut scan = Scan { s: d.as_bytes(), i: 0 };
+    let mut scan = Scan {
+        s: d.as_bytes(),
+        i: 0,
+    };
     let mut polys: Vec<Poly> = Vec::new();
     let mut cur: P = (0.0, 0.0);
     let mut start: P = (0.0, 0.0);
@@ -321,7 +378,10 @@ fn flatten_path(d: &str) -> Vec<Poly> {
 
     let finish = |points: &mut Vec<P>, polys: &mut Vec<Poly>, closed: bool| {
         if points.len() > 1 || (closed && !points.is_empty()) {
-            polys.push(Poly { points: std::mem::take(points), closed });
+            polys.push(Poly {
+                points: std::mem::take(points),
+                closed,
+            });
         } else {
             points.clear();
         }
@@ -392,8 +452,14 @@ fn flatten_path(d: &str) -> Vec<Poly> {
                 };
                 let end = (ox + scan.number(), oy + scan.number());
                 // A quadratic is a cubic with these control points.
-                let c1 = (cur.0 + 2.0 / 3.0 * (c.0 - cur.0), cur.1 + 2.0 / 3.0 * (c.1 - cur.1));
-                let c2 = (end.0 + 2.0 / 3.0 * (c.0 - end.0), end.1 + 2.0 / 3.0 * (c.1 - end.1));
+                let c1 = (
+                    cur.0 + 2.0 / 3.0 * (c.0 - cur.0),
+                    cur.1 + 2.0 / 3.0 * (c.1 - cur.1),
+                );
+                let c2 = (
+                    end.0 + 2.0 / 3.0 * (c.0 - end.0),
+                    end.1 + 2.0 / 3.0 * (c.1 - end.1),
+                );
                 cubic(&mut points, cur, c1, c2, end);
                 last_quad = Some(c);
                 last_cubic = None;
@@ -477,7 +543,12 @@ fn arc(out: &mut Vec<P>, from: P, rx: f32, ry: f32, rot_deg: f32, large: bool, s
         a
     };
     let theta = angle(1.0, 0.0, (x1 - cxp) / rx, (y1 - cyp) / ry);
-    let mut delta = angle((x1 - cxp) / rx, (y1 - cyp) / ry, (-x1 - cxp) / rx, (-y1 - cyp) / ry);
+    let mut delta = angle(
+        (x1 - cxp) / rx,
+        (y1 - cyp) / ry,
+        (-x1 - cxp) / rx,
+        (-y1 - cyp) / ry,
+    );
     if !sweep && delta > 0.0 {
         delta -= std::f32::consts::TAU;
     } else if sweep && delta < 0.0 {
@@ -571,7 +642,14 @@ pub fn rasterize(icon: Icon, px: u32) -> Vec<u8> {
 /// Three bars, low to high, that follow the sound being played: `levels` are the low, mid and high
 /// band levels, each 0 to 1. When `live` is false the bars hold a fixed skyline, so a paused track
 /// still reads as "this one".
-pub fn equalizer(draw: &mut DrawList, center: P, size: f32, color: Color, levels: [f32; 3], live: bool) {
+pub fn equalizer(
+    draw: &mut DrawList,
+    center: P,
+    size: f32,
+    color: Color,
+    levels: [f32; 3],
+    live: bool,
+) {
     let bar_w = (size * 0.2).max(2.0);
     let gap = bar_w * 0.8;
     let total = bar_w * 3.0 + gap * 2.0;
@@ -632,7 +710,11 @@ mod tests {
         assert_eq!(alpha(&play, 10.0, 12.0), 255, "play should be filled");
         // Inside the house's doorway: an outline icon must leave it empty.
         let house = rasterize(Icon::House, px);
-        assert_eq!(alpha(&house, 12.0, 16.0), 0, "an outline icon must not fill");
+        assert_eq!(
+            alpha(&house, 12.0, 16.0),
+            0,
+            "an outline icon must not fill"
+        );
     }
 
     #[test]

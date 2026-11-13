@@ -143,10 +143,10 @@ impl Model {
                 .map(|mesh| mesh.primitives().count())
                 .unwrap_or(0);
             for flattened in flattened..flattened + primitives {
-                if let Some(mesh) = model.meshes.get_mut(flattened) {
-                    if mesh.node.is_none() {
-                        mesh.node = Some(node.index());
-                    }
+                if let Some(mesh) = model.meshes.get_mut(flattened)
+                    && mesh.node.is_none()
+                {
+                    mesh.node = Some(node.index());
                 }
             }
         }
@@ -307,12 +307,7 @@ fn texture_ref(info: &gltf::texture::Info<'_>, images: &[gltf::image::Data]) -> 
         scale: t.scale(),
         tex_coord: t.tex_coord(),
     });
-    Some(map_ref_parts(
-        &texture,
-        info.tex_coord(),
-        transform,
-        images,
-    )?)
+    map_ref_parts(&texture, info.tex_coord(), transform, images)
 }
 
 /// Same as [`texture_ref`] for the `NormalTexture`/`OcclusionTexture` shapes,
@@ -323,12 +318,12 @@ fn map_ref(
     transform_value: Option<&gltf::json::Value>,
     images: &[gltf::image::Data],
 ) -> Option<TextureRef> {
-    Some(map_ref_parts(
+    map_ref_parts(
         texture,
         tex_coord,
         transform_value.and_then(parse_uv_transform),
         images,
-    )?)
+    )
 }
 
 fn map_ref_parts(

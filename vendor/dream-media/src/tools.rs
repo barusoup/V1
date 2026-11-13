@@ -71,7 +71,12 @@ impl Tools {
     pub(crate) fn ffprobe_flat(&self, source: &Path) -> Result<String> {
         let mut cmd = process::command(&self.ffprobe);
         cmd.args(["-v", "error", "-max_alloc", MAX_ALLOC, "-threads", "1"]);
-        cmd.args(["-protocol_whitelist", PROTOCOLS, "-format_whitelist", FORMATS]);
+        cmd.args([
+            "-protocol_whitelist",
+            PROTOCOLS,
+            "-format_whitelist",
+            FORMATS,
+        ]);
         cmd.args(["-probesize", "8388608", "-analyzeduration", "5000000"]);
         cmd.args(["-print_format", "flat", "-show_format", "-show_streams"]);
         cmd.arg(source);
@@ -92,7 +97,12 @@ pub(crate) fn is_networked(source: &Path) -> bool {
     text.starts_with("http://") || text.starts_with("https://")
 }
 
-pub(crate) fn input_options(cmd: &mut Command, threads: &str, filter_threads: &str, networked: bool) {
+pub(crate) fn input_options(
+    cmd: &mut Command,
+    threads: &str,
+    filter_threads: &str,
+    networked: bool,
+) {
     cmd.args([
         "-max_alloc",
         MAX_ALLOC,
@@ -161,5 +171,3 @@ fn in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
     }
     None
 }
-
-

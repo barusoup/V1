@@ -75,7 +75,9 @@ impl InnerTube {
         let value = self.browse(browse_id).await?;
         let page = parse_artist(browse_id, &value);
         if page.name.is_empty() && page.songs.is_empty() && page.shelves.is_empty() {
-            return Err(Error::NoContent { endpoint: "browse".to_owned() });
+            return Err(Error::NoContent {
+                endpoint: "browse".to_owned(),
+            });
         }
         Ok(page)
     }
@@ -85,7 +87,9 @@ impl InnerTube {
         let value = self.browse(browse_id).await?;
         let page = parse_album(browse_id, &value);
         if page.title.is_empty() && page.tracks.is_empty() {
-            return Err(Error::NoContent { endpoint: "browse".to_owned() });
+            return Err(Error::NoContent {
+                endpoint: "browse".to_owned(),
+            });
         }
         Ok(page)
     }
@@ -105,7 +109,9 @@ impl InnerTube {
 /// Read an artist's channel response. Missing parts come back empty, never as an error.
 pub fn parse_artist(browse_id: &str, root: &Value) -> ArtistPage {
     let header = header(root);
-    let name = header.and_then(|h| text_field(h, "title")).unwrap_or_default();
+    let name = header
+        .and_then(|h| text_field(h, "title"))
+        .unwrap_or_default();
     let mut page = ArtistPage {
         browse_id: browse_id.to_owned(),
         thumbnail: header.and_then(thumbnail_of),
@@ -301,7 +307,10 @@ fn run_page(run: &Value) -> Option<(&str, Option<&str>)> {
 }
 
 fn is_artist_kind(kind: &str) -> bool {
-    matches!(kind, "MUSIC_PAGE_TYPE_ARTIST" | "MUSIC_PAGE_TYPE_USER_CHANNEL")
+    matches!(
+        kind,
+        "MUSIC_PAGE_TYPE_ARTIST" | "MUSIC_PAGE_TYPE_USER_CHANNEL"
+    )
 }
 
 /// A run that names an artist without linking to their page, when it is not the album's kind or
@@ -313,7 +322,10 @@ fn plain_artist_run(run: &Value) -> Option<String> {
     let text = text_of_run(run);
     if text.is_empty()
         || !text.chars().any(char::is_alphanumeric)
-        || matches!(text.to_ascii_lowercase().as_str(), "album" | "single" | "ep" | "compilation")
+        || matches!(
+            text.to_ascii_lowercase().as_str(),
+            "album" | "single" | "ep" | "compilation"
+        )
         || text.chars().all(|c| c.is_ascii_digit() || c == '-')
     {
         return None;
@@ -323,7 +335,11 @@ fn plain_artist_run(run: &Value) -> Option<String> {
 
 /// The text of one run, trimmed.
 fn text_of_run(run: &Value) -> String {
-    run.get("text").and_then(Value::as_str).unwrap_or_default().trim().to_owned()
+    run.get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
 }
 
 /// The runs of a text object (`{ "runs": [...] }`), or none.
@@ -356,7 +372,10 @@ pub(crate) fn text_field(value: &Value, key: &str) -> Option<String> {
 /// The text of a text object: its runs joined, or its `simpleText`.
 pub(crate) fn text_of(field: &Value) -> Option<String> {
     if let Some(runs) = field.get("runs").and_then(Value::as_array) {
-        let text: String = runs.iter().filter_map(|r| r.get("text")?.as_str()).collect();
+        let text: String = runs
+            .iter()
+            .filter_map(|r| r.get("text")?.as_str())
+            .collect();
         return (!text.is_empty()).then_some(text);
     }
     field.get("simpleText")?.as_str().map(str::to_owned)
@@ -521,7 +540,10 @@ mod tests {
         assert_eq!(page.title, "Homework");
         assert_eq!(page.artist, "Daft Punk");
         assert_eq!(page.artist_id.as_deref(), Some("UCdaftpunk"));
-        assert_eq!(page.meta, "Album  ·  1996  ·  16 songs  ·  1 hour, 14 minutes");
+        assert_eq!(
+            page.meta,
+            "Album  ·  1996  ·  16 songs  ·  1 hour, 14 minutes"
+        );
         assert_eq!(page.thumbnail.as_deref(), Some("https://x/cover"));
         assert_eq!(page.tracks.len(), 1);
         assert_eq!(page.tracks[0].artists, vec!["Daft Punk".to_owned()]);
