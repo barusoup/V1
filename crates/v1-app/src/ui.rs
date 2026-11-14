@@ -3496,9 +3496,10 @@ pub fn build(
         cx.blocked |= theater;
         cx.clip(Rect::new(0.0, 0.0, sidebar_w, body_h));
         draw_sidebar(&mut cx, state, sidebar, open_t, &mut actions);
+        cx.unclip();
+        // The join extends to the right of the sidebar, outside its content clip.
         let panel_alpha = ui_panel_alpha(state);
         draw_join_crescent(&mut cx, sidebar, panel_alpha);
-        cx.unclip();
     }
     // The chrome floats over the content, which now scrolls up under it. Its layer sorts it above
     // the page's rows, so a row's text never paints over the search bar or the caption icons.
