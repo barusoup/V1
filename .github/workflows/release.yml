@@ -86,6 +86,15 @@ jobs:
       - name: Build Apple Silicon DMG
         run: ./installer/build-macos.sh
 
+      - name: Verify the DMG and the signed app
+        run: |
+          dmg="target/aarch64-apple-darwin/release/V1-$VERSION-arm64.dmg"
+          hdiutil verify "$dmg"
+          mount="$(mktemp -d)"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount"
+          codesign --verify --deep --strict --verbose=2 "$mount/V1.app"
+          hdiutil detach "$mount" -quiet
+
       - name: Upload macOS DMG
         uses: actions/upload-artifact@v4
         with:
