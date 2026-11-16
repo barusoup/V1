@@ -32,6 +32,11 @@ const HANDOFF_FILE: &str = "update-in-progress";
 /// A marker older than this is treated as a crashed update, so a broken install cannot lock the app
 /// out for long. The helper script waits up to two minutes before it gives up.
 const HANDOFF_TTL: Duration = Duration::from_secs(300);
+/// How long the background check waits before it starts. It builds a runtime and a TLS client,
+/// which is CPU the first frame wants: by the time this elapses the window is up. A launch that
+/// blocks the check behind a release installs it just as it did before, only a few milliseconds
+/// later.
+const START_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(u64, u64, u64);
@@ -161,10 +166,17 @@ pub fn run_at_startup() {
 /// Start the update check on a thread of its own, so a slow or unreachable GitHub can never hold
 /// the window shut. An installed copy still checks on every start; if a newer release is staged,
 /// the app exits and the helper installs it and starts it again.
+///
+/// The thread waits [`START_DELAY`] first. Starting the check takes the same CPU the renderer and
+/// the first frame want (a runtime, a TLS client, a name lookup), and nothing about an update is
+/// urgent to the millisecond: the window is up before the check begins.
 pub fn check_in_background() {
     let _ = std::thread::Builder::new()
         .name("v1-update".to_owned())
-        .spawn(run_at_startup);
+        .spawn(|| {
+            std::thread::sleep(START_DELAY);
+            run_at_startup();
+        });
 }
 
 /// The folder the app is installed in, or `None` for a build run from anywhere else.

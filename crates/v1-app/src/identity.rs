@@ -5,26 +5,40 @@
 //!
 //! The taskbar and the media flyout identify a process by its AppUserModelID and resolve the
 //! display name from the Start Menu shortcut that carries the same ID. An explicit ID without a
-//! matching shortcut shows up as "Unknown app", so an installed copy repairs its own shortcut
-//! before the window exists. Builds run from `target/` are left alone: installing a shortcut for a
-//! development binary would put an entry in the Start Menu for something the user never installed.
+//! matching shortcut shows up as "Unknown app", so an installed copy repairs its own shortcut.
+//! Builds run from `target/` are left alone: installing a shortcut for a development binary would
+//! put an entry in the Start Menu for something the user never installed.
+//!
+//! Only the two parts the window itself needs run before it: setting the process ID, and (for an
+//! installed copy) starting the repair. The repair is COM work and a handful of file operations,
+//! none of which anything on screen reads, so it runs on a thread beside start-up instead of
+//! holding the window shut for it.
 
 #[cfg(windows)]
 pub const APP_ID: &str = "Barusoup.V1";
 
 #[cfg(windows)]
 pub fn apply() {
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-
-    // The shortcut work below is COM; winit would initialize the apartment later, but the
-    // identity has to be in place before the first window or media session is created.
-    // SAFETY: CoInitializeEx takes no borrowed pointers; an already-initialized apartment is
-    // reported as an error and is harmless.
-    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    // Before the first window, or the taskbar groups the app by its executable path rather than
+    // by its own icon and name. This is a single call into the shell; it needs no COM apartment.
     set_process_id();
     if crate::update::installed_dir().is_some() {
-        let _ = repair_shortcut();
+        let _ = std::thread::Builder::new()
+            .name("v1-identity".to_owned())
+            .spawn(repair_shortcut_in_background);
     }
+}
+
+/// Run [`repair_shortcut`] on its own COM apartment. A detached thread: the app may close while
+/// it runs, and a shortcut that is one repair behind is repaired by the next launch.
+#[cfg(windows)]
+fn repair_shortcut_in_background() {
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+
+    // SAFETY: CoInitializeEx takes no borrowed pointers, and this thread does its own COM work
+    // from here on. The apartment is torn down with the thread.
+    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let _ = repair_shortcut();
 }
 
 #[cfg(windows)]

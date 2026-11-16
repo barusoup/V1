@@ -95,6 +95,14 @@ struct Index {
     albums: Vec<AlbumRec>,
 }
 
+/// The index as [`Library::write_index`] writes it: borrowed, so saving the collection does not
+/// deep-copy every song record it holds first. It serializes to the same JSON [`Index`] reads.
+#[derive(Serialize)]
+struct IndexRef<'a> {
+    songs: Vec<&'a SongRec>,
+    albums: Vec<&'a AlbumRec>,
+}
+
 /// A saved song's file, as the player needs it.
 #[derive(Debug, Clone)]
 pub struct Local {
@@ -425,9 +433,9 @@ impl Library {
 
     fn write_index(&self) {
         let Some(writer) = &self.writer else { return };
-        let index = Index {
-            songs: self.songs.values().cloned().collect(),
-            albums: self.albums.values().cloned().collect(),
+        let index = IndexRef {
+            songs: self.songs.values().collect(),
+            albums: self.albums.values().collect(),
         };
         if let Ok(bytes) = serde_json::to_vec(&index) {
             writer.put(self.root.join("library.json"), bytes);

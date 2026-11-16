@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 
 use dream::ui::draw::UiFrame;
 use dream::ui::font::{Align, FontId};
-use dream::ui::theme::Theme;
 use dream::ui::widgets::{
     ScrollBehavior, ScrollToOptions, ScrollbarStyle, TextFieldStyle, Ui, UiInput,
 };
@@ -3199,7 +3198,8 @@ pub fn build(
         }
     }
 
-    let dark = Theme::dark_theme();
+    // Nothing is installed into the UI per frame: `Ui::new` already starts on the dark theme these
+    // widgets want, and every colour here is read from `crate::theme`'s own palette.
     let mut anims = std::mem::take(&mut state.anims);
     let gpu = std::mem::take(&mut state.gpu);
     anims.begin(dt);
@@ -3230,7 +3230,6 @@ pub fn build(
     }
 
     ui.begin(input, (width, height));
-    ui.set_theme(&dark);
     ui.set_focus_rings(false);
     ui.rect(Rect::new(0.0, 0.0, width, height), theme::bg());
     draw_background(ui, &gpu, width, height);
@@ -3283,22 +3282,27 @@ pub fn build(
     let zone = Rect::new(main.x, 0.0, main.w, zone_h);
     // On the results page the bar stays up while the list is at its top; once scrolled, it is hidden
     // again and behaves like everywhere else.
-    // The scroll area of whatever list or page is on screen.
+    // The scroll area of whatever list or page is on screen. Borrowed rather than rebuilt: this
+    // runs every frame, and the results case is by far the common one.
+    let detail_id;
     let list_id = match &state.pages.top {
-        Some(detail) => detail_scroll_id(detail),
-        None => "search_results".to_owned(),
+        Some(detail) => {
+            detail_id = detail_scroll_id(detail);
+            detail_id.as_str()
+        }
+        None => "search_results",
     };
     // Back on the results: bring the list back to where the reader left it. Otherwise remember where
     // it is, so leaving the results can return to it.
     if results_page {
         if let Some(target) = state.pending_results_scroll.take() {
             ui.scroll_by(
-                &list_id,
-                target - ui.scroll_state(&list_id).0,
+                list_id,
+                target - ui.scroll_state(list_id).0,
                 dream::ui::widgets::ScrollBehavior::Instant,
             );
         }
-        state.results_scroll = ui.scroll_state(&list_id).0;
+        state.results_scroll = ui.scroll_state(list_id).0;
     }
     // `V1_SHOT_SCROLL=<px>` scrolls the list on screen to that offset, to check the glass over rows.
     // It counts as the reader scrolling, so the bar is up in the shot as it would be for them.
@@ -3307,10 +3311,10 @@ pub fn build(
         .and_then(|v| v.parse::<f32>().ok())
     {
         state.bar_at = Some(now);
-        let current = ui.scroll_state(&list_id).0;
+        let current = ui.scroll_state(list_id).0;
         if (target - current).abs() > 0.5 {
             ui.scroll_by(
-                &list_id,
+                list_id,
                 target - current,
                 dream::ui::widgets::ScrollBehavior::Instant,
             );
@@ -3354,7 +3358,7 @@ pub fn build(
 
     // A detail page is pinned like the results: the bar, and the back button with it, stay up while
     // the page is at its top.
-    let at_top = ui.scroll_state(&list_id).0 < 0.5;
+    let at_top = ui.scroll_state(list_id).0 < 0.5;
     let pinned = (results_page || on_detail) && at_top;
     // The caption buttons are not part of the reveal zone: reaching for them does not pop the field.
     let wanted = pinned

@@ -26,35 +26,6 @@ use yt_stream::{FileCache, HttpProber, Resolver, ResolverConfig, YtScripts};
 use crate::library::Job;
 use crate::store::{cover_key, safe_id};
 
-/// Fill a song's empty metadata fields from another copy of the same song. Never overwrites: a
-/// search result is less complete than what the app may already know.
-fn fill_meta(song: &mut yt_client::SongHit, other: &yt_client::SongHit) {
-    if song.video_id != other.video_id {
-        return;
-    }
-    if song.album_id.is_none() {
-        song.album_id = other.album_id.clone();
-    }
-    if song.album.is_none() {
-        song.album = other.album.clone();
-    }
-    if song.artist_id.is_none() {
-        song.artist_id = other.artist_id.clone();
-    }
-    if song.artist_ids.is_empty() && !other.artist_ids.is_empty() {
-        song.artist_ids = other.artist_ids.clone();
-    }
-    if song.artists.is_empty() {
-        song.artists = other.artists.clone();
-    }
-    if song.duration.is_none() {
-        song.duration = other.duration.clone();
-    }
-    if song.thumbnail.is_none() {
-        song.thumbnail = other.thumbnail.clone();
-    }
-}
-
 /// What the UI asks for.
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -491,7 +462,9 @@ impl Net {
                 if let Ok(hits) = self.tube.search_songs(&query, false).await {
                     if let Some(found) = hits.into_iter().find(|hit| hit.video_id == song.video_id)
                     {
-                        fill_meta(&mut updated, &found);
+                        // The same gap-filling the collection uses: never overwrite what the
+                        // row already knows, only fill what it left out.
+                        crate::library::fill_gaps(&mut updated, &found);
                     }
                 }
             }
