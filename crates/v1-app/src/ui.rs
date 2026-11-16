@@ -4530,7 +4530,7 @@ fn lyrics_page(
         None => empty_state(
             cx,
             main,
-            Icon::Music,
+            None,
             "Nothing playing",
             "Play a song to see its lyrics.",
         ),
@@ -4836,11 +4836,19 @@ fn lyric_text_outlined(
     }
 }
 
-/// An icon, title and hint, centred in `main`, for when there are no lyrics to show.
-fn empty_state(cx: &mut Cx, main: Rect, icon: Icon, title: &str, hint: &str) {
+/// An optional icon, title and hint, centred in `main`, for when there is nothing to show.
+fn empty_state(
+    cx: &mut Cx,
+    main: Rect,
+    icon: impl Into<Option<Icon>>,
+    title: &str,
+    hint: &str,
+) {
     let center_x = main.x + main.w * 0.5;
     let y = main.h * 0.5 - 8.0;
-    cx.icon(icon, (center_x, y - 54.0), 38.0, theme::faint());
+    if let Some(icon) = icon.into() {
+        cx.icon(icon, (center_x, y - 54.0), 38.0, theme::faint());
+    }
     cx.text(
         Rect::new(main.x, y - 16.0, main.w, 28.0),
         title,
