@@ -22,13 +22,18 @@ Lyrics are synced line by line from Boidu (the Better Lyrics API), with
 ## Install
 
 On Windows, download `V1-Setup-<version>.exe` from the [Releases](https://github.com/barusoup/V1/releases) page.
-The installer includes FFmpeg and ffprobe. V1 checks for a newer Windows release every time it starts and installs it before the window opens.
+The installer includes FFmpeg and ffprobe.
 
 On macOS, open the `.dmg` from Releases and drag `V1` to the Applications folder. The app bundle
 includes FFmpeg and ffprobe. V1 is signed, but Apple has not notarized it, so the first launch asks
 for your permission once: open System Settings > Privacy & Security and choose "Open Anyway"
-(right-clicking `V1` in Applications and choosing Open does the same). Automatic updates are
-currently Windows only.
+(right-clicking `V1` in Applications and choosing Open does the same).
+
+Both platforms keep themselves up to date. Every launch asks GitHub for a newer full release and,
+when there is one, replaces the app before the window opens: Windows runs the new setup silently,
+macOS swaps the app bundle out of the disk image. macOS builds before 0.2.3 must be replaced once
+by hand, and only installed copies update — an app opened straight from the disk image, or one run
+from a build folder, never writes to itself.
 
 Only one copy runs at a time. While a self-update replaces the app, launches made before the updated
 copy starts exit silently, so the new instance opens cleanly.

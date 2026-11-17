@@ -81,5 +81,19 @@ native refresh rate. Display-rate reporting alone does not measure sustained
 frame delivery.
 
 Release bundles are signed ad-hoc unless a Developer ID is supplied, and are not
-notarized, so the first launch needs one approval. macOS automatic updates are
-not implemented; install a newer DMG manually.
+notarized, so the first launch needs one approval.
+
+Automatic updates work as they do on Windows: a launch asks GitHub for the newest
+full release and, when it is newer, downloads `V1-<version>-arm64.dmg`, checks it
+against `SHA256SUMS`, and hands it to a detached `sh` script. The script waits for
+the app to exit, mounts the image, verifies the bundled `.app` with
+`codesign --verify --deep --strict`, copies it beside the installed bundle with
+`ditto`, swaps the two, unmounts, and reopens the app with `--updated`. Nothing
+touches the installed bundle until the new one is verified and copied, so a failed
+download or a broken signature leaves the old app runnable.
+
+The updater only acts on an installed copy: the executable must sit inside a `.app`
+bundle outside `/Volumes`, so an app opened from the disk image or built into a
+target folder never writes to itself. The bundle's folder must be writable by the
+user (`/Applications` is, for an admin account; `/Applications` installed with
+sudo is not, and those installs update by hand).

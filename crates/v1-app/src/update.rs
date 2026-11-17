@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Startup self-update. Beside the app starting, a thread asks GitHub for the latest full release.
-//! If it is newer than this build and its installer matches the published checksum, a helper script
-//! waits for this process to exit, installs silently, and starts the updated app in its place. Any
-//! failure (no network, a failed request, a bad download) is dropped and the app starts as usual.
+//! If it is newer than this build and its package matches the published checksum, a helper script
+//! waits for this process to exit, installs it, and starts the updated app in its place. Any
+//! failure (no network, a failed request, a bad download, a bundle that will not verify) is
+//! dropped and the app starts as usual.
 //!
-//! Only installed copies update. The installer leaves `uninstall.exe` beside the app, and a build
-//! run from a target folder has none. Set `V1_NO_UPDATE` to skip the check.
+//! Windows runs the NSIS setup program; macOS replaces the app bundle from the disk image. Only
+//! installed copies update: the Windows installer leaves `uninstall.exe` beside the app, and on
+//! macOS the executable must live inside a `.app` bundle outside `/Volumes`, so a build run from a
+//! target folder and an app opened straight from the disk image both sit this out. Set
+//! `V1_NO_UPDATE` to skip the check.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -23,14 +27,19 @@ const ATTEMPTS: u32 = 3;
 const RETRY_PAUSE: Duration = Duration::from_millis(300);
 /// The release lookup, retries included, may take this long before the app gives up on it.
 const CHECK_BUDGET: Duration = Duration::from_secs(6);
-/// The installer download may take this long. Past it, the update waits for the next launch.
+/// The package download may take this long. Past it, the update waits for the next launch. A
+/// Windows setup is ~90 MB and the macOS disk image ~40 MB, so a slow line needs more than a
+/// minute; the check runs beside the window, so a long budget only delays the update itself.
+#[cfg(target_os = "macos")]
+const DOWNLOAD_BUDGET: Duration = Duration::from_secs(240);
+#[cfg(not(target_os = "macos"))]
 const DOWNLOAD_BUDGET: Duration = Duration::from_secs(90);
 /// Set by the installer, which starts the updated copy after replacing the old one.
 pub(crate) const UPDATED_FLAG: &str = "--updated";
 /// Marker covering the gap between the old process exiting and the installer starting the new one.
 const HANDOFF_FILE: &str = "update-in-progress";
 /// A marker older than this is treated as a crashed update, so a broken install cannot lock the app
-/// out for long. The helper script waits up to two minutes before it gives up.
+/// out for long. The helper scripts wait up to two minutes before they give up.
 const HANDOFF_TTL: Duration = Duration::from_secs(300);
 /// How long the background check waits before it starts. It builds a runtime and a TLS client,
 /// which is CPU the first frame wants: by the time this elapses the window is up. A launch that
@@ -59,31 +68,44 @@ impl fmt::Display for Version {
     }
 }
 
+/// The release asset this build installs from. The release job uploads both names, so each
+/// platform picks its own: the Windows setup program, or the Apple Silicon disk image.
+fn package_name(version: Version) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        format!("V1-{version}-arm64.dmg")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        format!("V1-Setup-{version}.exe")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Asset {
     name: String,
     url: String,
 }
 
-/// The newest full release, with the installer and checksum file it published.
+/// The newest full release, with the package and checksum file it published.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
     pub version: Version,
-    installer: Asset,
+    package: Asset,
     checksums: Asset,
 }
 
-/// Reads the body of `releases/latest`. The installer must be named `V1-Setup-<version>.exe`, and
-/// both assets must come from this repository's release downloads.
+/// Reads the body of `releases/latest`. The package must carry this platform's name (see
+/// [`package_name`]), and both assets must come from this repository's release downloads.
 pub fn parse_latest(json: &[u8]) -> Option<Release> {
     let value: serde_json::Value = serde_json::from_slice(json).ok()?;
     let version = Version::parse(value.get("tag_name")?.as_str()?)?;
     let assets = value.get("assets")?.as_array()?;
-    let installer = find_asset(assets, &format!("V1-Setup-{version}.exe"))?;
+    let package = find_asset(assets, &package_name(version))?;
     let checksums = find_asset(assets, CHECKSUMS)?;
     Some(Release {
         version,
-        installer,
+        package,
         checksums,
     })
 }
@@ -116,7 +138,7 @@ pub fn run_at_startup() {
     if std::env::var_os("V1_NO_UPDATE").is_some() {
         return;
     }
-    let Some(install_dir) = installed_dir() else {
+    let Some(target) = install_target() else {
         return;
     };
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -141,8 +163,8 @@ pub fn run_at_startup() {
     }) else {
         return;
     };
-    let Some(installer) = runtime.block_on(async {
-        tokio::time::timeout(DOWNLOAD_BUDGET, stage_installer(&client, &release))
+    let Some(package) = runtime.block_on(async {
+        tokio::time::timeout(DOWNLOAD_BUDGET, stage_package(&client, &release))
             .await
             .ok()
             .flatten()
@@ -153,14 +175,14 @@ pub fn run_at_startup() {
     if begin_handoff(release.version).is_err() {
         // Without the marker another launch could race the installer into the old build, so leave
         // the update for the next start rather than take that chance.
-        let _ = std::fs::remove_file(&installer);
+        let _ = std::fs::remove_file(&package);
         return;
     }
-    if restart_into_update(&installer, &install_dir).is_ok() {
+    if restart_into_update(&package, &target).is_ok() {
         std::process::exit(0);
     }
     clear_handoff();
-    let _ = std::fs::remove_file(&installer);
+    let _ = std::fs::remove_file(&package);
 }
 
 /// Start the update check on a thread of its own, so a slow or unreachable GitHub can never hold
@@ -179,11 +201,46 @@ pub fn check_in_background() {
         });
 }
 
-/// The folder the app is installed in, or `None` for a build run from anywhere else.
-pub(crate) fn installed_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
+/// What an update replaces: the folder the Windows app is installed in, or the macOS app bundle.
+/// `None` for a build run from anywhere else, or for a copy that cannot replace itself (an app
+/// opened from the disk image, or one macOS is running from a translocated path).
+pub(crate) fn install_target() -> Option<PathBuf> {
+    installed_target_for(&std::env::current_exe().ok()?)
+}
+
+#[cfg(windows)]
+fn installed_target_for(exe: &Path) -> Option<PathBuf> {
     let dir = exe.parent()?.to_path_buf();
     dir.join("uninstall.exe").is_file().then_some(dir)
+}
+
+#[cfg(target_os = "macos")]
+fn installed_target_for(exe: &Path) -> Option<PathBuf> {
+    let bundle = app_bundle_of(exe)?;
+    // An app opened straight from the disk image lives under /Volumes and cannot replace itself
+    // there (the image is read-only). App Translocation runs a quarantined copy from a
+    // throwaway folder, which an update must not write to either. Both mean "not installed":
+    // the README asks for a drag to Applications, and the next launch from there updates.
+    let path = bundle.to_string_lossy();
+    let replaceable = !bundle.starts_with("/Volumes") && !path.contains("/AppTranslocation/");
+    replaceable.then_some(bundle)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn installed_target_for(_exe: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// `…/V1.app/Contents/MacOS/v1` -> `…/V1.app`, for an executable inside an app bundle.
+#[cfg(target_os = "macos")]
+fn app_bundle_of(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    let well_formed = macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.extension()? == "app";
+    well_formed.then(|| bundle.to_path_buf())
 }
 
 fn handoff_path() -> PathBuf {
@@ -247,23 +304,20 @@ async fn newer_release(client: &reqwest::Client) -> Option<Release> {
     (release.version > Version::parse(CURRENT)?).then_some(release)
 }
 
-/// Downloads the installer for `release` and checks it against the published checksum. Returns the
+/// Downloads the package for `release` and checks it against the published checksum. Returns the
 /// path of the verified file.
-async fn stage_installer(client: &reqwest::Client, release: &Release) -> Option<PathBuf> {
+async fn stage_package(client: &reqwest::Client, release: &Release) -> Option<PathBuf> {
     let checksums = get(client, &release.checksums.url, Duration::from_secs(10)).await?;
-    let expected = expected_hash(
-        std::str::from_utf8(&checksums).ok()?,
-        &release.installer.name,
-    )?;
-    let installer = get(client, &release.installer.url, DOWNLOAD_BUDGET).await?;
-    let actual = format!("{:x}", Sha256::digest(&installer));
+    let expected = expected_hash(std::str::from_utf8(&checksums).ok()?, &release.package.name)?;
+    let package = get(client, &release.package.url, DOWNLOAD_BUDGET).await?;
+    let actual = format!("{:x}", Sha256::digest(&package));
     if actual != expected {
         return None;
     }
     let dir = std::env::temp_dir().join("v1-update");
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(&release.installer.name);
-    std::fs::write(&path, &installer).ok()?;
+    let path = dir.join(&release.package.name);
+    std::fs::write(&path, &package).ok()?;
     Some(path)
 }
 
@@ -292,7 +346,7 @@ async fn get(client: &reqwest::Client, url: &str, timeout: Duration) -> Option<V
 }
 
 /// About two minutes of waiting, then the update is dropped instead of hanging.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const WAIT_TRIES: u32 = 120;
 
 /// The detached script that waits for this process to exit, installs silently, and starts the
@@ -350,11 +404,112 @@ fn restart_into_update(installer: &Path, install_dir: &Path) -> std::io::Result<
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn restart_into_update(_installer: &Path, _install_dir: &Path) -> std::io::Result<()> {
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn restart_into_update(_package: &Path, _target: &Path) -> std::io::Result<()> {
     Err(std::io::Error::other(
-        "self-update is only built for Windows",
+        "self-update installs Windows and macOS builds only",
     ))
+}
+
+/// Shell-quote a path for the update script: single quotes, with any embedded quote closed and
+/// reopened so an apostrophe in a user's folder name cannot break the script.
+#[cfg(target_os = "macos")]
+fn sh_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', r#"'\''"#))
+}
+
+/// The detached script that waits for this process to exit, replaces the app bundle from the disk
+/// image, and opens the updated app with [`UPDATED_FLAG`].
+///
+/// Nothing touches the installed bundle until the new one has been verified and copied beside it,
+/// so a failed download, a broken signature or a full disk leaves the old app runnable. Any abort
+/// removes the handoff marker, so a failed update cannot lock the app out.
+#[cfg(target_os = "macos")]
+fn update_script(pid: u32, package: &Path, bundle: &Path, mount: &Path, handoff: &Path) -> String {
+    format!(
+        r#"#!/bin/sh
+# Replaces {name} with the copy in the disk image and reopens it. Written by the app.
+pid={pid}
+dmg={dmg}
+target={target}
+mount={mount}
+handoff={handoff}
+wait={wait}
+staged="$target.staged"
+old="$target.old"
+abort() {{
+  hdiutil detach "$mount" -quiet >/dev/null 2>&1
+  rm -rf "$staged"
+  rm -f "$dmg"
+  rm -f "$handoff"
+  rm -f "$0"
+  exit 1
+}}
+tries=0
+while kill -0 "$pid" 2>/dev/null; do
+  tries=$((tries + 1))
+  [ "$tries" -lt "$wait" ] || abort
+  sleep 1
+done
+rm -rf "$mount"
+mkdir -p "$mount" || abort
+hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount" -quiet || abort
+src="$mount/$(basename "$target")"
+[ -d "$src" ] || abort
+codesign --verify --deep --strict "$src" >/dev/null 2>&1 || abort
+rm -rf "$staged" "$old"
+ditto "$src" "$staged" || abort
+xattr -dr com.apple.quarantine "$staged" >/dev/null 2>&1
+mv "$target" "$old" || abort
+if ! mv "$staged" "$target"; then
+  mv "$old" "$target"
+  abort
+fi
+rm -rf "$old"
+hdiutil detach "$mount" -quiet >/dev/null 2>&1
+rm -f "$dmg"
+if open "$target" --args {updated}; then
+  rm -f "$0"
+else
+  rm -f "$handoff" "$0"
+fi
+"#,
+        name = bundle.display(),
+        pid = pid,
+        dmg = sh_quote(package),
+        target = sh_quote(bundle),
+        mount = sh_quote(mount),
+        handoff = sh_quote(handoff),
+        wait = WAIT_TRIES,
+        updated = UPDATED_FLAG,
+    )
+}
+
+/// Writes the script beside the downloaded disk image and runs it detached, so it outlives this
+/// process. The app exits as soon as the spawn succeeds; the script waits for that exit before it
+/// replaces the bundle it is running from.
+#[cfg(target_os = "macos")]
+fn restart_into_update(package: &Path, bundle: &Path) -> std::io::Result<()> {
+    use std::process::Stdio;
+    let dir = package
+        .parent()
+        .ok_or_else(|| std::io::Error::other("update package has no folder"))?;
+    let script = dir.join("v1-update.sh");
+    let body = update_script(
+        std::process::id(),
+        package,
+        bundle,
+        &dir.join("mount"),
+        &handoff_path(),
+    );
+    std::fs::write(&script, body)?;
+    std::process::Command::new("/bin/sh")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -378,31 +533,47 @@ mod tests {
         assert!(Version(0, 1, 0) <= Version(0, 1, 0));
     }
 
-    fn release_json(tag: &str, installer: &str) -> String {
+    fn release_json(tag: &str, package: &str) -> String {
         format!(
             r#"{{"tag_name":"{tag}","assets":[
-                {{"name":"{installer}","browser_download_url":"https://github.com/barusoup/V1/releases/download/{tag}/{installer}"}},
+                {{"name":"{package}","browser_download_url":"https://github.com/barusoup/V1/releases/download/{tag}/{package}"}},
                 {{"name":"SHA256SUMS","browser_download_url":"https://github.com/barusoup/V1/releases/download/{tag}/SHA256SUMS"}}
             ]}}"#
         )
     }
 
     #[test]
-    fn a_release_needs_its_installer_and_checksums() {
-        let release =
-            parse_latest(release_json("v0.2.0", "V1-Setup-0.2.0.exe").as_bytes()).unwrap();
+    fn a_release_needs_its_package_and_checksums() {
+        let name = package_name(Version(0, 2, 0));
+        let release = parse_latest(release_json("v0.2.0", &name).as_bytes()).unwrap();
         assert_eq!(release.version, Version(0, 2, 0));
-        assert_eq!(release.installer.name, "V1-Setup-0.2.0.exe");
-        assert!(parse_latest(release_json("v0.2.0", "V1-Setup-0.1.0.exe").as_bytes()).is_none());
-        assert!(parse_latest(release_json("v0.2.0", "Other.exe").as_bytes()).is_none());
+        assert_eq!(release.package.name, name);
+        // A release whose package is named for another version, or not at all, is not ours.
+        let wrong_version = package_name(Version(0, 1, 0));
+        assert!(parse_latest(release_json("v0.2.0", &wrong_version).as_bytes()).is_none());
+        assert!(parse_latest(release_json("v0.2.0", "Other.bin").as_bytes()).is_none());
+    }
+
+    /// Each platform installs only from its own asset: a Windows setup on macOS, or a disk image on
+    /// Windows, would leave the app unable to update.
+    #[test]
+    fn a_release_for_the_other_platform_is_refused() {
+        #[cfg(target_os = "macos")]
+        let other = "V1-Setup-0.2.0.exe";
+        #[cfg(not(target_os = "macos"))]
+        let other = "V1-0.2.0-arm64.dmg";
+        assert!(parse_latest(release_json("v0.2.0", other).as_bytes()).is_none());
     }
 
     #[test]
     fn assets_from_elsewhere_are_refused() {
-        let json = r#"{"tag_name":"v0.2.0","assets":[
-            {"name":"V1-Setup-0.2.0.exe","browser_download_url":"https://example.com/V1-Setup-0.2.0.exe"},
-            {"name":"SHA256SUMS","browser_download_url":"https://github.com/barusoup/V1/releases/download/v0.2.0/SHA256SUMS"}
-        ]}"#;
+        let json = format!(
+            r#"{{"tag_name":"v0.2.0","assets":[
+            {{"name":"{}","browser_download_url":"https://example.com/package"}},
+            {{"name":"SHA256SUMS","browser_download_url":"https://github.com/barusoup/V1/releases/download/v0.2.0/SHA256SUMS"}}
+        ]}}"#,
+            package_name(Version(0, 2, 0))
+        );
         assert!(parse_latest(json.as_bytes()).is_none());
     }
 
@@ -455,5 +626,222 @@ mod tests {
         assert!(script.contains(r#"if errorlevel 1 goto abort"#));
         assert!(script.contains(r#"start "" "C:\Apps\V1\v1.exe" --updated"#));
         assert!(script.contains(r#"del "C:\Data\update-in-progress" >nul 2>&1"#));
+    }
+
+    /// An executable counts as installed only when it sits inside a `.app` bundle, and never when
+    /// the bundle is on a read-only disk image or in macOS's translocation folder.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_bundles_are_recognised_but_mounted_images_are_not() {
+        assert_eq!(
+            app_bundle_of(Path::new("/Applications/V1.app/Contents/MacOS/v1")),
+            Some(PathBuf::from("/Applications/V1.app"))
+        );
+        assert_eq!(
+            app_bundle_of(Path::new("/Users/x/V1.app/Contents/MacOS/v1")),
+            Some(PathBuf::from("/Users/x/V1.app"))
+        );
+        // A build run from a target folder is not an install.
+        assert_eq!(
+            app_bundle_of(Path::new("/Users/x/V1/target/release/v1")),
+            None
+        );
+        assert_eq!(app_bundle_of(Path::new("/Applications/V1.app")), None);
+        // The disk image is read-only, and a translocated copy is throwaway: neither can update.
+        assert_eq!(
+            installed_target_for(Path::new("/Volumes/V1/V1.app/Contents/MacOS/v1")),
+            None
+        );
+        assert_eq!(
+            installed_target_for(Path::new(
+                "/private/var/folders/xy/T/AppTranslocation/ABC/d/V1.app/Contents/MacOS/v1"
+            )),
+            None
+        );
+    }
+
+    /// The macOS script must wait for the app to exit, verify the image's bundle, keep the old
+    /// bundle until the swap succeeds, reopen the app with the flag, and clear the handoff on
+    /// every abort path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_script_swaps_the_bundle_after_the_app_exits() {
+        let script = update_script(
+            42,
+            Path::new("/var/folders/xy/T/v1-update/V1-0.2.4-arm64.dmg"),
+            Path::new("/Applications/V1.app"),
+            Path::new("/var/folders/xy/T/v1-update/mount"),
+            Path::new("/Users/x/Library/Application Support/v1/update-in-progress"),
+        );
+        assert!(script.starts_with("#!/bin/sh\n"));
+        assert!(script.contains("while kill -0 \"$pid\" 2>/dev/null; do"));
+        assert!(
+            script.contains("hdiutil attach \"$dmg\" -nobrowse -readonly -mountpoint \"$mount\"")
+        );
+        assert!(script.contains("codesign --verify --deep --strict \"$src\""));
+        assert!(script.contains("ditto \"$src\" \"$staged\""));
+        // A bundle that does not verify must be refused before the installed one is touched.
+        let verified = script.find("codesign --verify").unwrap();
+        let touched = script.find("mv \"$target\" \"$old\"").unwrap();
+        assert!(verified < touched, "the image is verified before the swap");
+        assert!(script.contains("mv \"$target\" \"$old\""));
+        assert!(script.contains("open \"$target\" --args --updated"));
+        // Every abort path clears the marker and the download, so a failure cannot lock the app out.
+        assert!(script.contains("rm -f \"$handoff\""));
+        assert!(script.contains("rm -f \"$dmg\""));
+        // Paths with spaces stay one shell word.
+        assert!(script.contains("target='/Applications/V1.app'"));
+        assert!(
+            script.contains("handoff='/Users/x/Library/Application Support/v1/update-in-progress'")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_apostrophe_in_a_path_cannot_break_the_script() {
+        assert_eq!(
+            sh_quote(Path::new("/Users/o'brien/V1.app")),
+            r#"'/Users/o'\''brien/V1.app'"#
+        );
+    }
+
+    /// The whole macOS handoff against throwaway bundles: the script waits for the old process,
+    /// mounts the image, verifies the new bundle, swaps it in, cleans up the download and reopens
+    /// the app with [`UPDATED_FLAG`].
+    ///
+    /// `hdiutil` and `open` are stubbed on `PATH` (the first copies a prepared `V1.app` into the
+    /// mount point, the second records its arguments), so the handoff runs without a disk-image
+    /// device while the script itself is the one the app writes. `codesign` is real: a bundle that
+    /// does not verify must never replace the installed one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_handoff_replaces_the_bundle_and_reopens_it() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!("v1-update-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let installed = root.join("Applications/V1.app");
+        let image_app = root.join("image/V1.app");
+        let launched = root.join("launched.txt");
+
+        let make_app = |app: &Path, version: &str| {
+            let macos = app.join("Contents/MacOS");
+            std::fs::create_dir_all(&macos).expect("create the bundle");
+            std::fs::create_dir_all(app.join("Contents/Resources")).expect("create resources");
+            std::fs::write(
+                app.join("Contents/Info.plist"),
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>v1</string>
+<key>CFBundleIdentifier</key><string>test.v1.update</string>
+<key>CFBundleName</key><string>V1</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>"#,
+            )
+            .expect("write Info.plist");
+            std::fs::write(app.join("Contents/Resources/version.txt"), version)
+                .expect("write version");
+            let exe = macos.join("v1");
+            std::fs::write(&exe, "#!/bin/sh\nexit 0\n").expect("write executable");
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))
+                .expect("make it executable");
+            let signed = Command::new("codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(app)
+                .status()
+                .expect("run codesign");
+            assert!(signed.success(), "ad-hoc signing failed");
+        };
+        make_app(&installed, "old");
+        make_app(&image_app, "new");
+
+        // The download the script is handed: the stub reads the image folder beside it.
+        let dmg = root.join("V1-9.9.9-arm64.dmg");
+        std::fs::write(&dmg, b"stub").expect("write the staged download");
+
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).expect("create the stub folder");
+        let stub = |name: &str, body: &str| {
+            let path = bin.join(name);
+            std::fs::write(&path, body).expect("write the stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make the stub executable");
+        };
+        stub(
+            "hdiutil",
+            r#"#!/bin/sh
+case "$1" in
+  attach)
+    shift
+    dmg="$1"
+    shift
+    mount=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -mountpoint) mount="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [ -n "$mount" ] || exit 1
+    rm -rf "$mount"
+    mkdir -p "$mount" || exit 1
+    cp -R "$(dirname "$dmg")/image/V1.app" "$mount/V1.app" || exit 1
+    ;;
+  detach)
+    rm -rf "$2"
+    ;;
+esac
+exit 0
+"#,
+        );
+        stub(
+            "open",
+            &format!(
+                "#!/bin/sh\nprintf '%s ' \"$@\" > '{}'\n",
+                launched.display()
+            ),
+        );
+
+        // A child that has already exited: the wait loop falls through at once.
+        let mut gone = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = gone.id();
+        let _ = gone.wait();
+
+        let handoff = root.join("update-in-progress");
+        std::fs::write(&handoff, "9.9.9\n1700000000\n").expect("write the handoff");
+        let script = root.join("v1-update.sh");
+        std::fs::write(
+            &script,
+            update_script(pid, &dmg, &installed, &root.join("mount"), &handoff),
+        )
+        .expect("write the script");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let ran = Command::new("/bin/sh")
+            .arg(&script)
+            .env("PATH", path)
+            .status()
+            .expect("run the update script");
+        assert!(ran.success(), "the update script gave up");
+
+        let version = std::fs::read_to_string(installed.join("Contents/Resources/version.txt"))
+            .expect("read the installed version");
+        assert_eq!(version, "new", "the installed bundle was replaced");
+        assert!(!dmg.exists(), "the download is cleaned up");
+        let relaunch = std::fs::read_to_string(&launched).expect("the app was reopened");
+        assert!(
+            relaunch.starts_with(&installed.display().to_string())
+                && relaunch.ends_with("--args --updated "),
+            "reopened as {relaunch:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
