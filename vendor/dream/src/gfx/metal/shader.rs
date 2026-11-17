@@ -3,6 +3,24 @@
 //! Translates WGSL shaders to Metal Shading Language (MSL) via `naga::back::msl`
 //! with explicit `(group, binding)` -> Metal slot mappings and caches the
 //! compiled `MTLLibrary` objects on `GpuContext`.
+//!
+//! Vertex entry points are emitted with `@builtin(position).y` negated **only
+//! for screen-space pipelines** (`Raster::screen`). Dream authors UI geometry
+//! in pixel space with y growing *down* and converts it to NDC as
+//! `2y/size - 1`, and the fullscreen passes (blit, present, backdrop, the
+//! scene thumbnail) map texel rows into NDC the same way. Vulkan renders that
+//! through a negative-height viewport, whose mapping (`NDC +1` at target row 0)
+//! is the *opposite* of Metal's positive-height one (`NDC -1` at row 0), so the
+//! negation is what makes both backends agree.
+//!
+//! World-space shaders (scene, meshes, impostor cards) already emit y-up NDC
+//! through a camera projection; Metal's native mapping is identical to Vulkan's
+//! negative viewport for them, so they are **not** flipped (`Raster::world`).
+//! Flipping one of them mirrors the 3D scene vertically.
+//!
+//! Metal's targets hold their rows top-first, which is also what Vulkan's
+//! display image holds after its own flip; passes that read a target back state
+//! their orientation explicitly.
 
 use naga::back::msl;
 use std::collections::BTreeMap;

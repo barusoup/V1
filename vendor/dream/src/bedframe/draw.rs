@@ -211,6 +211,31 @@ impl Clip {
     }
 }
 
+/// How a laid-out glyph is placed on the target.
+///
+/// Both modes draw the same cached coverage mask; they differ only in where
+/// the quad lands, so neither costs atlas space or rasterization work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextAa {
+    /// Subpixel positioning (the default). A glyph's quad keeps its exact
+    /// fractional pen position, quantized to a quarter of a physical pixel,
+    /// and the sampler's linear filter moves the mask by that fraction, so
+    /// letter spacing follows the shaping advance instead of jittering by up
+    /// to a pixel. This is what browsers and native toolkits do above 1x.
+    #[default]
+    Subpixel,
+    /// Whole-physical-pixel positioning: every mask texel covers exactly one
+    /// target pixel. Crispest for stems, but the pen's fraction is dropped, so
+    /// spacing can drift by up to half a pixel per glyph. Use it when a
+    /// display's scaling makes the filter's softening visible.
+    PixelSnap,
+}
+
+/// A quarter of a physical pixel: the subpixel grid glyph quads quantize to.
+/// Coarser than the 1/256 a full subpixel mask would track, fine enough that
+/// the mask moves by at most an eighth of a pixel.
+const SUBPIXEL_STEPS: f32 = 4.0;
+
 pub struct DrawList {
     vertices: Vec<UiVertex>,
     indices: Vec<u32>,
@@ -224,6 +249,8 @@ pub struct DrawList {
     /// Logical-to-physical multiplier applied by [`Self::finish`]: draw
     /// calls are submitted in logical units, the frame comes out physical.
     scale: f32,
+    /// Glyph placement; see [`TextAa`].
+    text_aa: TextAa,
 }
 
 impl Default for DrawList {
@@ -254,6 +281,7 @@ impl DrawList {
             scissor_stack: Vec::new(),
             size: (0.0, 0.0),
             scale: 1.0,
+            text_aa: TextAa::default(),
         }
     }
 
@@ -307,6 +335,16 @@ impl DrawList {
     /// The scale [`Self::finish`] applies (see [`Self::set_scale`]).
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// Glyph placement for text drawn from now on; see [`TextAa`].
+    pub fn set_text_aa(&mut self, aa: TextAa) {
+        self.text_aa = aa;
+    }
+
+    /// The current glyph placement mode (see [`Self::set_text_aa`]).
+    pub fn text_aa(&self) -> TextAa {
+        self.text_aa
     }
 
     /// Outward grow of an SDF quad, in logical units: one physical pixel.
@@ -1421,12 +1459,19 @@ impl DrawList {
         } else {
             color
         };
-        // Snap at the *physical* pixel: a half-logical-unit at scale 2 is
-        // still a whole device pixel, and landing on one keeps the raster
-        // crisp where a logical snap would blur it.
+        // Vertical placement always lands on a physical pixel: glyph masks are
+        // baked with their baseline on the grid, and a fractional y would blur
+        // every horizontal stem. Horizontal placement depends on the mode —
+        // see `TextAa` — and is quantized in *physical* pixels, so a half
+        // logical unit at scale 2 is still a whole device pixel of precision.
         let scale = self.scale;
+        let x = (origin.0 + glyph.x) * scale;
+        let x = match self.text_aa {
+            TextAa::Subpixel => (x * SUBPIXEL_STEPS).round() / SUBPIXEL_STEPS,
+            TextAa::PixelSnap => x.round(),
+        } / scale;
         let rect = Rect::new(
-            ((origin.0 + glyph.x) * scale).round() / scale,
+            x,
             ((origin.1 + glyph.y) * scale).round() / scale,
             glyph.glyph.width,
             glyph.glyph.height,

@@ -113,6 +113,9 @@ impl GpuContext {
         layer.setDevice(Some(&device));
         layer.setMaximumDrawableCount(MAX_FRAMES_IN_FLIGHT as _);
         layer.setFramebufferOnly(true);
+        // Every frame writes alpha 1 (the scene clear and the composited UI both
+        // leave it opaque), so the window server can skip blending the drawable.
+        layer.setOpaque(true);
         layer.setPresentsWithTransaction(false);
         layer.setContentsScale(window.scale_factor());
 
@@ -144,6 +147,35 @@ impl GpuContext {
             blocking_submissions: AtomicU64::new(0),
             live_textures: AtomicUsize::new(0),
         })
+    }
+
+    /// An offscreen context: device, queue and an unattached layer, with no
+    /// window. GPU tools and tests render into their own textures with it, so
+    /// they need no window server.
+    pub fn new_headless() -> Option<Arc<Self>> {
+        let device = MTLCreateSystemDefaultDevice()?;
+        let queue = device.newCommandQueue()?;
+        let has_unified_memory = device.hasUnifiedMemory();
+        let layer = CAMetalLayer::new();
+        layer.setDevice(Some(&device));
+        layer.setMaximumDrawableCount(MAX_FRAMES_IN_FLIGHT as _);
+        let default_sampler = create_sampler_state(&device, &SamplerDesc::default());
+        Some(Arc::new(Self {
+            _window: None,
+            device,
+            queue,
+            layer,
+            has_unified_memory,
+            submitted_serial: AtomicU64::new(0),
+            completed_serial: AtomicU64::new(0),
+            retired_buffers: Mutex::new(Vec::new()),
+            library_cache: Mutex::new(HashMap::new()),
+            shared_samplers: Mutex::new(HashMap::new()),
+            default_sampler,
+            buffer_count: AtomicU64::new(0),
+            blocking_submissions: AtomicU64::new(0),
+            live_textures: AtomicUsize::new(0),
+        }))
     }
 
     pub fn new_owned(window: Arc<Window>) -> Arc<Self> {
@@ -748,4 +780,483 @@ pub fn is_srgb(format: MTLPixelFormat) -> bool {
 
 pub(crate) fn align_up(value: u64, align: u64) -> u64 {
     value.div_ceil(align) * align
+}
+
+/// Offscreen GPU checks: the UI overlay composed exactly the way the window
+/// sees it, with no window and no event loop, so they run headless (and in
+/// CI). Every test skips when the machine has no Metal device.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx::{DEPTH_FORMAT, SCENE_FORMAT};
+    use crate::ui::draw::DrawList;
+    use crate::ui::render::{UiBlend, UiRenderer};
+    use crate::ui::{Color, Rect};
+    use objc2_metal::{
+        MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCompareFunction, MTLCullMode,
+        MTLIndexType, MTLLoadAction, MTLOrigin, MTLPrimitiveType, MTLRenderCommandEncoder,
+        MTLRenderPassDescriptor, MTLSize, MTLStoreAction, MTLTexture, MTLTextureUsage,
+        MTLVertexFormat, MTLViewport, MTLWinding,
+    };
+
+    const W: u32 = 64;
+    const H: u32 = 64;
+
+    fn ctx() -> Option<Arc<GpuContext>> {
+        GpuContext::new_headless()
+    }
+
+    fn target(ctx: &Arc<GpuContext>, format: PixelFormat) -> GpuImage {
+        ctx.create_image(
+            "offscreen target",
+            W,
+            H,
+            format,
+            MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead,
+        )
+    }
+
+    /// One BGRA8 texture read back as bytes, row 0 first (memory order).
+    fn read_back(ctx: &Arc<GpuContext>, texture: &ProtocolObject<dyn MTLTexture>) -> Vec<u8> {
+        let bytes = (W as u64) * (H as u64) * 4;
+        let buffer = ctx.create_readback_buffer("offscreen readback", bytes);
+        ctx.one_shot(|cmd| {
+            let blit = cmd.blitCommandEncoder().expect("blit encoder");
+            unsafe {
+                blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                    texture,
+                    0,
+                    0,
+                    MTLOrigin { x: 0, y: 0, z: 0 },
+                    MTLSize {
+                        width: W as usize,
+                        height: H as usize,
+                        depth: 1,
+                    },
+                    &buffer.buffer,
+                    0,
+                    (W * 4) as usize,
+                    bytes as usize,
+                );
+            }
+            blit.endEncoding();
+        });
+        buffer.mapped().expect("readback buffer is host visible")[..bytes as usize].to_vec()
+    }
+
+    /// One pixel of a BGRA8 readback as `(r, g, b)`.
+    fn px(data: &[u8], x: u32, y: u32) -> (i32, i32, i32) {
+        let i = ((y * W + x) * 4) as usize;
+        (data[i + 2] as i32, data[i + 1] as i32, data[i] as i32)
+    }
+
+    /// An asymmetric UI frame: a red band along pixel y = 0, a blue band along
+    /// the bottom edge, three colour bands in between (red, green, blue top to
+    /// bottom) and a frosted-glass panel over them.
+    fn frame() -> crate::ui::draw::UiFrame {
+        let mut list = DrawList::new();
+        list.begin((W as f32, H as f32));
+        let w = W as f32;
+        let h = H as f32;
+        list.rect(Rect::new(0.0, 0.0, w, 8.0), Color::rgb(255, 0, 0));
+        list.rect(Rect::new(0.0, h - 8.0, w, 8.0), Color::rgb(0, 0, 255));
+        list.rect(Rect::new(0.0, 20.0, w, 8.0), Color::rgb(255, 0, 0));
+        list.rect(Rect::new(0.0, 28.0, w, 8.0), Color::rgb(0, 255, 0));
+        list.rect(Rect::new(0.0, 36.0, w, 8.0), Color::rgb(0, 0, 255));
+        list.backdrop_rounded(Rect::new(0.0, 18.0, w, 28.0), Color::WHITE, 0.0);
+        list.finish((w, h))
+    }
+
+    fn render(
+        ctx: &Arc<GpuContext>,
+        display: &GpuImage,
+        ui: &mut UiRenderer,
+        frame: &crate::ui::draw::UiFrame,
+    ) {
+        let cmd = ctx.queue().commandBuffer().expect("command buffer");
+        ui.record(&cmd, &display.texture, (W, H), frame, 0, true);
+        cmd.commit();
+        cmd.waitUntilCompleted();
+    }
+
+    /// The composed image is stored in screen-row order, and the frosted-glass
+    /// panel shows the bands in the same order they were drawn (a vertically
+    /// mirrored backdrop capture would reverse them).
+    #[test]
+    fn metal_offscreen_ui_is_upright_and_glass_matches_the_frame() {
+        let Some(ctx) = ctx() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let display = target(&ctx, PixelFormat::BGRA8Unorm);
+        let mut ui = UiRenderer::new(&ctx, PixelFormat::BGRA8Unorm, 512);
+        let frame = frame();
+        render(&ctx, &display, &mut ui, &frame);
+        let data = read_back(&ctx, &display.texture);
+
+        // The frame's own marker: the red edge band sits at pixel y = 0 and the
+        // blue one at the bottom, so whichever end of the texel data holds red
+        // is that target's first row. Deriving it keeps the check independent
+        // of the storage convention and makes it a pure "is anything mirrored"
+        // test.
+        let head = px(&data, W / 2, 2);
+        let tail = px(&data, W / 2, H - 3);
+        assert!(
+            (head.0 > 200 && head.2 < 60 && tail.2 > 200 && tail.0 < 60)
+                || (tail.0 > 200 && tail.2 < 60 && head.2 > 200 && head.0 < 60),
+            "the frame's edge bands must survive composition: head={head:?} tail={tail:?}"
+        );
+        // Frame pixel y -> its row in the texel data.
+        let row_of = |y: u32| -> u32 { if head.0 > head.2 { y } else { H - 1 - y } };
+
+        // Inside the glass panel the red interior band must still be on the
+        // side the red edge band is on: one mirrored pass in the backdrop
+        // capture (downsample -> blur -> sample) flips it.
+        let upper = px(&data, W / 2, row_of(22));
+        let lower = px(&data, W / 2, row_of(40));
+        assert!(
+            upper.0 - upper.2 > 20,
+            "the frosted backdrop is mirrored against the frame: head={head:?} upper={upper:?}"
+        );
+        assert!(
+            lower.2 - lower.0 > 20,
+            "the frosted backdrop is mirrored against the frame: tail={tail:?} lower={lower:?}"
+        );
+    }
+
+    /// The present pass hands the composed display image to the swapchain
+    /// unchanged, so the window shows the pixels the UI renderer wrote.
+    #[test]
+    fn metal_offscreen_present_preserves_display_bytes() {
+        let Some(ctx) = ctx() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let display = target(&ctx, PixelFormat::BGRA8Unorm);
+        let swapchain = target(&ctx, PixelFormat::BGRA8Unorm);
+        let mut ui = UiRenderer::new(&ctx, PixelFormat::BGRA8Unorm, 512);
+        let frame = frame();
+        let cmd = ctx.queue().commandBuffer().expect("command buffer");
+        ui.record(&cmd, &display.texture, (W, H), &frame, 0, true);
+        present(&ctx, &cmd, &display, &swapchain, PixelFormat::BGRA8Unorm);
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        let composed = read_back(&ctx, &display.texture);
+        let presented = read_back(&ctx, &swapchain.texture);
+        let row = (W * 4) as usize;
+        let diff = |a: &[u8], b: &[u8], mirror: bool| -> i32 {
+            let mut worst = 0i32;
+            for y in 0..H as usize {
+                let src = if mirror {
+                    (H as usize - 1 - y) * row
+                } else {
+                    y * row
+                };
+                for i in 0..row {
+                    worst = worst.max((i32::from(a[y * row + i]) - i32::from(b[src + i])).abs());
+                }
+            }
+            worst
+        };
+        // The present pass copies the display image row for row: the UI
+        // renderer and the present shader each flip exactly once, so the pair
+        // is an identity. What it must never do is re-encode; a gamma
+        // double-decode moves mid-tones by tens of LSB.
+        let straight = diff(&presented, &composed, false);
+        let mirrored = diff(&presented, &composed, true);
+        assert!(
+            straight <= 2,
+            "present must copy the display image row for row (straight {straight} LSB, mirrored {mirrored} LSB)"
+        );
+    }
+
+    /// A world-space scene shader: vertices arrive as clip-space NDC with a
+    /// camera already applied, so the test exercises exactly the
+    /// viewport/orientation part of the scene pipeline.
+    const WORLD_SHADER: &str = r#"
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@location(0) pos: vec3<f32>, @location(1) color: vec4<f32>) -> VsOut {
+    var out: VsOut;
+    out.pos = vec4<f32>(pos.xy, 0.0, 1.0);
+    out.color = color;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return in.color;
+}
+"#;
+
+    /// The production present pass: `present.wgsl` into `dst`.
+    fn present(
+        ctx: &Arc<GpuContext>,
+        cmd: &ProtocolObject<dyn MTLCommandBuffer>,
+        display: &GpuImage,
+        dst: &GpuImage,
+        format: PixelFormat,
+    ) {
+        let bindings = shader::MslBindings::new()
+            .texture(0, 0, 0)
+            .sampler(0, 1, 0)
+            .push_constants(shader::PUSH_CONSTANT_BUFFER_SLOT);
+        let entry = pipeline::present_fragment_entry(UiBlend::Gamma, format);
+        let present = pipeline::create_render_pipeline(
+            ctx,
+            "present",
+            include_str!("../present.wgsl"),
+            &bindings,
+            "vs_main",
+            entry,
+            &[format],
+            None,
+            None,
+            false,
+        );
+        let rpd = MTLRenderPassDescriptor::new();
+        let att = unsafe { rpd.colorAttachments().objectAtIndexedSubscript(0) };
+        att.setTexture(Some(&dst.texture));
+        att.setLoadAction(MTLLoadAction::DontCare);
+        att.setStoreAction(MTLStoreAction::Store);
+        let enc = cmd
+            .renderCommandEncoderWithDescriptor(&rpd)
+            .expect("present encoder");
+        enc.setViewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: W as f64,
+            height: H as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        enc.setRenderPipelineState(&present);
+        let push = [W as f32, H as f32, 0.0, 0.0];
+        unsafe {
+            enc.setFragmentTexture_atIndex(Some(&display.texture), 0);
+            enc.setFragmentSamplerState_atIndex(Some(ctx.default_sampler()), 0);
+            let bytes = bytemuck::bytes_of(&push);
+            enc.setFragmentBytes_length_atIndex(
+                std::ptr::NonNull::new(bytes.as_ptr() as *mut _).unwrap(),
+                bytes.len(),
+                shader::PUSH_CONSTANT_BUFFER_SLOT as usize,
+            );
+            enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+        }
+        enc.endEncoding();
+    }
+
+    /// The production blit pass: `blit.wgsl` from one image into another.
+    fn blit(
+        ctx: &Arc<GpuContext>,
+        cmd: &ProtocolObject<dyn MTLCommandBuffer>,
+        src: &GpuImage,
+        dst: &GpuImage,
+    ) {
+        let bindings = shader::MslBindings::new().texture(0, 0, 0).sampler(0, 1, 0);
+        let pipe = pipeline::create_render_pipeline(
+            ctx,
+            "blit",
+            include_str!("../blit.wgsl"),
+            &bindings,
+            "vs_main",
+            "fs_main",
+            &[dst.format],
+            None,
+            None,
+            false,
+        );
+        let rpd = MTLRenderPassDescriptor::new();
+        let att = unsafe { rpd.colorAttachments().objectAtIndexedSubscript(0) };
+        att.setTexture(Some(&dst.texture));
+        att.setLoadAction(MTLLoadAction::DontCare);
+        att.setStoreAction(MTLStoreAction::Store);
+        let enc = cmd
+            .renderCommandEncoderWithDescriptor(&rpd)
+            .expect("blit encoder");
+        enc.setViewport(super::pipeline::make_viewport((W, H)));
+        enc.setRenderPipelineState(&pipe);
+        unsafe {
+            enc.setFragmentTexture_atIndex(Some(&src.texture), 0);
+            enc.setFragmentSamplerState_atIndex(Some(ctx.default_sampler()), 0);
+            enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+        }
+        enc.endEncoding();
+    }
+
+    /// Draw a world-space scene: a red quad over NDC y in `0.1..0.9` (world up)
+    /// and a blue one over `-0.9..-0.1`, through the real scene pipeline.
+    fn draw_world_scene(
+        ctx: &Arc<GpuContext>,
+        cmd: &ProtocolObject<dyn MTLCommandBuffer>,
+        scene: &GpuImage,
+        depth: &GpuImage,
+    ) {
+        use crate::gfx::ColorVertex;
+        let quad = |y0: f32, y1: f32, color: [u8; 4]| {
+            [
+                ColorVertex {
+                    position: [-1.0, y0, 0.0],
+                    color,
+                },
+                ColorVertex {
+                    position: [1.0, y0, 0.0],
+                    color,
+                },
+                ColorVertex {
+                    position: [1.0, y1, 0.0],
+                    color,
+                },
+                ColorVertex {
+                    position: [-1.0, y1, 0.0],
+                    color,
+                },
+            ]
+        };
+        let mut verts = Vec::new();
+        verts.extend_from_slice(&quad(0.1, 0.9, [255, 0, 0, 255]));
+        verts.extend_from_slice(&quad(-0.9, -0.1, [0, 0, 255, 255]));
+        let indices: [u32; 12] = [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7];
+
+        let mut vbuf = ctx.create_host_buffer("test scene vertices", 512);
+        vbuf.write_bytes(0, bytemuck::cast_slice(&verts));
+        let mut ibuf = ctx.create_host_buffer("test scene indices", 64);
+        ibuf.write_bytes(0, bytemuck::cast_slice(&indices));
+
+        let vd = pipeline::make_vertex_descriptor(
+            std::mem::size_of::<ColorVertex>(),
+            &[
+                pipeline::VertexAttr {
+                    location: 0,
+                    format: MTLVertexFormat::Float3,
+                    offset: 0,
+                },
+                pipeline::VertexAttr {
+                    location: 1,
+                    format: MTLVertexFormat::UChar4Normalized,
+                    offset: 12,
+                },
+            ],
+        );
+        let scene_pipe = pipeline::create_render_pipeline_world(
+            ctx,
+            "test scene",
+            WORLD_SHADER,
+            &shader::MslBindings::new(),
+            "vs_main",
+            "fs_main",
+            &[SCENE_FORMAT],
+            Some(DEPTH_FORMAT),
+            Some(&vd),
+            false,
+        );
+        let depth_state =
+            pipeline::create_depth_stencil_state(ctx, true, true, MTLCompareFunction::Less);
+
+        let rpd = MTLRenderPassDescriptor::new();
+        let att = unsafe { rpd.colorAttachments().objectAtIndexedSubscript(0) };
+        att.setTexture(Some(&scene.texture));
+        att.setLoadAction(MTLLoadAction::Clear);
+        att.setStoreAction(MTLStoreAction::Store);
+        att.setClearColor(MTLClearColor {
+            red: 0.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 1.0,
+        });
+        let da = rpd.depthAttachment();
+        da.setTexture(Some(&depth.texture));
+        da.setLoadAction(MTLLoadAction::Clear);
+        da.setStoreAction(MTLStoreAction::Store);
+        da.setClearDepth(1.0);
+        let enc = cmd
+            .renderCommandEncoderWithDescriptor(&rpd)
+            .expect("scene encoder");
+        enc.setViewport(super::pipeline::make_viewport((W, H)));
+        enc.setFrontFacingWinding(MTLWinding::Clockwise);
+        enc.setCullMode(MTLCullMode::Back);
+        enc.setRenderPipelineState(&scene_pipe);
+        enc.setDepthStencilState(Some(&depth_state));
+        unsafe {
+            enc.setVertexBuffer_offset_atIndex(Some(&vbuf.buffer), 0, 0);
+            enc.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
+                MTLPrimitiveType::Triangle,
+                indices.len(),
+                MTLIndexType::UInt32,
+                &ibuf.buffer,
+                0,
+            );
+        }
+        enc.endEncoding();
+    }
+
+    /// The whole non-direct frame chain, in the order the renderer records it:
+    /// a world-space scene pass, the blit into the display image, and the
+    /// present pass into the drawable. World *up* must come out at the top row
+    /// of the presented image on every backend.
+    #[test]
+    fn metal_scene_chain_keeps_world_up_at_the_top() {
+        let Some(ctx) = ctx() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let scene = target(&ctx, SCENE_FORMAT);
+        let depth = target(&ctx, DEPTH_FORMAT);
+        let display = target(&ctx, PixelFormat::BGRA8Unorm);
+        let shown = target(&ctx, PixelFormat::BGRA8Unorm);
+
+        let cmd = ctx.queue().commandBuffer().expect("command buffer");
+        draw_world_scene(&ctx, &cmd, &scene, &depth);
+        blit(&ctx, &cmd, &scene, &display);
+        present(&ctx, &cmd, &display, &shown, PixelFormat::BGRA8Unorm);
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        let data = read_back(&ctx, &shown.texture);
+        let top = px(&data, W / 2, 2);
+        let bottom = px(&data, W / 2, H - 3);
+        assert!(
+            top.0 > 200 && top.2 < 60,
+            "world up must be at the top of the presented frame: top={top:?} bottom={bottom:?}"
+        );
+        assert!(
+            bottom.2 > 200 && bottom.0 < 60,
+            "world down must be at the bottom of the presented frame: top={top:?} bottom={bottom:?}"
+        );
+    }
+
+    /// The UI frame's pixel y = 0 must reach the top row of the presented image.
+    #[test]
+    fn metal_ui_frame_reaches_the_presented_top_row() {
+        let Some(ctx) = ctx() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let display = target(&ctx, PixelFormat::BGRA8Unorm);
+        let shown = target(&ctx, PixelFormat::BGRA8Unorm);
+        let mut ui = UiRenderer::new(&ctx, PixelFormat::BGRA8Unorm, 512);
+        let frame = frame();
+        let cmd = ctx.queue().commandBuffer().expect("command buffer");
+        ui.record(&cmd, &display.texture, (W, H), &frame, 0, true);
+        present(&ctx, &cmd, &display, &shown, PixelFormat::BGRA8Unorm);
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        let data = read_back(&ctx, &shown.texture);
+        let top = px(&data, W / 2, 1);
+        let bottom = px(&data, W / 2, H - 2);
+        assert!(
+            top.0 > 200 && top.2 < 60,
+            "UI pixel y = 0 must be at the top of the presented frame: top={top:?} bottom={bottom:?}"
+        );
+        assert!(
+            bottom.2 > 200 && bottom.0 < 60,
+            "UI pixel y = H must be at the bottom of the presented frame: top={top:?} bottom={bottom:?}"
+        );
+    }
 }

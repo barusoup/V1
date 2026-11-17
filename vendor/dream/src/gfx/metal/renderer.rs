@@ -1,6 +1,6 @@
 use super::metal::pipeline::{
-    VertexAttr, create_depth_stencil_state, create_render_pipeline, display_format,
-    make_vertex_descriptor, present_fragment_entry, scaled_size,
+    VertexAttr, create_depth_stencil_state, create_render_pipeline, create_render_pipeline_world,
+    display_format, make_vertex_descriptor, present_fragment_entry, scaled_size,
 };
 use super::metal::shader::{MslBindings, PUSH_CONSTANT_BUFFER_SLOT};
 use super::metal::swapchain::{PresentMode, Swapchain, SwapchainOptions};
@@ -176,7 +176,7 @@ impl Renderer {
                 },
             ],
         );
-        let scene_pipeline = create_render_pipeline(
+        let scene_pipeline = create_render_pipeline_world(
             &ctx,
             "scene pipeline",
             shader_src,
@@ -198,7 +198,7 @@ impl Renderer {
                 .buffer(0, 0, 0, false)
                 .buffer(1, 0, 1, false)
                 .push_constants(PUSH_CONSTANT_BUFFER_SLOT);
-            create_render_pipeline(
+            create_render_pipeline_world(
                 &ctx,
                 "scene pulling pipeline",
                 src,
@@ -235,7 +235,7 @@ impl Renderer {
             .texture(0, 0, 0)
             .sampler(0, 1, 0)
             .push_constants(PUSH_CONSTANT_BUFFER_SLOT);
-        let present_fs = present_fragment_entry(ui_blend, display_fmt);
+        let present_fs = present_fragment_entry(ui_blend, swapchain.format);
         let present_pipeline = create_render_pipeline(
             &ctx,
             "present pipeline",
@@ -251,7 +251,10 @@ impl Renderer {
 
         let targets = build_targets(&ctx, (1, 1));
         let display = build_display(&ctx, (1, 1), display_fmt);
-        let ui = crate::ui::render::UiRenderer::new(&ctx, display_fmt, 512);
+        // The UI pipelines and the display image's format both follow the
+        // blend mode: a linear-blend renderer samples sRGB targets and must not
+        // re-encode, a gamma one writes encoded values into a UNORM target.
+        let ui = crate::ui::render::UiRenderer::new_with_blend(&ctx, display_fmt, 512, ui_blend);
         let slots = (0..MAX_FRAMES_IN_FLIGHT).map(|_| SlotSync::new()).collect();
 
         Self {
@@ -370,7 +373,9 @@ impl Renderer {
                 ]);
             }
         }
-        if self.needs_display() {
+        // Rebuild the display image whenever one exists or the next frames
+        // need one: a stale size would blit the frame through the old extent.
+        if self.display_live || self.needs_display() {
             let display_fmt = display_format(self.swapchain.format, self.ui_blend);
             self.display = build_display(&self.ctx, self.display_size, display_fmt);
             self.display_live = true;

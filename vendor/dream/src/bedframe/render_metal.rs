@@ -16,7 +16,7 @@ use crate::texture::{self, GpuTexture, SamplerDesc, TextureFormat};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCompareFunction,
+    MTLBlitCommandEncoder, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCompareFunction,
     MTLDepthStencilState, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType,
     MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineState, MTLScissorRect,
     MTLSize, MTLStoreAction, MTLTexture, MTLVertexDescriptor, MTLVertexFormat,
@@ -88,6 +88,9 @@ struct FrameSlot {
     instance_policy: ResizePolicy,
     staging_policy: ResizePolicy,
     retained_textures: Vec<Arc<GpuTexture>>,
+    /// Per-slot preparation buffers, owned so a steady frame reuses their
+    /// allocation instead of building fresh vectors every record.
+    prepared: Prepared,
 }
 
 struct PageTex {
@@ -125,6 +128,9 @@ pub struct UiRenderer {
     blur: backdrop::BlurPipelines,
     atlas: Option<AtlasGpu>,
     page_size: u32,
+    /// Scratch rows for atlas uploads, reused across frames (a page-sized
+    /// staging copy per upload would otherwise allocate every time).
+    atlas_scratch: Vec<u8>,
     draws: u64,
     last_vertex_bytes: u64,
     last_index_bytes: u64,
@@ -296,6 +302,7 @@ impl UiRenderer {
                     instance_policy: ResizePolicy::new(inst_cap),
                     staging_policy: ResizePolicy::new(st_cap),
                     retained_textures: Vec::new(),
+                    prepared: Prepared::default(),
                 }
             })
             .collect();
@@ -316,6 +323,7 @@ impl UiRenderer {
             blur,
             atlas: None,
             page_size: page_size.max(1),
+            atlas_scratch: Vec::new(),
             draws: 0,
             last_vertex_bytes: 0,
             last_index_bytes: 0,
@@ -367,7 +375,9 @@ impl UiRenderer {
         self.slots[slot_index].retained_textures.clear();
         self.sync_atlas(cmd, frame, slot_index);
 
-        let mut prepared = Prepared::default();
+        // Reuse this slot's vectors: preparation runs every frame and a busy
+        // UI's instance list is thousands of entries long.
+        let mut prepared = std::mem::take(&mut self.slots[slot_index].prepared);
         prepare::prepare_into(
             &mut prepared,
             &frame.cmds,
@@ -420,6 +430,7 @@ impl UiRenderer {
                     .expect("ui clear");
                 enc.endEncoding();
             }
+            self.slots[slot_index].prepared = prepared;
             return;
         }
 
@@ -455,6 +466,16 @@ impl UiRenderer {
             att.setTexture(Some(target));
             att.setLoadAction(load);
             att.setStoreAction(MTLStoreAction::Store);
+            if load == MTLLoadAction::Clear {
+                // Opaque black: a UI-only frame owns the whole target, and a
+                // transparent clear would depend on the layer being opaque.
+                att.setClearColor(MTLClearColor {
+                    red: 0.0,
+                    green: 0.0,
+                    blue: 0.0,
+                    alpha: 1.0,
+                });
+            }
             let enc = cmd
                 .renderCommandEncoderWithDescriptor(&rpd)
                 .expect("ui render encoder");
@@ -470,6 +491,11 @@ impl UiRenderer {
         });
         let mut backdrop_captured = false;
         let mut draw_count = 0u64;
+        // The encoder keeps pipeline state across draws; re-setting it per draw
+        // costs a validation call on every one of a frame's hundreds of quads.
+        // A fresh encoder binds nothing, so the capture below clears this.
+        let mut bound_pipeline: Option<&Retained<ProtocolObject<dyn MTLRenderPipelineState>>> =
+            None;
 
         for draw in &prepared.draws {
             let cmd_info = &frame.cmds[draw.cmd_index];
@@ -489,6 +515,7 @@ impl UiRenderer {
                 backdrop::capture_backdrop_pass(&self.ctx, cmd, &self.blur, bd, target);
                 backdrop_captured = true;
                 enc = begin_ui_pass(MTLLoadAction::Load);
+                bound_pipeline = None;
             }
 
             let tex: &GpuTexture = match &cmd_info.texture {
@@ -550,7 +577,10 @@ impl UiRenderer {
                     } else {
                         &self.pipeline
                     };
-                    enc.setRenderPipelineState(pipe);
+                    if bound_pipeline != Some(pipe) {
+                        enc.setRenderPipelineState(pipe);
+                        bound_pipeline = Some(pipe);
+                    }
                     unsafe {
                         enc.setVertexBuffer_offset_atIndex(
                             Some(&slot.vertices.buffer),
@@ -583,7 +613,10 @@ impl UiRenderer {
                     } else {
                         &self.instance_pipeline
                     };
-                    enc.setRenderPipelineState(pipe);
+                    if bound_pipeline != Some(pipe) {
+                        enc.setRenderPipelineState(pipe);
+                        bound_pipeline = Some(pipe);
+                    }
                     unsafe {
                         enc.setVertexBuffer_offset_atIndex(
                             Some(&slot.instances.buffer),
@@ -613,6 +646,7 @@ impl UiRenderer {
 
         enc.endEncoding();
         self.draws = draw_count;
+        self.slots[slot_index].prepared = prepared;
     }
 
     fn sync_atlas(
@@ -727,7 +761,8 @@ impl UiRenderer {
                 });
                 let row_bytes = rect.width as usize * bpp;
                 let total_rect_bytes = row_bytes * rect.height as usize;
-                let mut tmp = vec![0u8; total_rect_bytes];
+                let mut tmp = std::mem::take(&mut self.atlas_scratch);
+                tmp.resize(total_rect_bytes, 0);
                 let stride = snapshot.page_size as usize * bpp;
                 for row in 0..rect.height as usize {
                     let src_off = (rect.y as usize + row) * stride + rect.x as usize * bpp;
@@ -736,6 +771,7 @@ impl UiRenderer {
                         .copy_from_slice(&page.pixels[src_off..src_off + row_bytes]);
                 }
                 slot.staging.write_bytes(offset, &tmp);
+                self.atlas_scratch = tmp;
                 unsafe {
                     blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
                         &slot.staging.buffer,

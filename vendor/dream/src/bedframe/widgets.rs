@@ -10,7 +10,7 @@
 //! [`Ui::draw_list_mut`] — widgets are convenience, not a cage.
 
 use super::atlas::AtlasConfig;
-use super::draw::{DrawList, UiFrame};
+use super::draw::{DrawList, TextAa, UiFrame};
 use super::font::GlyphCache;
 use super::font::{FontId, Fonts, LayoutOptions};
 use super::theme::Theme;
@@ -501,6 +501,9 @@ pub struct Ui {
     /// through [`Self::set_motion_scale`]; the default is `1.0`, so the
     /// framework asserts no policy of its own.
     motion_scale: f32,
+    /// Glyph placement for every text draw; see [`TextAa`]. Default
+    /// [`TextAa::Subpixel`].
+    text_aa: TextAa,
 }
 
 /// Shared text metrics for widgets that don't take an explicit style —
@@ -605,6 +608,7 @@ impl Ui {
             wake_in: None,
             scale: 1.0,
             motion_scale: 1.0,
+            text_aa: TextAa::default(),
             theme,
             rate_stack: Vec::new(),
             rates: HashMap::new(),
@@ -795,6 +799,19 @@ impl Ui {
         self.scale
     }
 
+    /// Glyph placement for every label drawn after this call; see
+    /// [`TextAa`]. Default [`TextAa::Subpixel`]: letters keep the shaper's
+    /// fractional advances, so spacing stays even at any scale.
+    pub fn set_text_aa(&mut self, aa: TextAa) {
+        self.text_aa = aa;
+        self.draw.set_text_aa(aa);
+    }
+
+    /// The glyph placement mode in force (see [`Self::set_text_aa`]).
+    pub fn text_aa(&self) -> TextAa {
+        self.text_aa
+    }
+
     /// How long until a pending UI clock (a tooltip mid-dwell, a toast
     /// approaching expiry) needs the host to build a frame. `None` means
     /// nothing is waiting — the host may park until input arrives. A
@@ -912,6 +929,7 @@ impl Ui {
         self.screen = screen_size;
         self.draw.begin(screen_size);
         self.draw.set_scale(self.scale);
+        self.draw.set_text_aa(self.text_aa);
         self.scopes.clear();
         self.scope_seed = FNV_OFFSET;
         self.hot_id = None;

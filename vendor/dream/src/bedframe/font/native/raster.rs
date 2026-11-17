@@ -99,6 +99,21 @@ impl NativeFace {
             return Coverage::default();
         }
         let ctx = CFRef(ctx);
+        // Match the system text stack: grayscale anti-aliasing plus font
+        // smoothing (CoreText's gamma-aware stem weight for light-on-dark
+        // text). Subpixel *positioning* of the mask stays off — the cached
+        // mask is shared by every placement, and `TextAa` applies the
+        // fractional advance on the GPU instead.
+        unsafe {
+            CGContextSetShouldAntialias(ctx.raw(), true);
+            CGContextSetAllowsAntialiasing(ctx.raw(), true);
+            CGContextSetAllowsFontSmoothing(ctx.raw(), true);
+            CGContextSetShouldSmoothFonts(ctx.raw(), true);
+            CGContextSetAllowsFontSubpixelPositioning(ctx.raw(), false);
+            CGContextSetShouldSubpixelPositionFonts(ctx.raw(), false);
+            CGContextSetAllowsFontSubpixelQuantization(ctx.raw(), true);
+            CGContextSetShouldSubpixelQuantizeFonts(ctx.raw(), true);
+        }
         let position = CGPoint {
             x: -ox,
             y: h as f64 - oy,

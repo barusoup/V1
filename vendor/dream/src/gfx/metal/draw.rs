@@ -2,8 +2,8 @@ use super::metal::shader::{PUSH_CONSTANT_BUFFER_SLOT, VERTEX_BUFFER_SLOT};
 use super::{DrawCtx, GpuBuffer, PulledMesh};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLDepthStencilState, MTLIndexType, MTLPrimitiveType, MTLRenderCommandEncoder,
-    MTLRenderPipelineState,
+    MTLBuffer, MTLCullMode, MTLDepthStencilState, MTLIndexType, MTLPrimitiveType,
+    MTLRenderCommandEncoder, MTLRenderPipelineState, MTLWinding,
 };
 use std::ptr::NonNull;
 
@@ -53,6 +53,11 @@ impl<'a> DrawCtx<'a> {
         self.encoder.setRenderPipelineState(self.scene_pipeline);
         self.encoder
             .setDepthStencilState(Some(self.scene_depth_stencil));
+        // Metal's cull mode is encoder state, and a mesh drawn earlier may
+        // have left it two-sided; state the scene pipeline's own raster state
+        // so draw order cannot change which faces survive.
+        self.encoder.setFrontFacingWinding(MTLWinding::Clockwise);
+        self.encoder.setCullMode(MTLCullMode::Back);
         unsafe {
             self.encoder
                 .setVertexBuffer_offset_atIndex(Some(self.scene_uniform), 0, 0);
@@ -101,6 +106,8 @@ impl<'a> DrawCtx<'a> {
         self.encoder.setRenderPipelineState(pipeline);
         self.encoder
             .setDepthStencilState(Some(self.scene_depth_stencil));
+        self.encoder.setFrontFacingWinding(MTLWinding::Clockwise);
+        self.encoder.setCullMode(MTLCullMode::Back);
         let constants = [origin[0], origin[1], origin[2], 0.0f32];
         unsafe {
             self.encoder

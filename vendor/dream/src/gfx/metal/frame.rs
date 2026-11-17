@@ -5,8 +5,9 @@ use crate::camera::Camera;
 use block2::RcBlock;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLLoadAction,
-    MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLStoreAction,
+    MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCullMode,
+    MTLLoadAction, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLStoreAction, MTLWinding,
 };
 use objc2_quartz_core::CAMetalDrawable;
 use std::ptr::NonNull;
@@ -71,7 +72,19 @@ impl Renderer {
     {
         self.scene_sample = None;
         self.phases = FramePhases::default();
-        if self.needs_display() && !self.display_live {
+        // Frosted glass samples a copy of the frame composed so far, and that
+        // copy is a blit — a drawable is `framebufferOnly`, so glass frames
+        // compose through the display image. A frame that needs neither glass
+        // nor capture draws straight into the drawable: no full-size
+        // intermediate, and no present pass.
+        let glass = ui.is_some_and(|frame| {
+            frame
+                .cmds
+                .iter()
+                .any(|cmd| matches!(cmd.texture, crate::ui::draw::CmdTexture::Backdrop))
+        });
+        let direct = !self.needs_display() && !glass;
+        if !direct && !self.display_live {
             self.ensure_display();
         }
 
@@ -146,7 +159,6 @@ impl Renderer {
             .commandBuffer()
             .expect("create Metal command buffer");
 
-        let direct = !self.needs_display();
         let drawable_tex = drawable.texture();
         let target_size: (u32, u32) = if direct {
             swapchain_extent
@@ -193,6 +205,11 @@ impl Renderer {
                 .expect("scene render encoder");
             enc.setViewport(scene_viewport);
             enc.setScissorRect(scene_scissor);
+            // Culling and winding are encoder state in Metal; the Vulkan scene
+            // pipeline culls back faces with a clockwise front face, and the
+            // mesh and impostor renderers restate it per draw.
+            enc.setFrontFacingWinding(MTLWinding::Clockwise);
+            enc.setCullMode(MTLCullMode::Back);
 
             let mut noop_starter = || {};
             let mut draw_ctx = DrawCtx {

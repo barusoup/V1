@@ -124,6 +124,18 @@ unsafe extern "C" {
     ) -> CGContextRef;
     pub(crate) fn CGColorSpaceCreateWithName(name: CFStringRef) -> CGColorSpaceRef;
     pub(crate) static kCGColorSpaceSRGB: CFStringRef;
+    // Text-rendering policy. CoreText draws glyphs through the context's
+    // defaults, which for a bitmap context mean grayscale anti-aliasing
+    // *without* the gamma/stem adjustment the system text stack applies, so
+    // glyphs come out visibly lighter than the same face in a native control.
+    pub(crate) fn CGContextSetShouldAntialias(context: CGContextRef, value: bool);
+    pub(crate) fn CGContextSetAllowsAntialiasing(context: CGContextRef, value: bool);
+    pub(crate) fn CGContextSetShouldSmoothFonts(context: CGContextRef, value: bool);
+    pub(crate) fn CGContextSetAllowsFontSmoothing(context: CGContextRef, value: bool);
+    pub(crate) fn CGContextSetShouldSubpixelPositionFonts(context: CGContextRef, value: bool);
+    pub(crate) fn CGContextSetAllowsFontSubpixelPositioning(context: CGContextRef, value: bool);
+    pub(crate) fn CGContextSetShouldSubpixelQuantizeFonts(context: CGContextRef, value: bool);
+    pub(crate) fn CGContextSetAllowsFontSubpixelQuantization(context: CGContextRef, value: bool);
 
     // CoreText
     pub(crate) fn CTFontCreateWithGraphicsFont(

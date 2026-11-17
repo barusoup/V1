@@ -293,7 +293,7 @@ impl ImpostorBaker {
                 },
             ],
         );
-        let capture_pipe = crate::gfx::metal::pipeline::create_render_pipeline_unflipped(
+        let capture_pipe = crate::gfx::metal::pipeline::create_render_pipeline_world(
             ctx,
             "impostor_capture",
             cap_src,

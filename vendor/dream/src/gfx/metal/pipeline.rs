@@ -49,13 +49,12 @@ pub(crate) fn scene_region(
     let sx = render.0 as f32 / display.0.max(1) as f32;
     let sy = render.1 as f32 / display.1.max(1) as f32;
     let x0 = (rect.x * sx).floor().clamp(0.0, render.0 as f32) as usize;
-    let y0 = (render.1 as f32 - (rect.y + rect.h) * sy)
-        .floor()
-        .clamp(0.0, render.1 as f32) as usize;
+    // Metal's target row 0 is the *top* row (see the shader module docs), and
+    // the scene's world-space shaders are not flipped, so a display rect's
+    // top-down y is already the scissor's y. No flip.
+    let y0 = (rect.y * sy).floor().clamp(0.0, render.1 as f32) as usize;
     let x1 = ((rect.x + rect.w) * sx).ceil().clamp(0.0, render.0 as f32) as usize;
-    let y1 = (render.1 as f32 - rect.y * sy)
-        .ceil()
-        .clamp(0.0, render.1 as f32) as usize;
+    let y1 = ((rect.y + rect.h) * sy).ceil().clamp(0.0, render.1 as f32) as usize;
     (
         viewport,
         MTLScissorRect {
@@ -67,18 +66,32 @@ pub(crate) fn scene_region(
     )
 }
 
+/// The composed display image's format, mirroring the Vulkan backend: a
+/// [`UiBlend::Gamma`] frame writes sRGB-encoded bytes, so the image is the
+/// swapchain's UNORM form. That equals the swapchain whenever the layer is
+/// already UNORM, which is what lets a frame compose straight into the
+/// drawable instead of through a full-size intermediate.
 pub(crate) fn display_format(swapchain_format: MTLPixelFormat, blend: UiBlend) -> MTLPixelFormat {
-    match blend {
-        UiBlend::Gamma => MTLPixelFormat::RGBA8Unorm,
-        UiBlend::Linear => swapchain_format,
+    match (blend, swapchain_format) {
+        (UiBlend::Gamma, MTLPixelFormat::BGRA8Unorm_sRGB) => MTLPixelFormat::BGRA8Unorm,
+        (UiBlend::Gamma, MTLPixelFormat::RGBA8Unorm_sRGB) => MTLPixelFormat::RGBA8Unorm,
+        _ => swapchain_format,
     }
 }
 
-pub(crate) fn present_fragment_entry(blend: UiBlend, display_fmt: MTLPixelFormat) -> &'static str {
-    match blend {
-        UiBlend::Gamma if super::is_srgb(display_fmt) => "fs_main",
-        UiBlend::Gamma => "fs_gamma",
-        UiBlend::Linear => "fs_main",
+/// The present pass' fragment entry. Only a gamma-blended display image in an
+/// sRGB swapchain holds encoded values that must be decoded so the hardware
+/// re-encodes them; every other pair passes values through unchanged. Getting
+/// this backwards decodes the frame a second time, which drops every mid-tone
+/// by about a stop.
+pub(crate) fn present_fragment_entry(
+    blend: UiBlend,
+    swapchain_format: MTLPixelFormat,
+) -> &'static str {
+    if blend == UiBlend::Gamma && super::is_srgb(swapchain_format) {
+        "fs_gamma"
+    } else {
+        "fs_main"
     }
 }
 
@@ -166,8 +179,15 @@ pub(crate) fn create_render_pipeline(
     )
 }
 
+/// A pipeline for world-space geometry: the vertex shader already emits y-up
+/// NDC through a camera projection, and Metal's native clip-to-target mapping
+/// is the same one Vulkan produces with its negative-height viewport, so no y
+/// negation is applied. Screen-space pipelines use [`create_render_pipeline`].
+///
+/// Back-face culling is render-encoder state in Metal, not pipeline state: the
+/// scene pass and the mesh and impostor renderers set it when they draw.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn create_render_pipeline_unflipped(
+pub(crate) fn create_render_pipeline_world(
     ctx: &GpuContext,
     label: &str,
     source: &str,
@@ -279,4 +299,39 @@ pub(crate) fn create_depth_stencil_state(
     ctx.device()
         .newDepthStencilStateWithDescriptor(&desc)
         .expect("create Metal depth stencil state")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scene target's row 0 is the top row, so a display rectangle's
+    /// scissor keeps its y; a mirrored scissor would render the 3D view in the
+    /// wrong half of the window.
+    #[test]
+    fn metal_scene_scissor_is_top_down() {
+        let (_, scissor) = scene_region(
+            Some(crate::ui::Rect::new(10.0, 10.0, 40.0, 20.0)),
+            (100, 100),
+            (100, 100),
+        );
+        assert_eq!((scissor.x, scissor.y), (10, 10));
+        assert_eq!((scissor.width, scissor.height), (40, 20));
+
+        // A half-height scene pane anchored at the bottom of the window.
+        let (_, scissor) = scene_region(
+            Some(crate::ui::Rect::new(0.0, 50.0, 100.0, 50.0)),
+            (200, 200),
+            (100, 100),
+        );
+        assert_eq!((scissor.y, scissor.height), (100, 100));
+    }
+
+    #[test]
+    fn metal_scene_scissor_without_a_rect_covers_the_target() {
+        let (viewport, scissor) = scene_region(None, (80, 60), (160, 120));
+        assert_eq!((viewport.width, viewport.height), (80.0, 60.0));
+        assert_eq!((scissor.x, scissor.y), (0, 0));
+        assert_eq!((scissor.width, scissor.height), (80, 60));
+    }
 }

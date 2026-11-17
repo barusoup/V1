@@ -3,7 +3,7 @@
 use super::{AlphaMode, Material, Model, ModelInstance, TexelFilter, TextureRef, Wrap};
 use crate::gfx::DrawCtx;
 use crate::gfx::metal::pipeline::{
-    VertexAttr, create_depth_stencil_state, create_render_pipeline, make_vertex_descriptor,
+    VertexAttr, create_depth_stencil_state, create_render_pipeline_world, make_vertex_descriptor,
 };
 use crate::gfx::metal::shader::{MslBindings, PUSH_CONSTANT_BUFFER_SLOT, VERTEX_BUFFER_SLOT};
 use crate::gfx::metal::{GpuBuffer, GpuContext, align_up};
@@ -433,7 +433,7 @@ impl PbrState {
             ],
         );
 
-        let opaque = create_render_pipeline(
+        let opaque = create_render_pipeline_world(
             ctx,
             "model pbr opaque",
             &src,
@@ -445,7 +445,7 @@ impl PbrState {
             Some(&vd),
             false,
         );
-        let blended = create_render_pipeline(
+        let blended = create_render_pipeline_world(
             ctx,
             "model pbr blended",
             &src,
@@ -542,7 +542,7 @@ impl ModelRenderer {
             ],
         );
 
-        let static_pipeline = create_render_pipeline(
+        let static_pipeline = create_render_pipeline_world(
             ctx,
             "model static",
             src,
@@ -554,7 +554,7 @@ impl ModelRenderer {
             Some(&static_vd),
             false,
         );
-        let skinned_pipeline = create_render_pipeline(
+        let skinned_pipeline = create_render_pipeline_world(
             ctx,
             "model skinned",
             src,
@@ -566,7 +566,7 @@ impl ModelRenderer {
             Some(&skinned_vd),
             false,
         );
-        let static_blended = create_render_pipeline(
+        let static_blended = create_render_pipeline_world(
             ctx,
             "model static blended",
             src,
@@ -578,7 +578,7 @@ impl ModelRenderer {
             Some(&static_vd),
             true,
         );
-        let skinned_blended = create_render_pipeline(
+        let skinned_blended = create_render_pipeline_world(
             ctx,
             "model skinned blended",
             src,

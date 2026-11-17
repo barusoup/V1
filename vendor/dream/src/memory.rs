@@ -211,18 +211,37 @@ pub fn resident_bytes() -> u64 {
     }
     #[cfg(target_os = "macos")]
     {
-        // `ps` reports resident bytes directly (KiB); /proc does not exist
-        // on macOS so the Linux path would silently read 0.
-        let pid = std::process::id();
-        let output = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &pid.to_string()])
-            .output()
-            .ok();
-        return output
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .and_then(|text| text.trim().parse::<u64>().ok())
-            .map(|kib| kib * 1024)
-            .unwrap_or(0);
+        // `proc_pid_rusage` is one libproc call: no subprocess, no `ps` fork,
+        // and it reports the same resident size as `ps`'s RSS column. (Forking
+        // `ps` from inside a frame is both slow and unavailable to sandboxed
+        // apps, which is why that path could return 0.)
+        #[repr(C)]
+        struct RusageInfoV0 {
+            uuid: [u8; 16],
+            user_time: u64,
+            system_time: u64,
+            pkg_idle_wkups: u64,
+            interrupt_wkups: u64,
+            pageins: u64,
+            wired_size: u64,
+            resident_size: u64,
+            phys_footprint: u64,
+            proc_start_abstime: u64,
+            proc_exit_abstime: u64,
+        }
+        unsafe extern "C" {
+            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut core::ffi::c_void) -> i32;
+        }
+        const RUSAGE_INFO_V0: i32 = 0;
+        let mut info = unsafe { core::mem::zeroed::<RusageInfoV0>() };
+        let rc = unsafe {
+            proc_pid_rusage(
+                std::process::id() as i32,
+                RUSAGE_INFO_V0,
+                &mut info as *mut RusageInfoV0 as *mut core::ffi::c_void,
+            )
+        };
+        if rc == 0 { info.resident_size } else { 0 }
     }
     #[cfg(target_os = "linux")]
     {

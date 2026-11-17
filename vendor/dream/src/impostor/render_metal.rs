@@ -2,7 +2,7 @@
 
 use super::atlas::AssetDebug;
 use super::{ImpostorAsset, ImpostorBounds, VIEWS, projected_extent};
-use crate::gfx::metal::pipeline::{create_depth_stencil_state, create_render_pipeline};
+use crate::gfx::metal::pipeline::{create_depth_stencil_state, create_render_pipeline_world};
 use crate::gfx::metal::shader::MslBindings;
 use crate::gfx::{DrawCtx, GpuBuffer, GpuContext, align_up};
 use crate::lighting::Lighting;
@@ -255,7 +255,7 @@ impl ImpostorRenderer {
             include_str!("../lighting/lighting.wgsl"),
             include_str!("impostor.wgsl")
         );
-        let pipeline = create_render_pipeline(
+        let pipeline = create_render_pipeline_world(
             ctx,
             "impostor",
             &src,
