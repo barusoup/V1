@@ -6,10 +6,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLOrigin, MTLPixelFormat,
-    MTLSamplerState, MTLSize, MTLTexture, MTLTextureSwizzle, MTLTextureSwizzleChannels,
+    MTLRegion, MTLSamplerState, MTLSize, MTLTexture, MTLTextureSwizzle, MTLTextureSwizzleChannels,
     MTLTextureType, MTLTextureUsage,
 };
 use std::ops::Range;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 pub struct GpuTexture {
@@ -123,19 +124,21 @@ impl GpuTexture {
         );
         let row_bytes = bw * 16;
         unsafe {
-            image.texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                MTLRegion {
-                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
-                    size: MTLSize {
-                        width: w as usize,
-                        height: h as usize,
-                        depth: 1,
+            image
+                .texture
+                .replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                    MTLRegion {
+                        origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                        size: MTLSize {
+                            width: w as usize,
+                            height: h as usize,
+                            depth: 1,
+                        },
                     },
-                },
-                0,
-                NonNull::new_unchecked(blocks.as_ptr() as *mut _),
-                row_bytes,
-            );
+                    0,
+                    NonNull::new_unchecked(blocks.as_ptr() as *mut _),
+                    row_bytes,
+                );
         }
         Self::finish(ctx, image, None, sampler, (w, h), 1, TextureFormat::Srgb)
     }
@@ -190,69 +193,6 @@ impl GpuTexture {
             mip_levels,
             options.format,
         )
-    }
-
-    pub fn from_bc7(
-        ctx: &Arc<GpuContext>,
-        label: &str,
-        blocks: &[u8],
-        width: u32,
-        height: u32,
-        sampler: SamplerDesc,
-    ) -> Self {
-        let w = width.max(1);
-        let h = height.max(1);
-        let bw = w.div_ceil(4) as usize;
-        let bh = h.div_ceil(4) as usize;
-        let expected = bw * bh * 16;
-        assert!(
-            blocks.len() == expected,
-            "{label}: {} bytes for {w}x{h} BC7 (expected {expected})",
-            blocks.len()
-        );
-        let image = ctx.create_image(
-            label,
-            w,
-            h,
-            MTLPixelFormat::BC7_RGBAUnorm_sRGB,
-            MTLTextureUsage::ShaderRead,
-        );
-        let row_bytes = bw * 16;
-        unsafe {
-            image.texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                MTLRegion {
-                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
-                    size: MTLSize {
-                        width: w as usize,
-                        height: h as usize,
-                        depth: 1,
-                    },
-                },
-                0,
-                NonNull::new_unchecked(blocks.as_ptr() as *mut _),
-                row_bytes,
-            );
-        }
-        Self::finish(ctx, image, None, sampler, (w, h), 1, TextureFormat::Srgb)
-    }
-
-    pub fn blank_bc7(
-        ctx: &Arc<GpuContext>,
-        label: &str,
-        width: u32,
-        height: u32,
-        sampler: SamplerDesc,
-    ) -> Self {
-        let w = width.max(1);
-        let h = height.max(1);
-        let image = ctx.create_image(
-            label,
-            w,
-            h,
-            MTLPixelFormat::BC7_RGBAUnorm_sRGB,
-            MTLTextureUsage::ShaderRead,
-        );
-        Self::finish(ctx, image, None, sampler, (w, h), 1, TextureFormat::Srgb)
     }
 
     pub fn white(ctx: &Arc<GpuContext>) -> Self {

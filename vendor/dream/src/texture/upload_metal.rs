@@ -4,7 +4,8 @@ use crate::gfx::renderer::SlotSync;
 use block2::RcBlock;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLOrigin, MTLSize,
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLOrigin,
+    MTLSize, MTLTexture,
 };
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -43,8 +44,8 @@ impl TextureUploader {
 
     pub fn upload(&mut self, texture: &GpuTexture, pixels: &[u8]) {
         let (w, h) = texture.size();
-        let is_bc7 = texture.raw_texture().pixelFormat()
-            == objc2_metal::MTLPixelFormat::BC7_RGBAUnorm_sRGB;
+        let is_bc7 =
+            texture.raw_texture().pixelFormat() == objc2_metal::MTLPixelFormat::BC7_RGBAUnorm_sRGB;
         let (bytes, row_bytes) = if is_bc7 {
             let bw = (w as u64).div_ceil(4);
             let bh = (h as u64).div_ceil(4);
