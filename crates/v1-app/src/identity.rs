@@ -22,7 +22,7 @@ pub fn apply() {
     // Before the first window, or the taskbar groups the app by its executable path rather than
     // by its own icon and name. This is a single call into the shell; it needs no COM apartment.
     set_process_id();
-    if crate::update::installed_dir().is_some() {
+    if crate::update::install_target().is_some() {
         let _ = std::thread::Builder::new()
             .name("v1-identity".to_owned())
             .spawn(repair_shortcut_in_background);
