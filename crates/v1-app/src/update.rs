@@ -28,11 +28,14 @@ const RETRY_PAUSE: Duration = Duration::from_millis(300);
 /// The release lookup, retries included, may take this long before the app gives up on it.
 const CHECK_BUDGET: Duration = Duration::from_secs(6);
 /// The package download may take this long. Past it, the update waits for the next launch. A
-/// Windows setup is ~90 MB and the macOS disk image ~40 MB, so a slow line needs more than a
-/// minute; the check runs beside the window, so a long budget only delays the update itself.
+/// Windows setup is ~90 MB, a macOS disk image ~40 MB and a Linux AppImage ~50 MB, so a slow line
+/// needs more than a minute; the check runs beside the window, so a long budget only delays the
+/// update itself.
 #[cfg(target_os = "macos")]
 const DOWNLOAD_BUDGET: Duration = Duration::from_secs(240);
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+const DOWNLOAD_BUDGET: Duration = Duration::from_secs(180);
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const DOWNLOAD_BUDGET: Duration = Duration::from_secs(90);
 /// Set by the installer, which starts the updated copy after replacing the old one.
 pub(crate) const UPDATED_FLAG: &str = "--updated";
@@ -68,14 +71,19 @@ impl fmt::Display for Version {
     }
 }
 
-/// The release asset this build installs from. The release job uploads both names, so each
-/// platform picks its own: the Windows setup program, or the Apple Silicon disk image.
+/// The release asset this build installs from. The release job uploads every name, so each
+/// platform picks its own: the Windows setup program, the Apple Silicon disk image, or the
+/// x86-64 AppImage.
 fn package_name(version: Version) -> String {
     #[cfg(target_os = "macos")]
     {
         format!("V1-{version}-arm64.dmg")
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        format!("V1-{version}-x86_64.AppImage")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         format!("V1-Setup-{version}.exe")
     }
@@ -193,6 +201,10 @@ pub fn run_at_startup() {
 /// the first frame want (a runtime, a TLS client, a name lookup), and nothing about an update is
 /// urgent to the millisecond: the window is up before the check begins.
 pub fn check_in_background() {
+    // A build that cannot replace itself has nothing to do on a thread; skip the wake-up entirely.
+    if std::env::var_os("V1_NO_UPDATE").is_some() || install_target().is_none() {
+        return;
+    }
     let _ = std::thread::Builder::new()
         .name("v1-update".to_owned())
         .spawn(|| {
@@ -226,7 +238,15 @@ fn installed_target_for(exe: &Path) -> Option<PathBuf> {
     replaceable.then_some(bundle)
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn installed_target_for(_exe: &Path) -> Option<PathBuf> {
+    // The AppImage runtime exports APPIMAGE as the path of the image it is running. That copy can
+    // replace itself; a build run from `target/` has no APPIMAGE and sits this out.
+    let image = std::env::var_os("APPIMAGE").map(PathBuf::from)?;
+    image.is_file().then_some(image)
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn installed_target_for(_exe: &Path) -> Option<PathBuf> {
     None
 }
@@ -346,7 +366,7 @@ async fn get(client: &reqwest::Client, url: &str, timeout: Duration) -> Option<V
 }
 
 /// About two minutes of waiting, then the update is dropped instead of hanging.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 const WAIT_TRIES: u32 = 120;
 
 /// The detached script that waits for this process to exit, installs silently, and starts the
@@ -404,16 +424,16 @@ fn restart_into_update(installer: &Path, install_dir: &Path) -> std::io::Result<
     Ok(())
 }
 
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
 fn restart_into_update(_package: &Path, _target: &Path) -> std::io::Result<()> {
     Err(std::io::Error::other(
-        "self-update installs Windows and macOS builds only",
+        "self-update installs Windows, macOS and Linux builds only",
     ))
 }
 
 /// Shell-quote a path for the update script: single quotes, with any embedded quote closed and
 /// reopened so an apostrophe in a user's folder name cannot break the script.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', r#"'\''"#))
 }
@@ -512,6 +532,72 @@ fn restart_into_update(package: &Path, bundle: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The detached script that waits for this process to exit, swaps the AppImage, and starts the
+/// updated copy with [`UPDATED_FLAG`].
+///
+/// The image is copied beside the installed one before the rename, so a full disk or a permission
+/// error leaves the old copy runnable. Any abort removes the handoff marker.
+#[cfg(target_os = "linux")]
+fn update_script(pid: u32, package: &Path, image: &Path, handoff: &Path) -> String {
+    format!(
+        r#"#!/bin/sh
+# Replaces {name} with the downloaded AppImage and reopens it. Written by the app.
+pid={pid}
+package={package}
+target={target}
+handoff={handoff}
+wait={wait}
+staged="$target.new"
+abort() {{
+  rm -f "$staged" "$package" "$handoff" "$0"
+  exit 1
+}}
+tries=0
+while kill -0 "$pid" 2>/dev/null; do
+  tries=$((tries + 1))
+  [ "$tries" -lt "$wait" ] || abort
+  sleep 1
+done
+cp "$package" "$staged" || abort
+chmod 755 "$staged" || abort
+mv -f "$staged" "$target" || abort
+# The new image is in place, so the marker's job is done: a launch from here on runs the new
+# build, and a crash before the restart below must not lock the app out.
+rm -f "$package" "$handoff"
+"$target" {updated} >/dev/null 2>&1 &
+rm -f "$0"
+"#,
+        name = image.display(),
+        pid = pid,
+        package = sh_quote(package),
+        target = sh_quote(image),
+        handoff = sh_quote(handoff),
+        wait = WAIT_TRIES,
+        updated = UPDATED_FLAG,
+    )
+}
+
+/// Writes the swap script beside the downloaded AppImage and runs it detached, so it outlives this
+/// process. The app exits as soon as the spawn succeeds; the script waits for that exit before it
+/// replaces the image it is running from.
+#[cfg(target_os = "linux")]
+fn restart_into_update(package: &Path, image: &Path) -> std::io::Result<()> {
+    use std::process::Stdio;
+    let dir = package
+        .parent()
+        .ok_or_else(|| std::io::Error::other("update package has no folder"))?;
+    let script = dir.join("v1-update.sh");
+    let body = update_script(std::process::id(), package, image, &handoff_path());
+    std::fs::write(&script, body)?;
+    std::process::Command::new("/bin/sh")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,15 +640,19 @@ mod tests {
         assert!(parse_latest(release_json("v0.2.0", "Other.bin").as_bytes()).is_none());
     }
 
-    /// Each platform installs only from its own asset: a Windows setup on macOS, or a disk image on
-    /// Windows, would leave the app unable to update.
+    /// Each platform installs only from its own asset: a setup program, disk image or AppImage
+    /// meant for another platform would leave the app unable to update.
     #[test]
     fn a_release_for_the_other_platform_is_refused() {
         #[cfg(target_os = "macos")]
-        let other = "V1-Setup-0.2.0.exe";
-        #[cfg(not(target_os = "macos"))]
-        let other = "V1-0.2.0-arm64.dmg";
-        assert!(parse_latest(release_json("v0.2.0", other).as_bytes()).is_none());
+        let others = ["V1-Setup-0.2.0.exe", "V1-0.2.0-x86_64.AppImage"];
+        #[cfg(target_os = "linux")]
+        let others = ["V1-Setup-0.2.0.exe", "V1-0.2.0-arm64.dmg"];
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let others = ["V1-0.2.0-arm64.dmg", "V1-0.2.0-x86_64.AppImage"];
+        for other in others {
+            assert!(parse_latest(release_json("v0.2.0", other).as_bytes()).is_none());
+        }
     }
 
     #[test]
@@ -610,6 +700,96 @@ mod tests {
         assert!(!handoff_pending("0.1.7", now));
         assert!(!handoff_pending("nightly\n1700000000\n", now));
         assert!(!handoff_pending("0.1.7\nnot-a-time\n", now));
+    }
+
+    /// The Linux script must wait for the app to exit, stage the new image beside the old one,
+    /// swap it in, reopen it with the flag, and clear the handoff on every abort path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_script_swaps_the_appimage_after_the_app_exits() {
+        let script = update_script(
+            42,
+            Path::new("/tmp/v1-update/V1-0.2.4-x86_64.AppImage"),
+            Path::new("/home/x/Apps/V1.AppImage"),
+            Path::new("/home/x/.local/share/v1/update-in-progress"),
+        );
+        assert!(script.starts_with("#!/bin/sh\n"));
+        assert!(script.contains("while kill -0 \"$pid\" 2>/dev/null; do"));
+        assert!(script.contains("cp \"$package\" \"$staged\""));
+        assert!(script.contains("chmod 755 \"$staged\""));
+        assert!(script.contains("mv -f \"$staged\" \"$target\""));
+        assert!(script.contains("\"$target\" --updated"));
+        // Every path clears the marker: the abort path, and the successful swap.
+        assert!(script.contains("rm -f \"$staged\" \"$package\" \"$handoff\" \"$0\""));
+        assert!(script.contains("rm -f \"$package\" \"$handoff\""));
+        // The image is copied and verified beside the target before the atomic rename.
+        let copied = script.find("cp \"$package\" \"$staged\"").unwrap();
+        let renamed = script.find("mv -f \"$staged\" \"$target\"").unwrap();
+        assert!(copied < renamed, "the new image is staged before the swap");
+        // Paths with spaces stay one shell word.
+        assert!(script.contains("target='/home/x/Apps/V1.AppImage'"));
+        assert!(script.contains("handoff='/home/x/.local/share/v1/update-in-progress'"));
+    }
+
+    /// The whole Linux handoff against throwaway files: the script waits for the old process,
+    /// replaces the image, reopens it with [`UPDATED_FLAG`], and removes the download.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_handoff_replaces_the_appimage_and_reopens_it() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!("v1-update-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create the test folder");
+
+        let installed = root.join("V1.AppImage");
+        let launched = root.join("launched.txt");
+        std::fs::write(&installed, "#!/bin/sh\nexit 0\n").expect("write the old image");
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755))
+            .expect("make it executable");
+
+        // The download stands in for an AppImage: it records the arguments it was started with.
+        let package = root.join("V1-9.9.9-x86_64.AppImage");
+        std::fs::write(
+            &package,
+            format!("#!/bin/sh\nprintf '%s' \"$*\" > '{}'\n", launched.display()),
+        )
+        .expect("write the new image");
+        std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o644))
+            .expect("the download is not executable yet");
+
+        let handoff = root.join("update-in-progress");
+        std::fs::write(&handoff, "9.9.9\n1700000000\n").expect("write the handoff");
+
+        // A child that has already exited: the wait loop falls through at once.
+        let mut gone = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = gone.id();
+        let _ = gone.wait();
+
+        let script = root.join("v1-update.sh");
+        std::fs::write(&script, update_script(pid, &package, &installed, &handoff))
+            .expect("write the script");
+        let ran = Command::new("/bin/sh")
+            .arg(&script)
+            .status()
+            .expect("run the update script");
+        assert!(ran.success(), "the update script gave up");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        assert!(!package.exists(), "the download is cleaned up");
+        assert!(
+            !handoff.exists(),
+            "the handoff is cleared once the swap lands"
+        );
+        let mode = std::fs::metadata(&installed).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "the installed image is executable");
+        let relaunch = std::fs::read_to_string(&launched).expect("the app was reopened");
+        assert_eq!(relaunch, "--updated");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(windows)]

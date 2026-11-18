@@ -149,6 +149,11 @@ impl GpuContext {
         })
     }
 
+    /// Whether hardware BC1–BC7 block-compressed textures are supported.
+    pub fn supports_bc(&self) -> bool {
+        true
+    }
+
     /// An offscreen context: device, queue and an unattached layer, with no
     /// window. GPU tools and tests render into their own textures with it, so
     /// they need no window server.

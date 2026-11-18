@@ -1,17 +1,16 @@
 // Copyright (c) 2026 Hunter Lehr (Barusoup)
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Windows System Media Transport Controls (SMTC).
+//! System media controls.
 //!
-//! This is what makes earbuds, keyboard media keys, and the Windows media flyout drive the app.
-//! Bluetooth transport buttons do not arrive as ordinary key messages: Windows only delivers them
-//! to the media app that owns the active SMTC session, so an app that never registers one simply
-//! sees nothing.
+//! This is what makes earbuds, keyboard media keys, and the desktop's media flyout drive the app.
+//! Windows uses System Media Transport Controls (SMTC); macOS uses MPRemoteCommandCenter and
+//! MPNowPlayingInfoCenter; Linux exports an MPRIS player on the session bus, which is what the
+//! desktop's media keys are usually bound to (through `playerctl` or a panel widget).
 //!
-//! The session is tied to the window. Transport buttons arrive on a COM thread and are forwarded to
-//! the UI thread through the event loop proxy; the UI then applies them like a press on the bar.
-//! Display metadata and the timeline are pushed back so the flyout shows the track and seeks land
-//! in the right place. Everything here is best effort: if the OS refuses SMTC, the app still runs.
+//! Transport buttons are forwarded to the UI thread and applied like a press on the bar. Display
+//! metadata and the timeline are pushed back so the flyout shows the track and seeks land in the
+//! right place. Everything here is best effort: if the OS refuses a session, the app still runs.
 
 /// A transport action requested by the OS.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -24,6 +23,9 @@ pub enum Command {
     Stop,
     /// Seek to this position, in seconds.
     Seek(f64),
+    /// Set the output volume, 0 to 1. Only MPRIS carries a volume knob.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Volume(f64),
 }
 
 /// What the SMTC session should show. Borrowed from the track view, so building it every frame
@@ -37,15 +39,18 @@ pub struct MediaInfo<'a> {
     pub position: f64,
     pub duration: f64,
     pub playing: bool,
+    /// The output volume, 0 to 1. MPRIS exposes this to the desktop.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub volume: f32,
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub use imp::MediaControls;
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub struct MediaControls;
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 impl MediaControls {
     pub fn new<F>(_window: &winit::window::Window, _on_command: F) -> Option<Self>
     where
@@ -303,6 +308,660 @@ mod imp {
                     let _: () = msg_send![command, release];
                 }
             }
+        }
+    }
+}
+
+/// Linux media controls: an MPRIS player on the session bus.
+///
+/// Desktop media keys and panel widgets do not talk to the focused window; they talk to
+/// `org.mpris.MediaPlayer2` services on the session bus (usually through `playerctl`). Exporting
+/// that interface is therefore what makes earbuds, keyboard transport buttons and the desktop's
+/// media widget drive the app.
+///
+/// The session lives on its own thread, because the zbus blocking connection runs its own
+/// executor and must not block the event loop. The UI thread pushes a snapshot when the track,
+/// playback state or volume changes (and once a second while playing, for the timeline); the
+/// D-Bus thread turns those into `PropertiesChanged` signals. Transport calls come back over a
+/// second channel, which the UI thread drains as ordinary media commands.
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::collections::HashMap;
+    use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::time::Instant;
+
+    use zbus::blocking::Connection;
+    use zbus::object_server::SignalEmitter;
+    use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
+
+    use super::{Command, MediaInfo};
+
+    /// MPRIS requires the bus name to be `org.mpris.MediaPlayer2.<player>`. The suffix also has to
+    /// match the desktop entry's base name, so it is `v1`.
+    const BUS_NAME: &str = "org.mpris.MediaPlayer2.v1";
+    const OBJECT_PATH: &str = "/org/mpris/MediaPlayer2";
+    const PLAYER_INTERFACE: &str = "org.mpris.MediaPlayer2.Player";
+    /// The track-id object path root. Each new track gets a fresh id from a counter.
+    const TRACK_ROOT: &str = "/org/v1/track";
+    const NO_TRACK: &str = "/org/mpris/MediaPlayer2/TrackList/NoTrack";
+    /// A position jump bigger than this looks like a seek rather than normal progress. Clients
+    /// interpolate from the last position, so ordinary playback needs no periodic update.
+    const SEEK_JUMP: f64 = 2.5;
+    /// How far a position may drift from where playback should have reached before it counts as a
+    /// seek. Slightly wider than a dropped frame's worth of progress.
+    const DRIFT: f64 = 1.0;
+
+    /// The track as the D-Bus thread keeps it.
+    struct Track {
+        title: String,
+        artist: String,
+        album: Option<String>,
+        duration: f64,
+        position: f64,
+        playing: bool,
+        /// When `position` was last written, for interpolating while playing.
+        at: Instant,
+        /// Changes when the track does, so clients see a new `mpris:trackid`.
+        id: u64,
+    }
+
+    impl Track {
+        fn position_now(&self) -> f64 {
+            if self.playing {
+                self.position + self.at.elapsed().as_secs_f64()
+            } else {
+                self.position
+            }
+        }
+
+        fn path(&self) -> String {
+            format!("{TRACK_ROOT}/{}", self.id)
+        }
+    }
+
+    #[derive(Default)]
+    struct Shared {
+        track: Option<Track>,
+        volume: f64,
+        next_id: u64,
+    }
+
+    /// A copy of the player state sent from the UI thread.
+    struct Snapshot {
+        title: String,
+        artist: String,
+        album: Option<String>,
+        position: f64,
+        duration: f64,
+        playing: bool,
+        volume: f32,
+    }
+
+    enum Update {
+        Snapshot(Snapshot),
+        Clear,
+        Stop,
+    }
+
+    struct Player {
+        shared: Arc<Mutex<Shared>>,
+        commands: SyncSender<Command>,
+    }
+
+    impl Player {
+        fn send(&self, command: Command) {
+            // The UI thread drains this promptly; a full queue means the app is shutting down.
+            let _ = self.commands.try_send(command);
+        }
+
+        fn shared(&self) -> MutexGuard<'_, Shared> {
+            self.shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    #[zbus::interface(name = "org.mpris.MediaPlayer2.Player")]
+    impl Player {
+        fn next(&self) {
+            self.send(Command::Next);
+        }
+
+        fn previous(&self) {
+            self.send(Command::Previous);
+        }
+
+        fn pause(&self) {
+            self.send(Command::Pause);
+        }
+
+        fn play(&self) {
+            self.send(Command::Play);
+        }
+
+        fn play_pause(&self) {
+            self.send(Command::Toggle);
+        }
+
+        fn stop(&self) {
+            self.send(Command::Stop);
+        }
+
+        /// `Seek` is relative, in microseconds, as MPRIS specifies.
+        fn seek(&self, offset: i64) {
+            let position = self
+                .shared()
+                .track
+                .as_ref()
+                .map(Track::position_now)
+                .unwrap_or(0.0);
+            self.send(Command::Seek(
+                (position + offset as f64 / 1_000_000.0).max(0.0),
+            ));
+        }
+
+        /// `SetPosition` addresses a specific track; ignore it when the track has moved on.
+        fn set_position(&self, track_id: OwnedObjectPath, position: i64) {
+            let current = self.shared().track.as_ref().map(Track::path);
+            if current.as_deref() != Some(track_id.as_str()) {
+                return;
+            }
+            self.send(Command::Seek((position as f64 / 1_000_000.0).max(0.0)));
+        }
+
+        fn open_uri(&self, _uri: String) -> zbus::fdo::Result<()> {
+            Err(zbus::fdo::Error::NotSupported(
+                "V1 cannot open URIs".to_owned(),
+            ))
+        }
+
+        #[zbus(property)]
+        fn playback_status(&self) -> String {
+            match &self.shared().track {
+                Some(track) if track.playing => "Playing",
+                Some(_) => "Paused",
+                None => "Stopped",
+            }
+            .to_owned()
+        }
+
+        #[zbus(property)]
+        fn metadata(&self) -> HashMap<String, OwnedValue> {
+            let shared = self.shared();
+            metadata_of(&shared)
+        }
+
+        #[zbus(property)]
+        fn position(&self) -> i64 {
+            self.shared()
+                .track
+                .as_ref()
+                .map_or(0, |track| seconds_to_micros(track.position_now()))
+        }
+
+        #[zbus(property)]
+        fn volume(&self) -> f64 {
+            self.shared().volume
+        }
+
+        #[zbus(property)]
+        fn set_volume(&self, volume: f64) {
+            self.send(Command::Volume(volume.clamp(0.0, 1.0)));
+        }
+
+        #[zbus(property)]
+        fn rate(&self) -> f64 {
+            1.0
+        }
+
+        #[zbus(property)]
+        fn minimum_rate(&self) -> f64 {
+            1.0
+        }
+
+        #[zbus(property)]
+        fn maximum_rate(&self) -> f64 {
+            1.0
+        }
+
+        #[zbus(property)]
+        fn can_go_next(&self) -> bool {
+            true
+        }
+
+        #[zbus(property)]
+        fn can_go_previous(&self) -> bool {
+            true
+        }
+
+        #[zbus(property)]
+        fn can_play(&self) -> bool {
+            true
+        }
+
+        #[zbus(property)]
+        fn can_pause(&self) -> bool {
+            true
+        }
+
+        #[zbus(property)]
+        fn can_seek(&self) -> bool {
+            true
+        }
+
+        #[zbus(property)]
+        fn can_control(&self) -> bool {
+            true
+        }
+
+        #[zbus(property)]
+        fn loop_status(&self) -> String {
+            "None".to_owned()
+        }
+
+        #[zbus(property)]
+        fn shuffle(&self) -> bool {
+            false
+        }
+    }
+
+    /// The `org.mpris.MediaPlayer2` root interface. V1 cannot be raised or quit through D-Bus,
+    /// so those capabilities are reported false.
+    struct Root;
+
+    #[zbus::interface(name = "org.mpris.MediaPlayer2")]
+    impl Root {
+        fn raise(&self) {}
+        fn quit(&self) {}
+
+        #[zbus(property)]
+        fn identity(&self) -> String {
+            "V1".to_owned()
+        }
+
+        #[zbus(property)]
+        fn desktop_entry(&self) -> String {
+            "v1".to_owned()
+        }
+
+        #[zbus(property)]
+        fn supported_uri_schemes(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        #[zbus(property)]
+        fn supported_mime_types(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        #[zbus(property)]
+        fn can_quit(&self) -> bool {
+            false
+        }
+
+        #[zbus(property)]
+        fn can_raise(&self) -> bool {
+            false
+        }
+
+        #[zbus(property)]
+        fn has_track_list(&self) -> bool {
+            false
+        }
+
+        #[zbus(property)]
+        fn can_set_fullscreen(&self) -> bool {
+            false
+        }
+
+        #[zbus(property)]
+        fn fullscreen(&self) -> bool {
+            false
+        }
+    }
+
+    /// The MPRIS metadata dictionary for the current track.
+    fn metadata_of(shared: &Shared) -> HashMap<String, OwnedValue> {
+        let mut metadata = HashMap::new();
+        let Some(track) = &shared.track else {
+            metadata.insert("mpris:trackid".to_owned(), path_value(NO_TRACK));
+            return metadata;
+        };
+        metadata.insert("mpris:trackid".to_owned(), path_value(&track.path()));
+        metadata.insert(
+            "mpris:length".to_owned(),
+            OwnedValue::from(seconds_to_micros(track.duration)),
+        );
+        metadata.insert(
+            "xesam:title".to_owned(),
+            OwnedValue::from(zbus::zvariant::Str::from(track.title.as_str())),
+        );
+        metadata.insert(
+            "xesam:artist".to_owned(),
+            OwnedValue::try_from(Value::from(vec![track.artist.clone()]))
+                .expect("an artist array is a D-Bus value"),
+        );
+        if let Some(album) = track.album.as_deref().filter(|album| !album.is_empty()) {
+            metadata.insert(
+                "xesam:album".to_owned(),
+                OwnedValue::from(zbus::zvariant::Str::from(album)),
+            );
+        }
+        metadata
+    }
+
+    fn path_value(path: &str) -> OwnedValue {
+        let path = ObjectPath::try_from(path).expect("a well-formed MPRIS track path");
+        OwnedValue::from(path)
+    }
+
+    fn seconds_to_micros(seconds: f64) -> i64 {
+        if !seconds.is_finite() || seconds <= 0.0 {
+            return 0;
+        }
+        (seconds * 1_000_000.0).round().clamp(0.0, i64::MAX as f64) as i64
+    }
+
+    /// Announce changed player properties. An empty map is not worth a signal.
+    fn announce(emitter: &SignalEmitter<'_>, changed: HashMap<String, Value<'static>>) {
+        if changed.is_empty() {
+            return;
+        }
+        let body = (PLAYER_INTERFACE, changed, Vec::<String>::new());
+        let _ = zbus::block_on(emitter.emit(
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &body,
+        ));
+    }
+
+    fn announce_seeked(emitter: &SignalEmitter<'_>, position: f64) {
+        let _ =
+            zbus::block_on(emitter.emit(PLAYER_INTERFACE, "Seeked", &seconds_to_micros(position)));
+    }
+
+    /// Serve the MPRIS interfaces until the UI thread closes the channel.
+    fn serve(updates: Receiver<Update>, commands: SyncSender<Command>) {
+        let Ok(connection) = Connection::session() else {
+            return;
+        };
+        // Another copy of V1 (or a stale name owner) wins the name; stay quiet then.
+        if connection.request_name(BUS_NAME).is_err() {
+            return;
+        }
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let player = Player {
+            shared: Arc::clone(&shared),
+            commands,
+        };
+        if connection.object_server().at(OBJECT_PATH, Root).is_err() {
+            return;
+        }
+        if connection.object_server().at(OBJECT_PATH, player).is_err() {
+            return;
+        }
+        let emitter = match connection
+            .object_server()
+            .interface::<_, Player>(OBJECT_PATH)
+        {
+            Ok(reference) => reference.signal_emitter().clone(),
+            Err(_) => return,
+        };
+
+        let mut announced_volume = -1.0;
+        loop {
+            // Nothing here is periodic: the player's position is interpolated from the last
+            // snapshot, and every real change arrives on the channel. Block until one does.
+            let update = match updates.recv() {
+                Ok(update) => update,
+                Err(_) => return,
+            };
+            let mut changed: HashMap<String, Value<'static>> = HashMap::new();
+            match update {
+                Update::Stop => return,
+                Update::Clear => {
+                    let mut shared = shared
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if shared.track.take().is_some() {
+                        changed.insert("Metadata".to_owned(), Value::from(metadata_of(&shared)));
+                        changed.insert("PlaybackStatus".to_owned(), Value::from("Stopped"));
+                    }
+                }
+                Update::Snapshot(snapshot) => {
+                    let mut shared = shared
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let same_track = shared.track.as_ref().is_some_and(|track| {
+                        track.title == snapshot.title
+                            && track.artist == snapshot.artist
+                            && track.album == snapshot.album
+                    });
+                    let mut seeked = None;
+                    let metadata_changed = if same_track {
+                        let track = shared.track.as_mut().expect("same track exists");
+                        let playing_changed = track.playing != snapshot.playing;
+                        let length_changed = (track.duration - snapshot.duration).abs() > 0.5;
+                        // Ordinary playback has moved the position since the last snapshot, so
+                        // compare against where it should have reached, not where it was then.
+                        let expected = track.position_now();
+                        if (snapshot.position - expected).abs() > SEEK_JUMP {
+                            seeked = Some(snapshot.position);
+                        }
+                        track.position = snapshot.position;
+                        track.at = Instant::now();
+                        track.playing = snapshot.playing;
+                        track.duration = snapshot.duration;
+                        if playing_changed {
+                            let status = if snapshot.playing {
+                                "Playing"
+                            } else {
+                                "Paused"
+                            };
+                            changed.insert("PlaybackStatus".to_owned(), Value::from(status));
+                        }
+                        length_changed
+                    } else {
+                        shared.next_id += 1;
+                        let id = shared.next_id;
+                        shared.track = Some(Track {
+                            title: snapshot.title,
+                            artist: snapshot.artist,
+                            album: snapshot.album,
+                            duration: snapshot.duration,
+                            position: snapshot.position,
+                            playing: snapshot.playing,
+                            at: Instant::now(),
+                            id,
+                        });
+                        changed.insert(
+                            "PlaybackStatus".to_owned(),
+                            Value::from(if snapshot.playing {
+                                "Playing"
+                            } else {
+                                "Paused"
+                            }),
+                        );
+                        true
+                    };
+                    if metadata_changed {
+                        changed.insert("Metadata".to_owned(), Value::from(metadata_of(&shared)));
+                    }
+                    let volume = f64::from(snapshot.volume);
+                    if (volume - announced_volume).abs() > 0.005 {
+                        shared.volume = volume;
+                        announced_volume = volume;
+                        changed.insert("Volume".to_owned(), Value::from(volume));
+                    }
+                    if let Some(position) = seeked {
+                        announce_seeked(&emitter, position);
+                    }
+                }
+            }
+            announce(&emitter, changed);
+        }
+    }
+
+    /// The identity and state last sent to D-Bus, so a frame that changes nothing allocates
+    /// nothing and crosses no thread boundary.
+    struct Shown {
+        title: String,
+        artist: String,
+        album: Option<String>,
+        playing: bool,
+        duration: f64,
+        volume: f32,
+    }
+
+    impl Shown {
+        fn matches(&self, info: &MediaInfo<'_>) -> bool {
+            self.title == info.title
+                && self.artist == info.artist
+                && self.album.as_deref() == info.album
+                && self.playing == info.playing
+                && (self.duration - info.duration).abs() < 0.5
+                && (self.volume - info.volume).abs() < 0.005
+        }
+    }
+
+    pub struct MediaControls {
+        updates: Sender<Update>,
+        shown: Option<Shown>,
+        last_sent: Option<Instant>,
+        /// The position in the last snapshot, for telling a seek from normal playback.
+        last_position: f64,
+    }
+
+    impl MediaControls {
+        pub fn new<F>(_window: &winit::window::Window, on_command: F) -> Option<Self>
+        where
+            F: Fn(Command) + Send + 'static,
+        {
+            let (updates, receiver) = mpsc::channel();
+            let (commands, command_receiver) = mpsc::sync_channel(64);
+            std::thread::Builder::new()
+                .name("v1-mpris".to_owned())
+                .spawn(move || serve(receiver, commands))
+                .ok()?;
+            // Transport calls arrive on zbus threads; apply them on the UI's own thread through
+            // the callback the host installs.
+            std::thread::Builder::new()
+                .name("v1-mpris-commands".to_owned())
+                .spawn(move || {
+                    while let Ok(command) = command_receiver.recv() {
+                        on_command(command);
+                    }
+                })
+                .ok()?;
+            Some(Self {
+                updates,
+                shown: None,
+                last_sent: None,
+                last_position: 0.0,
+            })
+        }
+
+        pub fn update(&mut self, info: Option<&MediaInfo<'_>>) {
+            let Some(info) = info else {
+                if self.shown.take().is_some() {
+                    let _ = self.updates.send(Update::Clear);
+                }
+                return;
+            };
+            // Borrowed comparison: an unchanged frame costs no allocation at all.
+            let changed = self.shown.as_ref().is_none_or(|shown| !shown.matches(info));
+            let moved = match (self.shown.as_ref(), self.last_sent) {
+                (Some(shown), Some(sent)) => {
+                    let expected = self.last_position
+                        + if shown.playing {
+                            sent.elapsed().as_secs_f64()
+                        } else {
+                            0.0
+                        };
+                    (info.position - expected).abs() > DRIFT
+                }
+                _ => true,
+            };
+            if !changed && !moved {
+                return;
+            }
+            let snapshot = Snapshot {
+                title: info.title.to_owned(),
+                artist: info.artist.to_owned(),
+                album: info.album.map(str::to_owned),
+                position: info.position,
+                duration: info.duration,
+                playing: info.playing,
+                volume: info.volume,
+            };
+            if self.updates.send(Update::Snapshot(snapshot)).is_ok() {
+                self.shown = Some(Shown {
+                    title: info.title.to_owned(),
+                    artist: info.artist.to_owned(),
+                    album: info.album.map(str::to_owned),
+                    playing: info.playing,
+                    duration: info.duration,
+                    volume: info.volume,
+                });
+                self.last_sent = Some(Instant::now());
+                self.last_position = info.position;
+            }
+        }
+    }
+
+    impl Drop for MediaControls {
+        fn drop(&mut self) {
+            let _ = self.updates.send(Update::Stop);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn positions_convert_to_microseconds() {
+            assert_eq!(seconds_to_micros(0.0), 0);
+            assert_eq!(seconds_to_micros(-1.0), 0);
+            assert_eq!(seconds_to_micros(f64::NAN), 0);
+            assert_eq!(seconds_to_micros(1.5), 1_500_000);
+        }
+
+        #[test]
+        fn metadata_carries_the_track_fields_mpris_clients_read() {
+            let shared = Shared {
+                track: Some(Track {
+                    title: "Around the World".to_owned(),
+                    artist: "Daft Punk".to_owned(),
+                    album: Some("Homework".to_owned()),
+                    duration: 429.0,
+                    position: 0.0,
+                    playing: true,
+                    at: Instant::now(),
+                    id: 7,
+                }),
+                volume: 0.8,
+                next_id: 7,
+            };
+            let metadata = metadata_of(&shared);
+            assert_eq!(
+                metadata.get("mpris:length"),
+                Some(&OwnedValue::from(429_000_000i64))
+            );
+            let title: String = metadata["xesam:title"].clone().try_into().unwrap();
+            assert_eq!(title, "Around the World");
+            let artists: Vec<String> = metadata["xesam:artist"].clone().try_into().unwrap();
+            assert_eq!(artists, ["Daft Punk"]);
+            let track_id: OwnedObjectPath = metadata["mpris:trackid"].clone().try_into().unwrap();
+            assert_eq!(track_id.as_str(), "/org/v1/track/7");
+        }
+
+        #[test]
+        fn stopped_metadata_names_the_no_track_path() {
+            let metadata = metadata_of(&Shared::default());
+            let track_id: OwnedObjectPath = metadata["mpris:trackid"].clone().try_into().unwrap();
+            assert_eq!(track_id.as_str(), NO_TRACK);
         }
     }
 }

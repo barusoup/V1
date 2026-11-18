@@ -96,6 +96,69 @@ impl GpuTexture {
         )
     }
 
+    pub fn from_bc7(
+        ctx: &Arc<GpuContext>,
+        label: &str,
+        blocks: &[u8],
+        width: u32,
+        height: u32,
+        sampler: SamplerDesc,
+    ) -> Self {
+        let w = width.max(1);
+        let h = height.max(1);
+        let bw = w.div_ceil(4) as usize;
+        let bh = h.div_ceil(4) as usize;
+        let expected = bw * bh * 16;
+        assert!(
+            blocks.len() == expected,
+            "{label}: {} bytes for {w}x{h} BC7 (expected {expected})",
+            blocks.len()
+        );
+        let image = ctx.create_image(
+            label,
+            w,
+            h,
+            MTLPixelFormat::BC7_RGBAUnorm_sRGB,
+            MTLTextureUsage::ShaderRead,
+        );
+        let row_bytes = bw * 16;
+        unsafe {
+            image.texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                MTLRegion {
+                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: MTLSize {
+                        width: w as usize,
+                        height: h as usize,
+                        depth: 1,
+                    },
+                },
+                0,
+                NonNull::new_unchecked(blocks.as_ptr() as *mut _),
+                row_bytes,
+            );
+        }
+        Self::finish(ctx, image, None, sampler, (w, h), 1, TextureFormat::Srgb)
+    }
+
+    pub fn blank_bc7(
+        ctx: &Arc<GpuContext>,
+        label: &str,
+        width: u32,
+        height: u32,
+        sampler: SamplerDesc,
+    ) -> Self {
+        let w = width.max(1);
+        let h = height.max(1);
+        let image = ctx.create_image(
+            label,
+            w,
+            h,
+            MTLPixelFormat::BC7_RGBAUnorm_sRGB,
+            MTLTextureUsage::ShaderRead,
+        );
+        Self::finish(ctx, image, None, sampler, (w, h), 1, TextureFormat::Srgb)
+    }
+
     pub fn blank(
         ctx: &Arc<GpuContext>,
         label: &str,
@@ -127,6 +190,69 @@ impl GpuTexture {
             mip_levels,
             options.format,
         )
+    }
+
+    pub fn from_bc7(
+        ctx: &Arc<GpuContext>,
+        label: &str,
+        blocks: &[u8],
+        width: u32,
+        height: u32,
+        sampler: SamplerDesc,
+    ) -> Self {
+        let w = width.max(1);
+        let h = height.max(1);
+        let bw = w.div_ceil(4) as usize;
+        let bh = h.div_ceil(4) as usize;
+        let expected = bw * bh * 16;
+        assert!(
+            blocks.len() == expected,
+            "{label}: {} bytes for {w}x{h} BC7 (expected {expected})",
+            blocks.len()
+        );
+        let image = ctx.create_image(
+            label,
+            w,
+            h,
+            MTLPixelFormat::BC7_RGBAUnorm_sRGB,
+            MTLTextureUsage::ShaderRead,
+        );
+        let row_bytes = bw * 16;
+        unsafe {
+            image.texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                MTLRegion {
+                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: MTLSize {
+                        width: w as usize,
+                        height: h as usize,
+                        depth: 1,
+                    },
+                },
+                0,
+                NonNull::new_unchecked(blocks.as_ptr() as *mut _),
+                row_bytes,
+            );
+        }
+        Self::finish(ctx, image, None, sampler, (w, h), 1, TextureFormat::Srgb)
+    }
+
+    pub fn blank_bc7(
+        ctx: &Arc<GpuContext>,
+        label: &str,
+        width: u32,
+        height: u32,
+        sampler: SamplerDesc,
+    ) -> Self {
+        let w = width.max(1);
+        let h = height.max(1);
+        let image = ctx.create_image(
+            label,
+            w,
+            h,
+            MTLPixelFormat::BC7_RGBAUnorm_sRGB,
+            MTLTextureUsage::ShaderRead,
+        );
+        Self::finish(ctx, image, None, sampler, (w, h), 1, TextureFormat::Srgb)
     }
 
     pub fn white(ctx: &Arc<GpuContext>) -> Self {
@@ -259,6 +385,9 @@ impl GpuTexture {
     }
 
     pub fn estimated_bytes(&self) -> u64 {
+        if self.mtl_format == MTLPixelFormat::BC7_RGBAUnorm_sRGB {
+            return (self.width as u64).div_ceil(4) * (self.height as u64).div_ceil(4) * 16;
+        }
         let bpp = match self.mtl_format {
             MTLPixelFormat::R8Unorm => 1u64,
             _ => 4u64,

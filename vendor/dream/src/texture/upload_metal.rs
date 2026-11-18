@@ -43,11 +43,19 @@ impl TextureUploader {
 
     pub fn upload(&mut self, texture: &GpuTexture, pixels: &[u8]) {
         let (w, h) = texture.size();
-        let bytes = (w as u64) * (h as u64) * 4;
+        let is_bc7 = texture.raw_texture().pixelFormat()
+            == objc2_metal::MTLPixelFormat::BC7_RGBAUnorm_sRGB;
+        let (bytes, row_bytes) = if is_bc7 {
+            let bw = (w as u64).div_ceil(4);
+            let bh = (h as u64).div_ceil(4);
+            (bw * bh * 16, (bw as usize) * 16)
+        } else {
+            ((w as u64) * (h as u64) * 4, (w as usize) * 4)
+        };
         assert_eq!(
             pixels.len() as u64,
             bytes,
-            "TextureUploader::upload: expected {bytes} bytes for {w}x{h} RGBA8, got {}",
+            "TextureUploader::upload: expected {bytes} bytes for {w}x{h}, got {}",
             pixels.len()
         );
         let idx = self.next;
@@ -73,14 +81,18 @@ impl TextureUploader {
             .commandBuffer()
             .expect("create upload command buffer");
         let blit = cmd.blitCommandEncoder().expect("blit encoder");
-        let row_bytes = (w as usize) * 4;
         let staging_buf = &slot.staging.as_ref().unwrap().buffer;
+        let image_bytes = if is_bc7 {
+            row_bytes * (h as usize).div_ceil(4)
+        } else {
+            row_bytes * (h as usize)
+        };
         unsafe {
             blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
                 staging_buf,
                 0,
                 row_bytes,
-                row_bytes * (h as usize),
+                image_bytes,
                 MTLSize {
                     width: w as usize,
                     height: h as usize,

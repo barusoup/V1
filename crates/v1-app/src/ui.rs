@@ -1055,6 +1055,10 @@ impl State {
         self.library.set_downloading(self.prefs.downloads());
     }
 
+    pub fn set_background_bc7(&self, enabled: bool) {
+        self.background.set_bc7(enabled);
+    }
+
     /// Close the track menu, if one is open. Escape does this, along with the download
     /// confirmation, which is the other thing that sits over the page.
     pub fn close_menu(&mut self) {
@@ -1067,6 +1071,9 @@ impl State {
     pub fn pump(&mut self) {
         while let Ok(done) = self.background_prep_rx.try_recv() {
             if done.id != self.background_prep_id {
+                if let Ok(path) = done.result {
+                    let _ = std::fs::remove_file(path);
+                }
                 continue;
             }
             self.background_prep_busy = false;
@@ -1077,6 +1084,7 @@ impl State {
                         self.prefs.set_background(Some(&path));
                         self.prefs.set_background_enabled(true);
                         sync_background(self);
+                        prune_backgrounds(self);
                     }
                     BackgroundPrepTarget::Theme(editing, session) => {
                         if background_theme_target_is_current(
@@ -1088,6 +1096,9 @@ impl State {
                         ) {
                             self.settings.theme_background =
                                 Some(path.to_string_lossy().into_owned());
+                            prune_backgrounds(self);
+                        } else {
+                            let _ = std::fs::remove_file(path);
                         }
                     }
                 },
@@ -1545,6 +1556,7 @@ impl State {
                 position: 0.0,
                 duration: self.known_length(hit) as f64,
                 playing: false,
+                volume: self.volume,
             });
         }
         if let Some(track) = &self.now {
@@ -1555,6 +1567,7 @@ impl State {
                 position: track.position as f64,
                 duration: track.duration as f64,
                 playing: !track.paused,
+                volume: self.volume,
             });
         }
         self.demo_track
@@ -1566,6 +1579,7 @@ impl State {
                 position: track.position as f64,
                 duration: track.duration as f64,
                 playing: !track.paused,
+                volume: self.volume,
             })
     }
 
@@ -1585,6 +1599,7 @@ impl State {
             Command::Next => self.next(),
             Command::Previous => self.back(),
             Command::Stop => self.set_playing(false),
+            Command::Volume(volume) => self.set_volume(volume as f32),
             Command::Seek(seconds) => {
                 if let Some(track) = self.now.as_mut() {
                     let upper = if track.duration > 0.0 {
@@ -2742,6 +2757,7 @@ impl State {
                 self.background_prep_error = None;
                 self.prefs.set_background(None);
                 sync_background(self);
+                prune_backgrounds(self);
             }
             Action::ToggleGlobalBackground(enabled) => {
                 self.cancel_background_prep();
@@ -4865,13 +4881,7 @@ fn lyric_text_outlined(
 }
 
 /// An optional icon, title and hint, centred in `main`, for when there is nothing to show.
-fn empty_state(
-    cx: &mut Cx,
-    main: Rect,
-    icon: impl Into<Option<Icon>>,
-    title: &str,
-    hint: &str,
-) {
+fn empty_state(cx: &mut Cx, main: Rect, icon: impl Into<Option<Icon>>, title: &str, hint: &str) {
     let center_x = main.x + main.w * 0.5;
     let y = main.h * 0.5 - 8.0;
     if let Some(icon) = icon.into() {
@@ -8791,6 +8801,23 @@ fn sync_background(state: &mut State) {
             state.gpu.clear_background();
         }
     }
+}
+
+fn prune_backgrounds(state: &State) {
+    let mut keep: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(global) = state.prefs.background() {
+        keep.push(global.to_path_buf());
+    }
+    for t in &state.themes {
+        if let Some(bg) = t.background.as_deref() {
+            keep.push(std::path::PathBuf::from(bg));
+        }
+    }
+    if let Some(editing_bg) = state.settings.theme_background.as_deref() {
+        keep.push(std::path::PathBuf::from(editing_bg));
+    }
+    let refs: Vec<&std::path::Path> = keep.iter().map(std::path::PathBuf::as_path).collect();
+    crate::background::prune_unused_backgrounds(&state.data_dir, &refs);
 }
 
 fn set_theme(state: &mut State, name: Option<String>) {

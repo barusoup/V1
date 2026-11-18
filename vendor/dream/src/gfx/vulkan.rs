@@ -62,6 +62,8 @@ pub struct GpuContext {
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Whether dynamic rendering is core (1.3) or the KHR extension.
     pub core_1_3: bool,
+    /// Whether hardware BC1-BC7 block-compressed textures are supported.
+    supports_bc: bool,
     /// Monotonic counters advanced by `submit_tracked`/`confirm_completed`.
     /// On this in-order queue, confirming serial N implies every earlier
     /// submission finished, so `fetch_max` is sound.
@@ -210,8 +212,10 @@ impl GpuContext {
         // feature only when the adapter supports it so those samplers are
         // valid to create.
         let supported_features = unsafe { instance.get_physical_device_features(physical_device) };
+        let supports_bc = supported_features.texture_compression_bc == vk::TRUE;
         let base_features = vk::PhysicalDeviceFeatures::default()
             .sampler_anisotropy(supported_features.sampler_anisotropy == vk::TRUE)
+            .texture_compression_bc(supports_bc)
             // The scene pass blends colour attachment 0 while leaving the
             // velocity attachment unblended, which requires a different blend
             // state per attachment. Without this feature those pipelines are
@@ -282,6 +286,7 @@ impl GpuContext {
             memory_properties,
             // Vulkan 1.3 is a hard requirement: see `pick_physical_device`.
             core_1_3: true,
+            supports_bc,
             submitted_serial: AtomicU64::new(0),
             completed_serial: AtomicU64::new(0),
             blocking_submissions: AtomicU64::new(0),
@@ -318,6 +323,11 @@ impl GpuContext {
 
     pub fn device(&self) -> &ash::Device {
         &self.device
+    }
+
+    /// Whether hardware BC1–BC7 block-compressed textures are supported.
+    pub fn supports_bc(&self) -> bool {
+        self.supports_bc
     }
 
     /// Live GPU allocation bytes and count, from the allocator's own books.

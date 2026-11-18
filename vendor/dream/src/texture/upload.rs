@@ -118,13 +118,20 @@ impl TextureUploader {
         assert!(
             matches!(
                 texture.vk_format,
-                vk::Format::R8G8B8A8_SRGB | vk::Format::R8G8B8A8_UNORM
+                vk::Format::R8G8B8A8_SRGB
+                    | vk::Format::R8G8B8A8_UNORM
+                    | vk::Format::BC7_SRGB_BLOCK
             ),
-            "dynamic uploads need an RGBA8 texture"
+            "dynamic uploads need an RGBA8 or BC7 texture"
         );
+        let expected_bytes = if texture.vk_format == vk::Format::BC7_SRGB_BLOCK {
+            texture.width.div_ceil(4) as usize * texture.height.div_ceil(4) as usize * 16
+        } else {
+            texture.width as usize * texture.height as usize * 4
+        };
         assert_eq!(
             pixels.len(),
-            texture.width as usize * texture.height as usize * 4,
+            expected_bytes,
             "pixel buffer must match the texture's dimensions"
         );
 

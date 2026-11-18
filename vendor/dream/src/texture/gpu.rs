@@ -179,6 +179,108 @@ impl GpuTexture {
         )
     }
 
+    /// Upload BC7 sRGB 4x4-block-compressed pixels (1 byte/pixel, single mip).
+    /// `blocks.len()` must equal `width.div_ceil(4) * height.div_ceil(4) * 16`.
+    pub fn from_bc7(
+        ctx: &Arc<GpuContext>,
+        label: &str,
+        blocks: &[u8],
+        width: u32,
+        height: u32,
+        sampler: SamplerDesc,
+    ) -> Self {
+        let expected = width.div_ceil(4) as usize * height.div_ceil(4) as usize * 16;
+        assert!(
+            blocks.len() == expected,
+            "{label}: {} bytes for {width}x{height} BC7 (expected {expected})",
+            blocks.len()
+        );
+        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+        let format = vk::Format::BC7_SRGB_BLOCK;
+        let image = ctx.create_image_mips(label, width, height, format, usage, 1);
+
+        let mut staging = ctx.create_transfer_buffer(label, (blocks.len() as u64).max(16));
+        staging.write(0, blocks);
+        let device = ctx.device().clone();
+        let raw = image.image;
+        ctx.one_shot(|cmd| unsafe {
+            vulkan::image_barrier(
+                &device,
+                cmd,
+                raw,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::ImageAspectFlags::COLOR,
+            );
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+            device.cmd_copy_buffer_to_image(
+                cmd,
+                staging.buffer,
+                raw,
+                vk::ImageLayout::GENERAL,
+                &[region],
+            );
+            vulkan::image_barrier(
+                &device,
+                cmd,
+                raw,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::ImageAspectFlags::COLOR,
+            );
+        });
+        Self::finish(ctx, image, sampler, (width, height), 1, (TextureFormat::Srgb, format))
+    }
+
+    /// A single-mip BC7 sRGB texture ready to receive streaming uploads via [`TextureUploader`].
+    pub fn blank_bc7(
+        ctx: &Arc<GpuContext>,
+        label: &str,
+        width: u32,
+        height: u32,
+        sampler: SamplerDesc,
+    ) -> Self {
+        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+        let format = vk::Format::BC7_SRGB_BLOCK;
+        let image = ctx.create_image_mips(label, width, height, format, usage, 1);
+        let device = ctx.device().clone();
+        let raw = image.image;
+        ctx.one_shot(|cmd| unsafe {
+            vulkan::image_barrier(
+                &device,
+                cmd,
+                raw,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_WRITE,
+                vk::ImageAspectFlags::COLOR,
+            );
+        });
+        Self::finish(ctx, image, sampler, (width, height), 1, (TextureFormat::Srgb, format))
+    }
+
     /// An all-zero texture, cleared on the GPU (no staging upload). Used for
     /// atlas pages that fill in lazily and for game render targets.
     pub fn blank(
@@ -469,6 +571,17 @@ impl GpuTexture {
 
     /// Approximate GPU payload in bytes, mip chain included.
     pub fn estimated_bytes(&self) -> u64 {
+        if self.vk_format == vk::Format::BC7_SRGB_BLOCK {
+            let mut bytes = 0u64;
+            let mut w = self.width as u64;
+            let mut h = self.height as u64;
+            for _ in 0..self.mip_levels {
+                bytes += w.div_ceil(4) * h.div_ceil(4) * 16;
+                w = (w / 2).max(1);
+                h = (h / 2).max(1);
+            }
+            return bytes;
+        }
         let bytes_per_texel: u64 = match self.vk_format {
             vk::Format::R8_UNORM | vk::Format::R8_SRGB => 1,
             vk::Format::R8G8_UNORM | vk::Format::R8G8_SRGB => 2,

@@ -15,6 +15,7 @@ use dream::gfx::GpuContext;
 use dream::texture::{GpuTexture, SamplerDesc, TextureFormat, TextureOptions, TextureUploader};
 use dream::ui::Color;
 
+use crate::background::{BackgroundImage, BackgroundPixels, encode_bc7_rgba};
 use crate::icons::{self, Icon};
 use crate::theme;
 
@@ -65,6 +66,7 @@ pub struct Gpu {
     /// The custom background, softened on a loading thread and uploaded here.
     pub background: Option<Arc<GpuTexture>>,
     background_animated: bool,
+    background_bc7: bool,
     /// Reuses staging buffers and the same single-mip texture for decoded
     /// animation frames; dropping a texture per frame otherwise churns GPU
     /// allocations and forces a synchronous upload.
@@ -72,7 +74,7 @@ pub struct Gpu {
     /// Its pixel size, for fitting it to the window without stretching it.
     pub background_size: (u32, u32),
     /// A softened background waiting to be uploaded, newest only.
-    pub incoming_background: Option<CoverImage>,
+    pub incoming_background: Option<BackgroundImage>,
     /// Icon sizes the last frame wanted and did not have.
     pub wanted_icons: HashSet<(Icon, u32)>,
     pub incoming: Vec<CoverImage>,
@@ -88,6 +90,7 @@ impl Gpu {
         self.background_uploader = None;
         self.background = None;
         self.background_animated = false;
+        self.background_bc7 = false;
         self.background_size = (0, 0);
         self.incoming_background = None;
     }
@@ -137,65 +140,100 @@ impl Gpu {
         // The background is one texture, so it goes first: a frame that asks for it is about to
         // show it.
         if let Some(background) = self.incoming_background.take() {
-            let animated = background.url.starts_with("background:anim:");
-            let same_size = animated
-                && self.background_animated
-                && self
-                    .background
-                    .as_ref()
-                    .is_some_and(|texture| texture.size() == (background.width, background.height));
-            if same_size {
-                let uploader = self
-                    .background_uploader
-                    .get_or_insert_with(|| TextureUploader::new(ctx));
-                uploader.upload(
-                    self.background.as_deref().expect("same-size background"),
-                    &background.rgba,
-                );
-                self.background_size = (background.width, background.height);
-            } else {
-                // An in-flight copy still owns the old texture as its target.
-                // Retire it before replacing or dropping that allocation.
-                if let Some(uploader) = self.background_uploader.as_mut() {
-                    uploader.wait_idle();
+            let animated = background.animated;
+            let use_bc7 = ctx.supports_bc();
+            let payload = match (use_bc7, background.pixels) {
+                (true, BackgroundPixels::Bc7(blocks)) => blocks,
+                (true, BackgroundPixels::Rgba(rgba)) => {
+                    encode_bc7_rgba(&rgba, background.width, background.height)
                 }
-                let options = TextureOptions {
-                    format: TextureFormat::Srgb,
-                    sampler: SamplerDesc::default(),
-                    mip_levels: if animated { Some(1) } else { None },
-                };
-                let texture = if animated {
-                    GpuTexture::blank(
-                        ctx,
-                        "background",
-                        background.width,
-                        background.height,
-                        options,
-                    )
-                } else {
-                    GpuTexture::from_rgba8(
-                        ctx,
-                        "background",
-                        &background.rgba,
-                        background.width,
-                        background.height,
-                        options,
-                    )
-                };
-                self.background_size = (background.width, background.height);
-                self.background = Some(Arc::new(texture));
-                self.background_animated = animated;
-                if !animated {
-                    self.background_uploader = None;
-                }
-                if animated {
+                (false, BackgroundPixels::Rgba(rgba)) => rgba,
+                // Only reachable if GPU lacked BC7; background.rs is synced with ctx.supports_bc().
+                (false, BackgroundPixels::Bc7(_)) => Vec::new(),
+            };
+            if !payload.is_empty() {
+                let same_size = animated
+                    && self.background_animated
+                    && self.background_bc7 == use_bc7
+                    && self
+                        .background
+                        .as_ref()
+                        .is_some_and(|texture| texture.size() == (background.width, background.height));
+                if same_size {
                     let uploader = self
                         .background_uploader
                         .get_or_insert_with(|| TextureUploader::new(ctx));
                     uploader.upload(
-                        self.background.as_deref().expect("just created background"),
-                        &background.rgba,
+                        self.background.as_deref().expect("same-size background"),
+                        &payload,
                     );
+                    self.background_size = (background.width, background.height);
+                } else {
+                    // An in-flight copy still owns the old texture as its target.
+                    // Retire it before replacing or dropping that allocation.
+                    if let Some(uploader) = self.background_uploader.as_mut() {
+                        uploader.wait_idle();
+                    }
+                    let texture = if use_bc7 {
+                        if animated {
+                            GpuTexture::blank_bc7(
+                                ctx,
+                                "background",
+                                background.width,
+                                background.height,
+                                SamplerDesc::default(),
+                            )
+                        } else {
+                            GpuTexture::from_bc7(
+                                ctx,
+                                "background",
+                                &payload,
+                                background.width,
+                                background.height,
+                                SamplerDesc::default(),
+                            )
+                        }
+                    } else {
+                        let options = TextureOptions {
+                            format: TextureFormat::Srgb,
+                            sampler: SamplerDesc::default(),
+                            mip_levels: Some(1),
+                        };
+                        if animated {
+                            GpuTexture::blank(
+                                ctx,
+                                "background",
+                                background.width,
+                                background.height,
+                                options,
+                            )
+                        } else {
+                            GpuTexture::from_rgba8(
+                                ctx,
+                                "background",
+                                &payload,
+                                background.width,
+                                background.height,
+                                options,
+                            )
+                        }
+                    };
+                    self.background_size = (background.width, background.height);
+                    self.background = Some(Arc::new(texture));
+                    self.background_animated = animated;
+                    self.background_bc7 = use_bc7;
+                    if !animated {
+                        self.background_uploader = None;
+                    }
+                    if animated {
+                        let uploader = self
+                            .background_uploader
+                            .get_or_insert_with(|| TextureUploader::new(ctx));
+                        uploader.upload(
+                            self.background.as_deref().expect("just created background"),
+                            &payload,
+                        );
+                    }
                 }
             }
         }

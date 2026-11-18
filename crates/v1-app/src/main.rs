@@ -226,6 +226,7 @@ fn make_frame(
     size: (f32, f32),
     scale: f32,
 ) -> dream::ui::draw::UiFrame {
+    state.set_background_bc7(renderer.context().supports_bc());
     state.gpu.sync(renderer.context());
     let frame = ui::build(ui, state, input.clone(), pointer, size.0, size.1, scale);
     if state.gpu.wanted_icons.is_empty() {
@@ -301,6 +302,16 @@ impl ApplicationHandler<UserEvent> for Host {
             .with_taskbar_icon(taskbar_icon())
             // Windows 11 rounds the corners of the window itself; no shader work needed.
             .with_corner_preference(CornerPreference::Round);
+        // The desktop pairs a window with its launcher, icon and media controls by the
+        // application id (Wayland) or WM_CLASS (X11). winit cannot know what to call the app, so
+        // name it explicitly; this matches `v1.desktop` and `org.mpris.MediaPlayer2.v1`.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            let attrs = WindowAttributesExtWayland::with_name(attrs, "v1", "v1");
+            WindowAttributesExtX11::with_name(attrs, "v1", "v1")
+        };
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         boot_mark("window created (hidden)");
         self.scale = window.scale_factor() as f32;
@@ -543,10 +554,14 @@ impl ApplicationHandler<UserEvent> for Host {
         // before choosing the wait so the deadline below is the next pending trim, not this one.
         self.idle_maintenance(now);
         // Motion (a transition, a spring, a window drag) is drawn at the monitor's refresh rate, so
-        // it follows the pointer and the animations without a lag. Playback moves the progress bar,
-        // the clock and the equalizer, which are motion too, so it gets the same rate.
-        if self.state.animating() || self.drag.is_some() || self.state.is_playing() {
+        // it follows the pointer and the animations without a lag. Playback on its own only moves
+        // the progress bar, the clock and the equalizer: slow motion, where a high-refresh display
+        // (360 Hz and up) buys nothing but a frame's CPU each time. It gets a capped rate; the
+        // moment there is real motion, the loop goes back to the full refresh rate.
+        if self.state.animating() || self.drag.is_some() {
             self.pace(event_loop, self.frame_period());
+        } else if self.state.is_playing() {
+            self.pace(event_loop, self.playback_period());
         } else if self.state.busy() || self.state.awaiting_covers() {
             self.pace(event_loop, WAITING_FRAME);
         } else {
@@ -579,7 +594,8 @@ impl ApplicationHandler<UserEvent> for Host {
 }
 
 /// How often a frame is drawn while the app waits on the network. A floor on the time between
-/// frames, not a target to reach. (Motion and playback use [`Host::frame_period`] instead.)
+/// frames, not a target to reach. (Motion uses [`Host::frame_period`]; playback uses
+/// [`Host::playback_period`].)
 const WAITING_FRAME: std::time::Duration = std::time::Duration::from_millis(80);
 
 /// How often the app ticks while its window is minimized or fully covered. Nothing is drawn; the
@@ -589,15 +605,29 @@ const HIDDEN_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 /// The rate used when the platform does not report the monitor's refresh rate.
 const FALLBACK_HZ: f32 = 60.0;
 
+/// The highest frame rate used when playback is the only thing moving. The progress bar, clock and
+/// equalizer gain nothing from a 360 Hz display.
+const PLAYBACK_HZ: f32 = 60.0;
+
 impl Host {
-    /// Time between frames while something is moving or playing: one frame per refresh of the
-    /// monitor the window is on, so motion follows the display instead of a fixed ceiling.
+    /// Time between frames while something is moving: one frame per refresh of the monitor the
+    /// window is on, so motion follows the display instead of a fixed ceiling.
     fn frame_period(&self) -> std::time::Duration {
         let hz = self
             .display_hz
             .filter(|hz| hz.is_finite() && *hz > 1.0)
             .unwrap_or(FALLBACK_HZ);
         std::time::Duration::from_secs_f32(1.0 / hz.clamp(10.0, 1000.0))
+    }
+
+    /// Time between frames when playback is the only motion. Above `PLAYBACK_HZ` extra frames
+    /// redraw the same slowly moving bars, so the display's higher rate is not used.
+    fn playback_period(&self) -> std::time::Duration {
+        let hz = self
+            .display_hz
+            .filter(|hz| hz.is_finite() && *hz > 1.0)
+            .unwrap_or(FALLBACK_HZ);
+        std::time::Duration::from_secs_f32(1.0 / hz.clamp(10.0, PLAYBACK_HZ))
     }
 
     /// Whether the window is minimized or fully occluded, so a frame would not be seen.
@@ -714,6 +744,12 @@ impl Host {
         }
     }
 
+    /// Whether the OS sends transport buttons to the media session rather than as key events.
+    /// SMTC is the one that is exclusive; elsewhere the window keeps its key fallback.
+    fn os_owns_media_keys(&self) -> bool {
+        cfg!(windows) && self.media.is_some()
+    }
+
     fn editing(&self) -> bool {
         self.ui.as_ref().is_some_and(|ui| ui.editing())
     }
@@ -772,22 +808,24 @@ impl Host {
                 self.state.toggle_theater();
                 true
             }
-            // Keyboard media keys that Windows delivers as ordinary key events. Most earbuds go
-            // through SMTC instead, and when an SMTC session exists the OS may deliver the key both
-            // ways; guarding on SMTC avoids toggling the song twice for one press.
-            WinitKey::Named(NamedKey::MediaPlayPause) if self.media.is_none() => {
+            // Keyboard media keys delivered as ordinary key events. On Windows most earbuds go
+            // through SMTC instead, and an active SMTC session may see the key both ways; guarding
+            // on it avoids toggling the song twice for one press. Other desktops either bind the
+            // keys themselves (a Wayland compositor usually consumes them) or deliver them here,
+            // so the listener keeps a working fallback.
+            WinitKey::Named(NamedKey::MediaPlayPause) if !self.os_owns_media_keys() => {
                 self.apply_media_command(media::Command::Toggle);
                 true
             }
-            WinitKey::Named(NamedKey::MediaTrackNext) if self.media.is_none() => {
+            WinitKey::Named(NamedKey::MediaTrackNext) if !self.os_owns_media_keys() => {
                 self.apply_media_command(media::Command::Next);
                 true
             }
-            WinitKey::Named(NamedKey::MediaTrackPrevious) if self.media.is_none() => {
+            WinitKey::Named(NamedKey::MediaTrackPrevious) if !self.os_owns_media_keys() => {
                 self.apply_media_command(media::Command::Previous);
                 true
             }
-            WinitKey::Named(NamedKey::MediaStop) if self.media.is_none() => {
+            WinitKey::Named(NamedKey::MediaStop) if !self.os_owns_media_keys() => {
                 self.apply_media_command(media::Command::Stop);
                 true
             }
@@ -906,7 +944,9 @@ impl Host {
     }
 
     fn toggle_fullscreen(&mut self) {
-        let Some(window) = self.window.clone() else { return };
+        let Some(window) = self.window.clone() else {
+            return;
+        };
         let fullscreen = if window.fullscreen().is_some() {
             None
         } else {

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=V1
+GenericName=Music Player
+Comment=Native YouTube Music client
+Exec=v1 %U
+Icon=v1
+Terminal=false
+Categories=AudioVideo;Audio;Player;Music;
+Keywords=music;player;audio;youtube;
+StartupNotify=true
+StartupWMClass=v1

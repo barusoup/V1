@@ -4,6 +4,8 @@
 //! - **Windows:** reads and writes the Win32 clipboard (`CF_UNICODETEXT`,
 //!   UTF-16LE), falling back to an in-process buffer if the clipboard cannot
 //!   be opened (for example in a headless service session).
+//! - **Linux:** the desktop clipboard through Wayland's data-control protocol, or X11 when no
+//!   Wayland session is present (`arboard` chooses).
 //! - **Other platforms:** in-process UTF-8 buffer.
 
 use std::sync::Mutex;
@@ -195,7 +197,41 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+/// Linux: the desktop clipboard, through Wayland's data-control protocol when a compositor
+/// offers it and X11 otherwise.
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// One clipboard per thread. On Wayland the clipboard owns the selection through a
+        /// data-control source, so the handle has to outlive the write.
+        static CLIPBOARD: RefCell<Option<arboard::Clipboard>> = const { RefCell::new(None) };
+    }
+
+    fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> T) -> Option<T> {
+        CLIPBOARD.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = arboard::Clipboard::new().ok();
+            }
+            slot.as_mut().map(f)
+        })
+    }
+
+    pub fn read() -> Option<String> {
+        with_clipboard(|clipboard| clipboard.get_text().ok())
+            .flatten()
+            .or_else(super::fallback_read)
+    }
+
+    pub fn write(text: &str) {
+        super::fallback_write(text);
+        let _ = with_clipboard(|clipboard| clipboard.set_text(text.to_owned()));
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 mod imp {
     pub fn read() -> Option<String> {
         super::fallback_read()
@@ -214,4 +250,16 @@ pub fn get_text() -> Option<String> {
 /// Replace the plain-text clipboard contents with `text`.
 pub fn set_text(text: &str) {
     imp::write(text);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    /// Needs a live desktop session, so it is opt-in: `cargo test -p dream -- --ignored`.
+    #[test]
+    #[ignore = "needs a live desktop clipboard"]
+    fn the_desktop_clipboard_round_trips() {
+        let text = format!("v1 clipboard {}", std::process::id());
+        super::set_text(&text);
+        assert_eq!(super::get_text().as_deref(), Some(text.as_str()));
+    }
 }

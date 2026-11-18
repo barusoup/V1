@@ -9,7 +9,8 @@
 //! moving the strength slider only re-blurs what is already in memory. Animated GIFs and videos
 //! stream frames from FFmpeg (with audio stripped on upload) and apply live Gaussian frost.
 
-use std::io::Read;
+use std::collections::HashSet;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -17,84 +18,380 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::gpu::CoverImage;
-
 /// The working size of a static picture: long edge, in pixels.
 const MAX_SIDE: u32 = 1280;
 /// The working size of an animated GIF or video background: long edge, in pixels.
 const MAX_VIDEO_SIDE: u32 = 720;
+/// Maximum frame rate of an animated background.
+const MAX_VIDEO_FPS: f32 = 24.0;
 /// Maximum Gaussian sigma at full frost strength, in working pixels.
 const MAX_SIGMA: f32 = 26.0;
 
-const VIDEO_EXTS: &[&str] = &["mp4", "webm", "mov", "mkv", "avi", "m4v", "ogv"];
-const ANIMATED_EXTS: &[&str] = &["gif", "mp4", "webm", "mov", "mkv", "avi", "m4v", "ogv"];
+const ANIMATED_EXTS: &[&str] = &["gif", "apng", "mp4", "webm", "mov", "mkv", "avi", "m4v", "ogv"];
 
-/// Whether `path` is a video format whose audio should be stripped on upload.
-pub fn is_video_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| VIDEO_EXTS.iter().any(|v| v.eq_ignore_ascii_case(ext)))
-}
-
-/// Whether `path` is an animated background (GIF or video).
+/// Whether `path` is an animated background (GIF, APNG, or video).
 pub fn is_animated_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| ANIMATED_EXTS.iter().any(|v| v.eq_ignore_ascii_case(ext)))
 }
 
-/// Prepare a chosen background file for use. For video files, strips any audio track into a
-/// managed copy under `data_dir/backgrounds/` so the background is guaranteed silent.
-pub fn prepare_background_media(src: &Path, data_dir: &Path) -> Result<PathBuf, String> {
-    if !is_video_path(src) {
-        return Ok(src.to_path_buf());
+#[derive(Default)]
+struct FfmpegCodecs {
+    encoders: HashSet<String>,
+    decoders: HashSet<String>,
+}
+
+impl FfmpegCodecs {
+    fn discover(ffmpeg: &Path) -> &'static FfmpegCodecs {
+        static CACHE: OnceLock<FfmpegCodecs> = OnceLock::new();
+        CACHE.get_or_init(|| {
+            let encoders = query_ffmpeg_codecs(ffmpeg, "-encoders");
+            let decoders = query_ffmpeg_codecs(ffmpeg, "-decoders");
+            FfmpegCodecs { encoders, decoders }
+        })
     }
-    let tools = dream_media::Tools::discover().map_err(|e| e.to_string())?;
+
+    fn has_enc(&self, name: &str) -> bool {
+        self.encoders.contains(name)
+    }
+
+    fn has_dec(&self, name: &str) -> bool {
+        self.decoders.contains(name)
+    }
+
+    fn has_av1_dec(&self) -> bool {
+        self.has_dec("libdav1d") || self.has_dec("libaom-av1") || self.has_dec("av1")
+    }
+}
+
+fn query_ffmpeg_codecs(ffmpeg: &Path, flag: &str) -> HashSet<String> {
+    let Ok(out) = hidden_command(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", flag])
+        .output()
+    else {
+        return HashSet::new();
+    };
+    let mut set = HashSet::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let trimmed = line.trim_start();
+        // Format: " V..... libsvtav1            SVT-AV1..."
+        let mut parts = trimmed.split_whitespace();
+        if let (Some(flags), Some(name)) = (parts.next(), parts.next()) {
+            if flags.starts_with('V') && flags.len() >= 6 {
+                set.insert(name.to_owned());
+            }
+        }
+    }
+    set
+}
+
+fn unique_stamp() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Prepare a chosen background file for use by transcoding/optimizing it into a managed copy
+/// under `data_dir/backgrounds/`. Never returns a reference to the original user file.
+pub fn prepare_background_media(src: &Path, data_dir: &Path) -> Result<PathBuf, String> {
     let bg_dir = data_dir.join("backgrounds");
     std::fs::create_dir_all(&bg_dir).map_err(|e| e.to_string())?;
+    let stamp = unique_stamp();
 
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("mp4")
-        .to_ascii_lowercase();
-    let dst = bg_dir.join(format!("bg-{stamp}.{ext}"));
-
-    // Fast lossless remux with audio stripped (`-an`).
-    let mut cmd = hidden_command(&tools.ffmpeg);
-    cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
-        .arg(src)
-        .args(["-an", "-c:v", "copy"])
-        .arg(&dst);
-    let status = cmd.status().map_err(|e| e.to_string())?;
-    if status.success() && dst.exists() {
-        return Ok(dst);
+    if is_animated_path(src) {
+        return prepare_animated_background(src, &bg_dir, stamp);
     }
 
-    // Use encoders available in the bundled LGPL builds. Apple provides hardware
-    // H.264; other platforms use FFmpeg's native MPEG-4 encoder.
-    let _ = std::fs::remove_file(&dst);
-    let fallback_dst = bg_dir.join(format!("bg-{stamp}.mp4"));
-    let mut cmd = hidden_command(&tools.ffmpeg);
-    cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
-        .arg(src)
-        .arg("-an");
-    #[cfg(target_os = "macos")]
-    cmd.args(["-c:v", "h264_videotoolbox", "-b:v", "6000k"]);
-    #[cfg(not(target_os = "macos"))]
-    cmd.args(["-c:v", "mpeg4", "-q:v", "3"]);
-    cmd.args(["-pix_fmt", "yuv420p", "-movflags", "+faststart"])
-        .arg(&fallback_dst);
-    let status = cmd.status().map_err(|e| e.to_string())?;
-    if status.success() && fallback_dst.exists() {
-        Ok(fallback_dst)
-    } else {
-        let _ = std::fs::remove_file(&fallback_dst);
-        Err("Could not strip audio from the selected video.".to_owned())
+    // Check if an image container (e.g. animated WebP) actually has multiple frames.
+    if let Ok(tools) = dream_media::Tools::discover() {
+        if is_multi_frame_image(&tools, src) {
+            return prepare_animated_background(src, &bg_dir, stamp);
+        }
+    }
+
+    prepare_still_background(src, &bg_dir, stamp)
+}
+
+fn is_multi_frame_image(tools: &dream_media::Tools, path: &Path) -> bool {
+    let Ok(out) = hidden_command(&tools.ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u32>()
+        .is_ok_and(|n| n > 1)
+}
+
+/// Transcode a still image to a downscaled, metadata-free, storage-optimized managed copy.
+fn prepare_still_background(src: &Path, bg_dir: &Path, stamp: u128) -> Result<PathBuf, String> {
+    let image = dream_media::Image::open(src, MAX_SIDE).map_err(|e| e.to_string())?;
+    let (w, h) = image.size();
+    if w == 0 || h == 0 {
+        return Err("That image has no pixels.".to_owned());
+    }
+
+    if let Ok(tools) = dream_media::Tools::discover() {
+        let codecs = FfmpegCodecs::discover(&tools.ffmpeg);
+
+        // 1. AVIF (smallest storage, modern codec) if FFmpeg can both encode and decode it.
+        if codecs.has_av1_dec() {
+            let avif_encoders: &[(&str, &[&str])] = &[
+                ("libsvtav1", &["-crf", "32", "-preset", "6"]),
+                ("libaom-av1", &["-crf", "32", "-cpu-used", "6", "-still-picture", "1"]),
+            ];
+            for (enc, args) in avif_encoders {
+                if codecs.has_enc(enc) {
+                    let dst = bg_dir.join(format!("bg-{stamp}.avif"));
+                    if encode_still_ffmpeg(&tools.ffmpeg, image.rgba(), w, h, enc, args, &dst) {
+                        return Ok(dst);
+                    }
+                    let _ = std::fs::remove_file(&dst);
+                }
+            }
+        }
+
+        // 2. Lossy WebP if FFmpeg has both libwebp encoder and native webp decoder.
+        if codecs.has_enc("libwebp") && codecs.has_dec("webp") {
+            let dst = bg_dir.join(format!("bg-{stamp}.webp"));
+            if encode_still_ffmpeg(
+                &tools.ffmpeg,
+                image.rgba(),
+                w,
+                h,
+                "libwebp",
+                &["-quality", "80", "-compression_level", "6"],
+                &dst,
+            ) {
+                return Ok(dst);
+            }
+            let _ = std::fs::remove_file(&dst);
+        }
+    }
+
+    // 3. Universal in-process JPEG fallback (opaque RGB8, quality 82, zero metadata).
+    let dst = bg_dir.join(format!("bg-{stamp}.jpg"));
+    let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
+    for px in image.rgba().chunks_exact(4) {
+        rgb.extend_from_slice(&px[..3]);
+    }
+    let mut file = std::fs::File::create(&dst).map_err(|e| e.to_string())?;
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, 82);
+    enc.encode(&rgb, w, h, image::ExtendedColorType::Rgb8)
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&dst);
+            e.to_string()
+        })?;
+    Ok(dst)
+}
+
+fn encode_still_ffmpeg(
+    ffmpeg: &Path,
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    encoder: &str,
+    extra_args: &[&str],
+    dst: &Path,
+) -> bool {
+    let size_str = format!("{w}x{h}");
+    // Even dimensions for yuv420p.
+    let ew = (w & !1).max(2);
+    let eh = (h & !1).max(2);
+    let vf = format!("scale={ew}:{eh}");
+    let mut cmd = hidden_command(ffmpeg);
+    cmd.args([
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgba",
+        "-s",
+        &size_str,
+        "-i",
+        "pipe:0",
+        "-frames:v",
+        "1",
+        "-vf",
+        &vf,
+        "-c:v",
+        encoder,
+        "-pix_fmt",
+        "yuv420p",
+    ])
+    .args(extra_args)
+    .arg(dst)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(rgba).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+    }
+    child.wait().is_ok_and(|s| s.success()) && dst.exists()
+}
+
+/// Transcode an animated GIF/WebP/video into a downscaled, audio-free, 8-bit 4:2:0,
+/// capped-FPS, modern-codec managed copy under `data_dir/backgrounds/`.
+fn prepare_animated_background(src: &Path, bg_dir: &Path, stamp: u128) -> Result<PathBuf, String> {
+    let tools = dream_media::Tools::discover().map_err(|e| e.to_string())?;
+    let codecs = FfmpegCodecs::discover(&tools.ffmpeg);
+    let (w, h, fps) = probe_video(&tools, src)?;
+    // Ensure even dimensions for yuv420p.
+    let w = (w & !1).max(2);
+    let h = (h & !1).max(2);
+    let vf = format!("scale={w}:{h}:flags=lanczos,fps={fps:.2}");
+
+    struct Candidate<'a> {
+        ext: &'a str,
+        encoder: &'a str,
+        usable: bool,
+        args: &'a [&'a str],
+        faststart: bool,
+    }
+
+    let candidates = [
+        Candidate {
+            ext: "mp4",
+            encoder: "libsvtav1",
+            usable: codecs.has_enc("libsvtav1") && codecs.has_av1_dec(),
+            args: &["-crf", "36", "-preset", "6"],
+            faststart: true,
+        },
+        Candidate {
+            ext: "mp4",
+            encoder: "libaom-av1",
+            usable: codecs.has_enc("libaom-av1") && codecs.has_av1_dec(),
+            args: &["-crf", "36", "-cpu-used", "6"],
+            faststart: true,
+        },
+        Candidate {
+            ext: "mp4",
+            encoder: "libx265",
+            usable: codecs.has_enc("libx265") && codecs.has_dec("hevc"),
+            args: &["-crf", "28", "-preset", "medium", "-tag:v", "hvc1"],
+            faststart: true,
+        },
+        Candidate {
+            ext: "mp4",
+            encoder: "hevc_videotoolbox",
+            usable: cfg!(target_os = "macos")
+                && codecs.has_enc("hevc_videotoolbox")
+                && codecs.has_dec("hevc"),
+            args: &["-q:v", "55", "-tag:v", "hvc1"],
+            faststart: true,
+        },
+        Candidate {
+            ext: "webm",
+            encoder: "libvpx-vp9",
+            usable: codecs.has_enc("libvpx-vp9") && codecs.has_dec("vp9"),
+            args: &["-crf", "34", "-b:v", "0", "-deadline", "good", "-cpu-used", "2"],
+            faststart: false,
+        },
+        Candidate {
+            ext: "mp4",
+            encoder: "libx264",
+            usable: codecs.has_enc("libx264") && codecs.has_dec("h264"),
+            args: &["-crf", "26", "-preset", "medium"],
+            faststart: true,
+        },
+        Candidate {
+            ext: "mp4",
+            encoder: "h264_videotoolbox",
+            usable: cfg!(target_os = "macos")
+                && codecs.has_enc("h264_videotoolbox")
+                && codecs.has_dec("h264"),
+            args: &["-b:v", "2500k"],
+            faststart: true,
+        },
+        Candidate {
+            ext: "mp4",
+            encoder: "mpeg4",
+            usable: true,
+            args: &["-q:v", "6"],
+            faststart: true,
+        },
+    ];
+
+    for c in candidates {
+        if !c.usable {
+            continue;
+        }
+        let dst = bg_dir.join(format!("bg-{stamp}.{}", c.ext));
+        let mut cmd = hidden_command(&tools.ffmpeg);
+        cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+            .arg(src)
+            .args([
+                "-an",
+                "-sn",
+                "-dn",
+                "-map_metadata",
+                "-1",
+                "-vf",
+                &vf,
+                "-c:v",
+                c.encoder,
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .args(c.args);
+        if c.faststart {
+            cmd.args(["-movflags", "+faststart"]);
+        }
+        cmd.arg(&dst);
+        if cmd.status().is_ok_and(|s| s.success()) && dst.exists() {
+            return Ok(dst);
+        }
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    Err("Could not optimize the selected animated background.".to_owned())
+}
+
+/// Remove any managed background files in `data_dir/backgrounds/` that are no longer referenced.
+pub fn prune_unused_backgrounds(data_dir: &Path, keep: &[&Path]) {
+    let bg_dir = data_dir.join("backgrounds");
+    let Ok(entries) = std::fs::read_dir(&bg_dir) else {
+        return;
+    };
+    let keep_set: HashSet<PathBuf> = keep
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| (*p).to_path_buf()))
+        .collect();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !keep_set.contains(&canon) {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -183,9 +480,21 @@ impl Drop for ChildGuard {
     }
 }
 
+pub enum BackgroundPixels {
+    Bc7(Vec<u8>),
+    Rgba(Vec<u8>),
+}
+
+pub struct BackgroundImage {
+    pub animated: bool,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: BackgroundPixels,
+}
+
 struct Msg {
     generation: u64,
-    image: Result<(u32, u32, Vec<u8>), String>,
+    image: Result<(u32, u32, BackgroundPixels), String>,
     /// The unblurred decoded picture, when this message finished decoding one.
     source: Option<Source>,
 }
@@ -207,6 +516,8 @@ pub struct Background {
     blurred: f32,
     /// Shared strength for live animated video/GIF blur.
     live_strength: Arc<AtomicU32>,
+    /// Whether the GPU supports BC7 block compression (4:1 VRAM savings).
+    bc7_enabled: Arc<AtomicBool>,
     /// Stop signal for an active animated decoder thread.
     stop_flag: Option<Arc<AtomicBool>>,
 }
@@ -232,12 +543,18 @@ impl Background {
             generation: 0,
             blurred: -1.0,
             live_strength: Arc::new(AtomicU32::new(strength.to_bits())),
+            bc7_enabled: Arc::new(AtomicBool::new(true)),
             stop_flag: None,
         };
         if let Some(path) = path {
             background.choose(path);
         }
         background
+    }
+
+    /// Inform the background workers whether the GPU supports BC7 textures.
+    pub fn set_bc7(&self, enabled: bool) {
+        self.bc7_enabled.store(enabled, Ordering::Release);
     }
 
     fn stop_animation(&mut self) {
@@ -270,19 +587,21 @@ impl Background {
             let stop = Arc::new(AtomicBool::new(false));
             self.stop_flag = Some(Arc::clone(&stop));
             let live_strength = Arc::clone(&self.live_strength);
+            let bc7 = Arc::clone(&self.bc7_enabled);
             std::thread::Builder::new()
                 .name("v1-background-video".to_owned())
                 .spawn(move || {
-                    stream_animated(generation, &path, live_strength, stop, tx);
+                    stream_animated(generation, &path, live_strength, bc7, stop, tx);
                 })
                 .ok();
         } else {
             self.animated = false;
             let strength = self.strength;
+            let bc7 = Arc::clone(&self.bc7_enabled);
             let (tx, rx) = mpsc::sync_channel(1);
             self.rx = Some(rx);
             if let Err(error) = queue_static(Box::new(move || {
-                let _ = tx.try_send(decode(generation, &path, strength));
+                let _ = tx.try_send(decode(generation, &path, strength, bc7.load(Ordering::Acquire)));
             })) {
                 self.rx = None;
                 self.error = Some(error);
@@ -334,7 +653,7 @@ impl Background {
     }
 
     /// The softened frame, once it is ready, for the host to upload.
-    pub fn poll(&mut self) -> Option<CoverImage> {
+    pub fn poll(&mut self) -> Option<BackgroundImage> {
         let rx = self.rx.as_ref()?;
         match rx.try_recv() {
             Ok(msg) => {
@@ -345,20 +664,16 @@ impl Background {
                     return None;
                 }
                 match msg.image {
-                    Ok((width, height, rgba)) => {
+                    Ok((width, height, pixels)) => {
                         if let Some(source) = msg.source {
                             self.source = Some(source);
                         }
                         self.error = None;
-                        Some(CoverImage {
-                            url: if self.animated {
-                                format!("background:anim:{}", msg.generation)
-                            } else {
-                                format!("background:{}", msg.generation)
-                            },
+                        Some(BackgroundImage {
+                            animated: self.animated,
                             width,
                             height,
-                            rgba,
+                            pixels,
                         })
                     }
                     Err(error) => {
@@ -384,14 +699,20 @@ impl Background {
         self.generation += 1;
         let generation = self.generation;
         let strength = self.strength;
+        let bc7 = Arc::clone(&self.bc7_enabled);
         let (tx, rx) = mpsc::sync_channel(1);
         self.rx = Some(rx);
         if let Err(error) = queue_static(Box::new(move || {
             let mut rgba = source.rgba.as_slice().to_vec();
             frost(&mut rgba, source.width, source.height, strength);
+            let pixels = if bc7.load(Ordering::Acquire) {
+                BackgroundPixels::Bc7(encode_bc7_rgba(&rgba, source.width, source.height))
+            } else {
+                BackgroundPixels::Rgba(rgba)
+            };
             let _ = tx.try_send(Msg {
                 generation,
-                image: Ok((source.width, source.height, rgba)),
+                image: Ok((source.width, source.height, pixels)),
                 source: None,
             });
         })) {
@@ -402,14 +723,14 @@ impl Background {
 }
 
 /// Decode and soften a picture on this thread, for `--shot`.
-pub fn preview(path: &Path, strength: f32) -> Option<CoverImage> {
-    let msg = decode(0, path, strength);
-    let (width, height, rgba) = msg.image.ok()?;
-    Some(CoverImage {
-        url: "background:preview".to_owned(),
+pub fn preview(path: &Path, strength: f32) -> Option<BackgroundImage> {
+    let msg = decode(0, path, strength, false);
+    let (width, height, pixels) = msg.image.ok()?;
+    Some(BackgroundImage {
+        animated: false,
         width,
         height,
-        rgba,
+        pixels,
     })
 }
 
@@ -421,7 +742,7 @@ fn decode_file(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
 }
 
 /// Decode a picture and soften it.
-fn decode(generation: u64, path: &Path, strength: f32) -> Msg {
+fn decode(generation: u64, path: &Path, strength: f32, use_bc7: bool) -> Msg {
     let failed = |message: String| Msg {
         generation,
         image: Err(message),
@@ -441,9 +762,14 @@ fn decode(generation: u64, path: &Path, strength: f32) -> Msg {
     };
     let mut rgba = source.rgba.as_slice().to_vec();
     frost(&mut rgba, width, height, strength);
+    let pixels = if use_bc7 {
+        BackgroundPixels::Bc7(encode_bc7_rgba(&rgba, width, height))
+    } else {
+        BackgroundPixels::Rgba(rgba)
+    };
     Msg {
         generation,
-        image: Ok((width, height, rgba)),
+        image: Ok((width, height, pixels)),
         source: Some(source),
     }
 }
@@ -487,9 +813,9 @@ fn probe_video(tools: &dream_media::Tools, path: &Path) -> Result<(u32, u32, f32
         fps_str.parse().unwrap_or(24.0)
     };
     let fps = if fps.is_finite() {
-        fps.clamp(10.0, 30.0)
+        fps.clamp(10.0, MAX_VIDEO_FPS)
     } else {
-        24.0
+        MAX_VIDEO_FPS
     };
 
     let long = orig_w.max(orig_h);
@@ -509,6 +835,7 @@ fn stream_animated(
     generation: u64,
     path: &Path,
     live_strength: Arc<AtomicU32>,
+    bc7: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     tx: SyncSender<Msg>,
 ) {
@@ -537,6 +864,8 @@ fn stream_animated(
         "-loglevel",
         "error",
         "-nostdin",
+        "-threads",
+        "2",
         "-stream_loop",
         "-1",
         "-i",
@@ -603,10 +932,15 @@ fn stream_animated(
         let strength = f32::from_bits(live_strength.load(Ordering::Relaxed)).clamp(0.0, 1.0);
         let mut frame = raw.clone();
         frost(&mut frame, w, h, strength);
+        let pixels = if bc7.load(Ordering::Acquire) {
+            BackgroundPixels::Bc7(encode_bc7_rgba(&frame, w, h))
+        } else {
+            BackgroundPixels::Rgba(frame)
+        };
 
         let _ = tx.try_send(Msg {
             generation,
-            image: Ok((w, h, frame)),
+            image: Ok((w, h, pixels)),
             source: None,
         });
 
@@ -730,6 +1064,144 @@ fn box_blur_pass(rgba: &mut [u8], temp: &mut [u8], width: u32, height: u32, radi
     }
 }
 
+/// Compress an RGBA8 image into BC7 Mode 6 (1 byte/pixel, 4:1 VRAM compression).
+/// Uses 7-bit endpoints + shared P-bit (effective 8-bit precision) and 4-bit indices per 4x4 block.
+pub fn encode_bc7_rgba(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let bw = width.div_ceil(4) as usize;
+    let bh = height.div_ceil(4) as usize;
+    let mut out = vec![0u8; bw * bh * 16];
+    let w = width as usize;
+    let h = height as usize;
+
+    for by in 0..bh {
+        for bx in 0..bw {
+            let mut block = [[0f32; 3]; 16];
+            let mut mean = [0f32; 3];
+            for py in 0..4 {
+                let sy = (by * 4 + py).min(h - 1);
+                for px in 0..4 {
+                    let sx = (bx * 4 + px).min(w - 1);
+                    let off = (sy * w + sx) * 4;
+                    let rgb = [
+                        f32::from(rgba[off]),
+                        f32::from(rgba[off + 1]),
+                        f32::from(rgba[off + 2]),
+                    ];
+                    block[py * 4 + px] = rgb;
+                    mean[0] += rgb[0];
+                    mean[1] += rgb[1];
+                    mean[2] += rgb[2];
+                }
+            }
+            mean[0] /= 16.0;
+            mean[1] /= 16.0;
+            mean[2] /= 16.0;
+
+            // Find principal axis via 2-step farthest-pair + projection.
+            let mut far0 = block[0];
+            let mut max_d = -1.0f32;
+            for c in &block {
+                let d = (c[0] - mean[0]).powi(2)
+                    + (c[1] - mean[1]).powi(2)
+                    + (c[2] - mean[2]).powi(2);
+                if d > max_d {
+                    max_d = d;
+                    far0 = *c;
+                }
+            }
+            let mut far1 = far0;
+            max_d = -1.0;
+            for c in &block {
+                let d = (c[0] - far0[0]).powi(2)
+                    + (c[1] - far0[1]).powi(2)
+                    + (c[2] - far0[2]).powi(2);
+                if d > max_d {
+                    max_d = d;
+                    far1 = *c;
+                }
+            }
+
+            let dir = [far1[0] - far0[0], far1[1] - far0[1], far1[2] - far0[2]];
+            let len_sq = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+
+            let mut ep0 = far0;
+            let mut ep1 = far1;
+            let mut indices = [0u8; 16];
+
+            if len_sq > 1e-4 {
+                let mut min_t = f32::INFINITY;
+                let mut max_t = f32::NEG_INFINITY;
+                let mut ts = [0.0f32; 16];
+                for (i, c) in block.iter().enumerate() {
+                    let t = ((c[0] - mean[0]) * dir[0]
+                        + (c[1] - mean[1]) * dir[1]
+                        + (c[2] - mean[2]) * dir[2])
+                        / len_sq;
+                    ts[i] = t;
+                    min_t = min_t.min(t);
+                    max_t = max_t.max(t);
+                }
+                for ch in 0..3 {
+                    ep0[ch] = (mean[ch] + min_t * dir[ch]).clamp(0.0, 255.0);
+                    ep1[ch] = (mean[ch] + max_t * dir[ch]).clamp(0.0, 255.0);
+                }
+                let span = (max_t - min_t).max(1e-5);
+                for i in 0..16 {
+                    let q = (((ts[i] - min_t) / span) * 15.0).round() as i32;
+                    indices[i] = q.clamp(0, 15) as u8;
+                }
+            }
+
+            // Anchor pixel 0 must have MSB == 0 (index < 8). Swap endpoints if needed.
+            if indices[0] >= 8 {
+                std::mem::swap(&mut ep0, &mut ep1);
+                for idx in &mut indices {
+                    *idx = 15 - *idx;
+                }
+            }
+
+            let q7 = |v: f32| -> (u128, u128) {
+                let v8 = (v.round() as u32).clamp(0, 255);
+                (u128::from(v8 >> 1), u128::from(v8 & 1))
+            };
+            let (r0, rp0) = q7(ep0[0]);
+            let (g0, _) = q7(ep0[1]);
+            let (b0, _) = q7(ep0[2]);
+            let (r1, rp1) = q7(ep1[0]);
+            let (g1, _) = q7(ep1[1]);
+            let (b1, _) = q7(ep1[2]);
+            // Opaque alpha (A0 = 127, A1 = 127 -> (127 << 1) | 1 = 255 if p=1, or 254 if p=0).
+            let a0 = 127u128;
+            let a1 = 127u128;
+
+            // Pack BC7 Mode 6 (128 bits, little-endian):
+            // [0..7): mode 0b1000000 (0x40)
+            // [7..63): R0(7), R1(7), G0(7), G1(7), B0(7), B1(7), A0(7), A1(7)
+            // [63..65): P0(1), P1(1)
+            // [65..128): idx0(3), idx1..idx15(4 each)
+            let mut bits: u128 = 0x40;
+            bits |= r0 << 7;
+            bits |= r1 << 14;
+            bits |= g0 << 21;
+            bits |= g1 << 28;
+            bits |= b0 << 35;
+            bits |= b1 << 42;
+            bits |= a0 << 49;
+            bits |= a1 << 56;
+            bits |= rp0 << 63;
+            bits |= rp1 << 64;
+            bits |= u128::from(indices[0] & 0x7) << 65;
+            for (i, &idx) in indices.iter().enumerate().skip(1) {
+                bits |= u128::from(idx & 0xf) << (68 + (i - 1) * 4);
+            }
+
+            let dst_off = (by * bw + bx) * 16;
+            out[dst_off..dst_off + 16].copy_from_slice(&bits.to_le_bytes());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,5 +1247,44 @@ mod tests {
     #[test]
     fn a_missing_picture_is_an_error() {
         assert!(decode_file(Path::new("no-such-background.png")).is_err());
+    }
+
+    #[test]
+    fn bc7_encoder_packs_valid_mode6_blocks_for_odd_dimensions() {
+        let rgba = vec![120u8, 180, 240, 255].repeat(7 * 5);
+        let bc7 = encode_bc7_rgba(&rgba, 7, 5);
+        // 7x5 -> 2x2 blocks -> 64 bytes.
+        assert_eq!(bc7.len(), 64);
+        for chunk in bc7.chunks_exact(16) {
+            assert_eq!(chunk[0] & 0x7f, 0x40);
+        }
+    }
+
+    #[test]
+    fn prepare_background_media_copies_and_optimizes_still_images() {
+        let dir = std::env::temp_dir().join(format!("v1-bg-prep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("big.png");
+        let rgba = vec![80u8, 120, 200, 255].repeat(64 * 64);
+        image::RgbaImage::from_raw(64, 64, rgba)
+            .unwrap()
+            .save(&src)
+            .unwrap();
+
+        let managed = prepare_background_media(&src, &dir).expect("still image should optimize");
+        assert!(managed.starts_with(dir.join("backgrounds")));
+        assert_ne!(managed, src);
+        assert!(managed.exists());
+
+        // Removing the original file must not break decoding of the managed copy.
+        std::fs::remove_file(&src).unwrap();
+        let decoded = decode_file(&managed).expect("managed copy decodes independently");
+        assert_eq!((decoded.0, decoded.1), (64, 64));
+
+        // Pruning should remove unreferenced files.
+        prune_unused_backgrounds(&dir, &[]);
+        assert!(!managed.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
