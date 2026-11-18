@@ -1,27 +1,40 @@
 name: Release
 
 # Runs when a full release is tagged, for example `v0.2.0`. Nightly commits never reach this.
+# A failed run can be republished against its existing tag with workflow_dispatch: the workflow
+# file comes from the default branch, the checkout uses the tag, and the tag is never moved.
 on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish, for example v0.2.3"
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Check the tag matches the Cargo version
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           if [ "$version" != "$manifest" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest"
+            echo "Tag $RELEASE_TAG does not match Cargo.toml version $manifest"
             exit 1
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
@@ -35,8 +48,8 @@ jobs:
       - name: Fetch FFmpeg (LGPL build, pinned and checksummed)
         shell: pwsh
         run: |
-          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-03-12-50/ffmpeg-n9.0.2-45-g1e65c6cd5d-win64-lgpl-9.0.zip"
-          $sha256 = "b1bae38cca5d84eb0f004f80cfb712d7bb755ef060e5a34207391228793c4406"
+          $url = "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-11-17-12-40/ffmpeg-n9.0.2-57-gd838f9f9ae-win64-lgpl-9.0.zip"
+          $sha256 = "219edf130456945dec2e7e8b176026a94bc1008b81c4c1cd6d64c5e55f9213fa"
           New-Item -ItemType Directory -Force build\ffmpeg-download | Out-Null
           $zip = "build\ffmpeg-download\ffmpeg.zip"
           Invoke-WebRequest -Uri $url -OutFile $zip
@@ -67,13 +80,15 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Check the tag matches the Cargo version
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           if [ "$version" != "$manifest" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest"
+            echo "Tag $RELEASE_TAG does not match Cargo.toml version $manifest"
             exit 1
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
@@ -106,6 +121,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -120,8 +137,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          gh release create "$GITHUB_REF_NAME" \
+          version="${RELEASE_TAG#v}"
+          gh release create "$RELEASE_TAG" \
             dist/V1-Setup-*.exe \
             dist/V1-*-arm64.dmg \
             dist/SHA256SUMS \
