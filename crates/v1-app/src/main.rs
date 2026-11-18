@@ -906,14 +906,19 @@ impl Host {
     }
 
     fn toggle_fullscreen(&mut self) {
-        let Some(window) = &self.window else { return };
-        // Let winit save and restore the native window placement, including the restored
-        // bounds of a maximized window. Resizing it ourselves would overwrite that placement.
+        let Some(window) = self.window.clone() else { return };
         let fullscreen = if window.fullscreen().is_some() {
             None
         } else {
             Some(Fullscreen::Borderless(window.current_monitor()))
         };
+        self.set_fullscreen(&window, fullscreen);
+    }
+
+    /// Apply a native fullscreen state to the window. Let winit save and restore the native window
+    /// placement, including the restored bounds of a maximized window. Resizing it ourselves would
+    /// overwrite that placement.
+    fn set_fullscreen(&mut self, window: &Window, fullscreen: Option<Fullscreen>) {
         self.drag = None;
         #[cfg(windows)]
         let entering = fullscreen.is_some();
@@ -942,9 +947,13 @@ impl Host {
     /// OS, whose modal loop takes over the thread: winit's loop stops running, so no frame is drawn
     /// until the button comes up, and every animation freezes for the length of the drag.
     fn start_drag(&mut self, window: &Window) {
-        // Moving a fullscreen window would move it off its monitor and spoil its placement.
+        // A press in the title strip while fullscreen is a request to move the window. Leave
+        // fullscreen first, through the same path as the toggle, so winit restores the former
+        // window placement (size, position and maximized state). Then carry on below, dragging
+        // that restored window from the pointer as usual. This runs on the event loop thread, so
+        // winit's restore is applied before `outer_position` is read.
         if window.fullscreen().is_some() {
-            return;
+            self.set_fullscreen(window, None);
         }
         match (cursor_screen_pos(), window.outer_position()) {
             (Some(cursor), Ok(origin)) => {

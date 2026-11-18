@@ -522,7 +522,7 @@ pub struct State {
     /// The track the bar is showing, and when it changed (drives the bar's crossfade).
     shown_id: Option<String>,
     track_at: Instant,
-    /// The spinner's angle, in radians, while a song loads.
+    /// The spinner's angle, in radians, while a song or detail page loads.
     spin: f32,
     /// Whether the bar drew the spinner last frame, so leaving it can land the glyph at once.
     glyph_loading: bool,
@@ -1649,9 +1649,18 @@ impl State {
         self.autoplay = true;
     }
 
+    /// True while a detail page (artist or album) is open and still waiting on its data.
+    fn page_loading(&self) -> bool {
+        !self.lyrics_open && detail_is_loading(self.pages.top.as_ref(), &self.artists, &self.albums)
+    }
+
     /// True while the UI is waiting on the backend, so the host keeps polling for the reply.
     pub fn busy(&self) -> bool {
-        !self.booted || self.searching || self.playlist.is_loading() || self.background_prep_busy
+        !self.booted
+            || self.searching
+            || self.playlist.is_loading()
+            || self.page_loading()
+            || self.background_prep_busy
     }
 
     /// True while something on screen is still moving, so the host keeps presenting frames.
@@ -3111,6 +3120,24 @@ mod tests {
     }
 
     #[test]
+    fn detail_loading_tracks_active_artist_or_album() {
+        use super::{detail_is_loading, Detail, Loaded};
+        let mut artists = std::collections::HashMap::new();
+        let mut albums = std::collections::HashMap::new();
+        let artist = Detail::Artist("a".to_owned());
+        let album = Detail::Album("b".to_owned());
+
+        assert!(!detail_is_loading(None, &artists, &albums));
+        assert!(detail_is_loading(Some(&artist), &artists, &albums));
+        assert!(detail_is_loading(Some(&album), &artists, &albums));
+
+        artists.insert("a".to_owned(), Loaded::Loading);
+        albums.insert("b".to_owned(), Loaded::Failed("err".to_owned()));
+        assert!(detail_is_loading(Some(&artist), &artists, &albums));
+        assert!(!detail_is_loading(Some(&album), &artists, &albums));
+    }
+
+    #[test]
     fn clock_formats_minutes_and_hours() {
         assert_eq!(clock(0.0), "0:00");
         assert_eq!(clock(71.4), "1:11");
@@ -3427,8 +3454,9 @@ pub fn build(
             || (back_visible && back.contains(pointer.pos)));
     let over_caption = !theater && caption.contains(pointer.pos);
 
-    // The spinner turns while a song loads, the same for the bar and the rows.
-    if state.playlist.is_loading() {
+    // The spinner turns while a song or detail page loads.
+    let spinner_active = state.playlist.is_loading() || state.page_loading();
+    if spinner_active {
         state.spin = (state.spin + anims.dt() * SPINNER_TURN) % std::f32::consts::TAU;
     }
     // Everything drawn over the page. The page is drawn first, so these are known up front and a
@@ -3598,8 +3626,8 @@ pub fn build(
             .as_ref()
             .is_some_and(|view| since(now, view.arrived) < 1.5);
     let visualizing = state.lyrics_open && state.spectrum_live;
-    // A song that is loading keeps the spinner turning.
-    let loading = state.playlist.is_loading();
+    // A song or detail page that is loading keeps the spinner turning.
+    let loading = spinner_active;
     state.animating = anims.moving()
         || entering
         || state.query_dirty
@@ -5692,14 +5720,21 @@ fn detail_page(
     }
 }
 
+fn detail_is_loading(
+    detail: Option<&Detail>,
+    artists: &HashMap<String, Loaded<ArtistPage>>,
+    albums: &HashMap<String, Loaded<AlbumPage>>,
+) -> bool {
+    match detail {
+        Some(Detail::Artist(id)) => matches!(artists.get(id), Some(Loaded::Loading) | None),
+        Some(Detail::Album(id)) => matches!(albums.get(id), Some(Loaded::Loading) | None),
+        None => false,
+    }
+}
+
 fn loading_page(cx: &mut Cx, main: Rect) {
-    cx.text(
-        Rect::new(main.x, main.h * 0.5 - 14.0, main.w, 28.0),
-        "Loading…",
-        14.5,
-        theme::muted(),
-        Align::Center,
-    );
+    let center = (main.x + main.w * 0.5, main.y + main.h * 0.5);
+    draw_spinner(cx, center, PAGE_SPINNER_RADIUS, theme::muted());
 }
 
 fn failed_page(cx: &mut Cx, main: Rect, message: &str) {
@@ -6526,12 +6561,13 @@ fn has_lyrics(state: &State, track: Option<&TrackView>) -> bool {
 /// The spinner that replaces the play glyph while a song loads: its radius, stroke width, arc
 /// length, and turn rate in radians per second.
 const SPINNER_RADIUS: f32 = 11.0;
+const PAGE_SPINNER_RADIUS: f32 = 14.0;
 const SPINNER_THICKNESS: f32 = 2.5;
 const SPINNER_SWEEP: f32 = std::f32::consts::PI * 1.4;
 const SPINNER_TURN: f32 = std::f32::consts::TAU * 1.1;
 
 /// The loading spinner: an arc of [`SPINNER_SWEEP`] turning at `cx.spin`, `radius` out from
-/// `center`. The bar's play disc and each row's cover both draw it.
+/// `center`. The bar's play disc, each row's cover, and a loading detail page draw it.
 fn draw_spinner(cx: &mut Cx, center: (f32, f32), radius: f32, color: Color) {
     let rect = Rect::new(
         center.0 - radius,
