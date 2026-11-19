@@ -237,6 +237,34 @@ fn rgba_at(pixels: &[u8], width: u32, at: (f32, f32)) -> (u8, u8, u8) {
     (pixels[i], pixels[i + 1], pixels[i + 2])
 }
 
+/// Run a selfcheck frame until it presents, retrying a transient
+/// [`crate::gfx::SurfaceError::Timeout`].
+///
+/// The selfcheck presents frames back-to-back without returning to the event
+/// loop, so a Wayland FIFO swapchain can briefly have every image held by the
+/// presentation engine and the acquire-ahead stalls past its wait cap. That is
+/// a transient timeout, not a failure — the scripted capture runs retry it
+/// the same way. Any other error is a real failure and panics.
+fn render_retrying_timeout(
+    label: &str,
+    mut render: impl FnMut() -> Result<(), crate::gfx::SurfaceError>,
+) {
+    const SLEEP: std::time::Duration = std::time::Duration::from_millis(5);
+    const MAX_TRIES: u32 = 200;
+    let mut tries = 0;
+    loop {
+        match render() {
+            Ok(()) => return,
+            Err(err) => {
+                assert_eq!(err, crate::gfx::SurfaceError::Timeout, "{label}: {err:?}");
+                tries += 1;
+                assert!(tries <= MAX_TRIES, "{label}: still timing out");
+                std::thread::sleep(SLEEP);
+            }
+        }
+    }
+}
+
 /// Scripted screenshot states for `--selfcheck`.
 #[derive(Clone, Debug)]
 pub enum SelfCheckShot {
@@ -315,6 +343,9 @@ pub struct App {
     pub hidden: bool,
     /// Decides when the process working set is returned to the OS (idle / after warm-up).
     memory: crate::memory::IdleTrim,
+    /// Consecutive `SurfaceError::Timeout` results (Wayland offscreen/workspace throttling backoff).
+    pub(crate) consecutive_timeouts: u32,
+    pub(crate) timeout_until: Option<Instant>,
     pub dirty: bool,
     pub last_input: Instant,
     pub last_frame: Instant,
@@ -609,21 +640,24 @@ impl App {
                 camera,
                 ..
             } = self;
-            renderer
-                .render_ui(
-                    camera,
-                    Some(viewport),
-                    |draw| {
-                        scene.draw(draw);
-                        1
-                    },
-                    Some(&frame),
-                )
-                .expect("legacy composite frame");
+            // Frames here are presented back-to-back without returning to the
+            // event loop, which a Wayland FIFO swapchain can briefly throttle;
+            // see `render_retrying_timeout`.
+            render_retrying_timeout("legacy composite frame", || {
+                renderer
+                    .render_ui(
+                        camera,
+                        Some(viewport),
+                        |draw| {
+                            scene.draw(draw);
+                            1
+                        },
+                        Some(&frame),
+                    )
+                    .map(|_| ())
+            });
             let (legacy_px, lw, lh) = renderer.capture_rgba8();
-            renderer
-                .render_ui_only(Some(&frame))
-                .expect("ui-only frame");
+            render_retrying_timeout("ui-only frame", || renderer.render_ui_only(Some(&frame)));
             let (only_px, ow, oh) = renderer.capture_rgba8();
             assert_eq!((lw, lh), (ow, oh));
             let worst = legacy_px

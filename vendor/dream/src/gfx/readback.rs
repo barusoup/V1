@@ -1,7 +1,8 @@
-use super::vulkan;
+use super::vulkan::{self, GpuBuffer};
 use super::{FrameMetrics, Renderer};
 use crate::ui::render::UiBlend;
 use ash::vk;
+use std::sync::LazyLock;
 
 impl Renderer {
     /// Whether display-target pixels are stored blue-first (B8G8R8A8).
@@ -51,14 +52,14 @@ impl Renderer {
     /// Copy the composed display image to the CPU. The display target is in
     /// the swapchain format — 8-bit BGRA or RGBA, sRGB-encoded when the
     /// surface is sRGB — not the scene pass's RGBA16F. Without a retained
-    /// frame (see [`Self::display_readable`]) this returns zeroed texels.
-    fn read_display_bytes(&mut self) -> Vec<u8> {
+    /// frame (see [`Self::display_readable`]) this returns `None`.
+    fn read_display_buffer(&mut self) -> Option<GpuBuffer> {
         let (w, h) = self.display_size;
         if !self.display_readable() {
-            return vec![0; (w as usize) * (h as usize) * 4];
+            return None;
         }
         let bytes = (w as u64) * (h as u64) * 4;
-        let buffer = self.ctx.create_readback_buffer("readback", bytes);
+        let buffer = self.ctx.create_cached_readback_buffer("readback", bytes);
         let image = self.display.image;
         let device = self.ctx.device().clone();
         self.ctx.one_shot(|cmd| unsafe {
@@ -94,10 +95,7 @@ impl Renderer {
                 &[region],
             );
         });
-        buffer
-            .mapped()
-            .expect("readback buffer is host visible")
-            .to_vec()
+        Some(buffer)
     }
 
     /// Raw bytes of the motion-vector target (render resolution, RG16
@@ -106,7 +104,12 @@ impl Renderer {
     /// across submissions should diff these bytes directly.
     pub fn capture_velocity_rg16f(&mut self) -> (Vec<u8>, u32, u32) {
         let (w, h) = self.render_size;
-        (self.read_velocity_bytes(), w, h)
+        let buffer = self.read_velocity_buffer();
+        let data = buffer
+            .mapped()
+            .expect("velocity buffer is host visible")
+            .to_vec();
+        (data, w, h)
     }
 
     /// Copy the scene depth target (render resolution, `D32_SFLOAT`, top row
@@ -116,7 +119,9 @@ impl Renderer {
         self.ensure_scene_targets();
         let (w, h) = self.render_size;
         let bytes = (w as u64) * (h as u64) * 4;
-        let buffer = self.ctx.create_readback_buffer("depth readback", bytes);
+        let buffer = self
+            .ctx
+            .create_cached_readback_buffer("depth readback", bytes);
         let image = self.targets.depth.image;
         let device = self.ctx.device().clone();
         self.ctx.one_shot(|cmd| unsafe {
@@ -166,14 +171,11 @@ impl Renderer {
                 vk::ImageAspectFlags::DEPTH,
             );
         });
-        let data = buffer
-            .mapped()
-            .expect("depth buffer is host visible")
-            .to_vec();
+        let data = buffer.mapped().expect("depth buffer is host visible");
         // Vulkan image row 0 is the framebuffer's bottom row; flip so the
         // returned buffer is top-first like the PNG captures.
         let row = (w as usize) * 4;
-        let mut flipped = vec![0u8; data.len()];
+        let mut flipped = vec![0u8; row * h as usize];
         for y in 0..h as usize {
             let src = (h as usize - 1 - y) * row;
             flipped[y * row..(y + 1) * row].copy_from_slice(&data[src..src + row]);
@@ -182,11 +184,13 @@ impl Renderer {
     }
 
     /// Copy the motion-vector target (render resolution, f16 two-channel) to the CPU.
-    fn read_velocity_bytes(&mut self) -> Vec<u8> {
+    fn read_velocity_buffer(&mut self) -> GpuBuffer {
         self.ensure_scene_targets();
         let (rw, rh) = self.render_size;
         let bytes = (rw as u64) * (rh as u64) * 4;
-        let buffer = self.ctx.create_readback_buffer("velocity readback", bytes);
+        let buffer = self
+            .ctx
+            .create_cached_readback_buffer("velocity readback", bytes);
         let image = self.targets.velocity.image;
         let device = self.ctx.device().clone();
         self.ctx.one_shot(|cmd| unsafe {
@@ -223,17 +227,16 @@ impl Renderer {
             );
         });
         buffer
-            .mapped()
-            .expect("velocity buffer is host visible")
-            .to_vec()
     }
 
     /// Copy the FSR dilated reactive masks (render resolution, R8G8B8A8_UNORM)
     /// to the CPU, or `None` when temporal upscaling is off.
-    fn read_reactive_bytes(&mut self) -> Option<Vec<u8>> {
+    fn read_reactive_buffer(&mut self) -> Option<GpuBuffer> {
         let (image, (rw, rh)) = self.fsr.as_ref().map(|fsr| fsr.reactive_masks())?;
         let bytes = (rw as u64) * (rh as u64) * 4;
-        let buffer = self.ctx.create_readback_buffer("reactive readback", bytes);
+        let buffer = self
+            .ctx
+            .create_cached_readback_buffer("reactive readback", bytes);
         let device = self.ctx.device().clone();
         self.ctx.one_shot(|cmd| unsafe {
             vulkan::image_barrier(
@@ -268,12 +271,7 @@ impl Renderer {
                 &[region],
             );
         });
-        Some(
-            buffer
-                .mapped()
-                .expect("reactive readback buffer is host visible")
-                .to_vec(),
-        )
+        Some(buffer)
     }
 
     /// GPU time of the scene pass on the frame that most recently completed on
@@ -297,7 +295,6 @@ impl Renderer {
     pub fn frame_metrics(&mut self) -> FrameMetrics {
         let (w, h) = self.display_size;
         let (rw, rh) = self.render_size;
-        let data = self.read_display_bytes();
         let count = (w as u64) * (h as u64);
         let bgra = self.display_bgra();
         let srgb = self.display_srgb();
@@ -306,30 +303,34 @@ impl Renderer {
         let mut sky_top = 0u64;
         let mut sky_bottom = 0u64;
         let mut nonblack = 0u64;
-        for i in 0..count {
-            let [r, g, b] = display_linear(&data, i as usize, bgra, srgb);
-            sum[0] += r as f64;
-            sum[1] += g as f64;
-            sum[2] += b as f64;
-            if (r - 0.48).abs() < 0.02 && (g - 0.69).abs() < 0.02 && (b - 0.89).abs() < 0.02 {
-                sky += 1;
-                // The composed display image is in screen-row order (row 0 is
-                // the top of the frame); report halves in screen space.
-                let screen_row = i / (w as u64);
-                if screen_row < (h as u64) / 2 {
-                    sky_top += 1;
-                } else {
-                    sky_bottom += 1;
+        if let Some(buffer) = self.read_display_buffer() {
+            let data = buffer.mapped().expect("readback buffer is host visible");
+            for i in 0..count {
+                let [r, g, b] = display_linear(data, i as usize, bgra, srgb);
+                sum[0] += r as f64;
+                sum[1] += g as f64;
+                sum[2] += b as f64;
+                if (r - 0.48).abs() < 0.02 && (g - 0.69).abs() < 0.02 && (b - 0.89).abs() < 0.02 {
+                    sky += 1;
+                    // The composed display image is in screen-row order (row 0 is
+                    // the top of the frame); report halves in screen space.
+                    let screen_row = i / (w as u64);
+                    if screen_row < (h as u64) / 2 {
+                        sky_top += 1;
+                    } else {
+                        sky_bottom += 1;
+                    }
                 }
-            }
-            if r + g + b > 0.01 {
-                nonblack += 1;
+                if r + g + b > 0.01 {
+                    nonblack += 1;
+                }
             }
         }
         // Motion vectors are only useful if the scene pass really writes them.
         // A camera that moves while this reports zero means upscalers will
         // reproject as if nothing moved.
-        let vdata = self.read_velocity_bytes();
+        let vbuffer = self.read_velocity_buffer();
+        let vdata = vbuffer.mapped().expect("velocity buffer is host visible");
         let vcount = (rw as u64) * (rh as u64);
         let mut mv_max = 0.0f32;
         let mut mv_sum = 0.0f64;
@@ -352,7 +353,10 @@ impl Renderer {
             }
         }
         let mut reactive_mean = [0.0f32; 4];
-        if let Some(mdata) = self.read_reactive_bytes() {
+        if let Some(mbuffer) = self.read_reactive_buffer() {
+            let mdata = mbuffer
+                .mapped()
+                .expect("reactive readback buffer is host visible");
             let pixels = (mdata.len() / 4).max(1) as f64;
             for i in 0..mdata.len() / 4 {
                 let base = i * 4;
@@ -395,13 +399,21 @@ impl Renderer {
     /// switched on for the next frame.
     pub fn capture_rgba8(&mut self) -> (Vec<u8>, u32, u32) {
         let (w, h) = self.display_size;
-        let data = self.read_display_bytes();
+        let pixels = (w as usize) * (h as usize);
+        let Some(buffer) = self.read_display_buffer() else {
+            let mut out = vec![0u8; pixels * 4];
+            for px in out.as_chunks_mut::<4>().0 {
+                px[3] = 255;
+            }
+            return (out, w, h);
+        };
+        let data = buffer.mapped().expect("readback buffer is host visible");
         let bgra = self.display_bgra();
         let srgb = self.display_srgb();
-        let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+        let mut out = vec![0u8; pixels * 4];
         // The display image is in screen-row order; PNG rows run the same way,
         // so no flip here.
-        for i in 0..(w as usize) * (h as usize) {
+        for i in 0..pixels {
             let src = i * 4;
             let (r, g, b) = if bgra {
                 (data[src + 2], data[src + 1], data[src])
@@ -455,14 +467,20 @@ fn display_linear(data: &[u8], index: usize, bgra: bool, srgb: bool) -> [f32; 3]
     }
 }
 
+static SRGB8_TO_LINEAR: LazyLock<[f32; 256]> = LazyLock::new(|| {
+    std::array::from_fn(|i| {
+        let s = i as f32 / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    })
+});
+
 /// 8-bit sRGB to linear float.
 fn srgb8_to_linear(value: u8) -> f32 {
-    let s = value as f32 / 255.0;
-    if s <= 0.04045 {
-        s / 12.92
-    } else {
-        ((s + 0.055) / 1.055).powf(2.4)
-    }
+    SRGB8_TO_LINEAR[value as usize]
 }
 
 /// Linear colour to 8-bit sRGB, matching the swapchain's sRGB transfer function.

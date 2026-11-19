@@ -11,6 +11,9 @@ use dream::bedframe::widgets::{
 };
 use dream::fsr3::JitterSequence as Fsr3Jitter;
 use dream::gfx::ColorVertex;
+#[cfg(target_os = "macos")]
+use dream::gfx::metal::{DynamicBuffers, GpuBuffer, GpuContext, GpuImage, PulledMesh, Swapchain};
+#[cfg(not(target_os = "macos"))]
 use dream::gfx::vulkan::{DynamicBuffers, GpuBuffer, GpuContext, GpuImage, PulledMesh, Swapchain};
 use dream::model::render::{ModelVertex, PbrVertex, SkinnedVertex};
 use dream::model::{AlphaMode, Material, Model, ModelInstance, TexelFilter, UvTransform, Wrap};
@@ -262,22 +265,29 @@ fn font_static_loading_paths_are_public() {
 
 #[test]
 fn presentation_and_capture_paths_are_public() {
-    use dream::gfx::{PresentMode, Renderer};
+    use dream::gfx::{GpuPreference, PresentMode, Renderer};
     let _ = size_of::<PresentMode>();
-    let _ = dream::gfx::vulkan::SwapchainOptions::default();
-    let _: dream::gfx::vulkan::PresentMode = PresentMode::Mailbox;
+    let _ = size_of::<GpuPreference>();
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dream::gfx::vulkan::SwapchainOptions::default();
+        let _: dream::gfx::vulkan::PresentMode = PresentMode::Mailbox;
+    }
     let _: fn(&mut Renderer, PresentMode) = Renderer::set_present_mode;
     let _: fn(&Renderer) -> PresentMode = Renderer::present_mode;
     let _: fn(&mut Renderer, bool) = Renderer::set_frame_capture;
     let _: fn(&Renderer) -> bool = Renderer::frame_capture;
     let _: fn(&mut Renderer) = Renderer::trim_memory;
-    let _: fn(
-        &Arc<GpuContext>,
-        u32,
-        u32,
-        ash::vk::SwapchainKHR,
-        dream::gfx::vulkan::SwapchainOptions,
-    ) -> Swapchain = Swapchain::new_with;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _: fn(
+            &Arc<GpuContext>,
+            u32,
+            u32,
+            ash::vk::SwapchainKHR,
+            dream::gfx::vulkan::SwapchainOptions,
+        ) -> Swapchain = Swapchain::new_with;
+    }
 }
 
 #[test]

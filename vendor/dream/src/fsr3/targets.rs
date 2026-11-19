@@ -99,21 +99,61 @@ impl FsrTargets {
             targets.new_locks.image,
             targets.upscaled_output.image,
         ];
+        let subresource = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let barriers = images.map(|image| {
+            vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(subresource)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        });
+        let post_clear = [vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(targets.farthest_depth_mip1.image)
+            .subresource_range(subresource)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)];
         ctx.one_shot(|cmd| unsafe {
-            for image in images {
-                crate::gfx::vulkan::image_barrier(
-                    ctx.device(),
-                    cmd,
-                    image,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::GENERAL,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    vk::AccessFlags::empty(),
-                    vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-                    vk::ImageAspectFlags::COLOR,
-                );
-            }
+            ctx.device().cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barriers,
+            );
+            ctx.device().cmd_clear_color_image(
+                cmd,
+                targets.farthest_depth_mip1.image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue {
+                    float32: [1.0, 0.0, 0.0, 0.0],
+                },
+                &[subresource],
+            );
+            ctx.device().cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &post_clear,
+            );
         });
 
         targets

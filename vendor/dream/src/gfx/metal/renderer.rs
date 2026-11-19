@@ -111,6 +111,16 @@ impl Renderer {
         Self::new_inner(window, shader_src, None, settings, blend)
     }
 
+    pub fn new_with_options(
+        window: Arc<Window>,
+        shader_src: &str,
+        settings: Settings,
+        blend: UiBlend,
+        _preference: crate::gfx::GpuPreference,
+    ) -> Self {
+        Self::new_inner(window, shader_src, None, settings, blend)
+    }
+
     pub fn new_with_pulling(
         window: Arc<Window>,
         shader_src: &str,

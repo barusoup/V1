@@ -12,7 +12,7 @@
 //! cargo run --release --bin bedframe_mem_probe
 //! ```
 
-use dream::gfx::Renderer;
+use dream::gfx::{Renderer, SurfaceError};
 use dream::memory::{resident_bytes, trim_working_set};
 use dream::settings::Settings;
 use dream::ui::Rect;
@@ -28,8 +28,8 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-const WIDTH: f32 = 1200.0;
-const HEIGHT: f32 = 600.0;
+const WIDTH: u32 = 1200;
+const HEIGHT: u32 = 600;
 /// Time for the OS to settle a trim before reading the working set.
 const TRIM_SETTLE: Duration = Duration::from_millis(1500);
 /// Time between a stage and its measurement.
@@ -48,17 +48,29 @@ fn trimmed(label: &str) {
 }
 
 /// Build one UI frame with a single button and submit it.
-fn ui_frame(ui: &mut Ui, renderer: &mut Renderer) {
-    ui.begin(UiInput::default(), (WIDTH, HEIGHT));
-    ui.button(
-        "Hello world",
-        Rect::new(10.0, 10.0, 120.0, 30.0),
-        ButtonStyle::new(FontId(0)),
-    );
-    let frame = ui.end();
-    renderer
-        .render_ui_only(Some(&frame))
-        .expect("render UI frame");
+fn ui_frame(ui: &mut Ui, renderer: &mut Renderer, window: &Window) {
+    let mut timeouts = 0u32;
+    loop {
+        let (w, h) = renderer.display_size();
+        ui.begin(UiInput::default(), (w as f32, h as f32));
+        ui.button(
+            "Hello world",
+            Rect::new(10.0, 10.0, 120.0, 30.0),
+            ButtonStyle::new(FontId(0)),
+        );
+        let frame = ui.end();
+        let res = renderer.render_ui_only(Some(&frame));
+        ui.recycle_frame(frame);
+        match res {
+            Ok(()) => return,
+            Err(SurfaceError::Outdated) => renderer.resize(window.inner_size()),
+            Err(SurfaceError::Timeout) if timeouts < 20 => {
+                timeouts += 1;
+                sleep(Duration::from_millis(20));
+            }
+            Err(err) => panic!("render UI frame: {err:?}"),
+        }
+    }
 }
 
 struct Probe;
@@ -67,40 +79,45 @@ impl ApplicationHandler for Probe {
     fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window = Arc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("bedframe_mem_probe")
-                        .with_inner_size(PhysicalSize::new(WIDTH as u32, HEIGHT as u32))
-                        .with_visible(true),
-                )
-                .expect("create window"),
-        );
+        let mut attrs = Window::default_attributes()
+            .with_title("bedframe_mem_probe")
+            .with_inner_size(PhysicalSize::new(WIDTH, HEIGHT))
+            .with_visible(true);
+        #[cfg(target_os = "linux")]
+        {
+            attrs = attrs
+                .with_min_inner_size(PhysicalSize::new(WIDTH, HEIGHT))
+                .with_max_inner_size(PhysicalSize::new(WIDTH, HEIGHT));
+        }
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         report("window created");
 
-        let mut renderer = Renderer::new(window, dream::DEFAULT_SCENE_WGSL, Settings::default());
+        let mut renderer = Renderer::new(
+            Arc::clone(&window),
+            dream::DEFAULT_SCENE_WGSL,
+            Settings::default(),
+        );
         report("Renderer::new");
 
         let mut ui = Ui::new(Fonts::bundled(), AtlasConfig::default());
         report("Ui::new+fonts");
 
         for _ in 0..3 {
-            ui_frame(&mut ui, &mut renderer);
+            ui_frame(&mut ui, &mut renderer, &window);
         }
         report("after 3 UI frames");
 
         for _ in 0..200 {
-            ui_frame(&mut ui, &mut renderer);
+            ui_frame(&mut ui, &mut renderer, &window);
         }
         report("after 200 UI frames");
 
         trimmed("after trim_working_set");
 
         for round in 1..=3 {
-            ui_frame(&mut ui, &mut renderer);
+            ui_frame(&mut ui, &mut renderer, &window);
             for _ in 0..60 {
-                ui_frame(&mut ui, &mut renderer);
+                ui_frame(&mut ui, &mut renderer, &window);
             }
             report(&format!("wake round {round}"));
             trimmed(&format!("  trimmed after round {round}"));

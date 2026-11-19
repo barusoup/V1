@@ -10,13 +10,13 @@
 //! [`Ui::draw_list_mut`] — widgets are convenience, not a cage.
 
 use super::atlas::AtlasConfig;
-use super::draw::{DrawList, TextAa, UiFrame};
+use super::draw::{DrawList, UiFrame};
 use super::font::GlyphCache;
 use super::font::{FontId, Fonts, LayoutOptions};
+use super::hash::{IdMap, IdSet};
 use super::theme::Theme;
 use super::tween::{Anim, Ease};
 use super::{Color, Rect};
-use std::collections::{HashMap, HashSet};
 
 pub mod adapters;
 mod animation;
@@ -356,7 +356,7 @@ pub struct Ui {
     cache: GlyphCache,
     pub(crate) draw: DrawList,
     pub(crate) input: UiInput,
-    state: HashMap<u64, WidgetState>,
+    state: IdMap<WidgetState>,
     /// Id scopes as a running seed: `scopes` is the stack of cumulative
     /// FNV-1a seeds (one per open scope), `scope_seed` the current one.
     /// Hashing an id is O(label) — never O(depth).
@@ -381,10 +381,10 @@ pub struct Ui {
     /// keys on it so new faces invalidate old results.
     fonts_rev: u64,
     /// Persistent keyframe animations, keyed like widget ids.
-    anims_f32: HashMap<u64, Anim<f32>>,
-    anims_color: HashMap<u64, Anim<Color>>,
+    anims_f32: IdMap<Anim<f32>>,
+    anims_color: IdMap<Anim<Color>>,
     /// Persistent spring animations, keyed like widget ids.
-    anims_spring: HashMap<u64, SpringAnim>,
+    anims_spring: IdMap<SpringAnim>,
     /// Scroll-view physics for every view built this frame (public field:
     /// set it to whatever feel the app wants; nothing reads it but the
     /// scroll views).
@@ -394,29 +394,29 @@ pub struct Ui {
     /// When set, widget input is confined to this rect (an open modal card).
     blocked: Option<Rect>,
     /// Wheel-scroll offsets for scroll views, keyed by id.
-    pub(crate) scrolls: HashMap<u64, ScrollState>,
+    pub(crate) scrolls: IdMap<ScrollState>,
     /// Content height each scroll view reported on its last frame, keyed
     /// like `scrolls` — the extent [`Ui::scroll_state`] reports so a host
     /// can pin a transcript to its newest row.
-    pub(crate) scroll_contents: HashMap<u64, f32>,
+    pub(crate) scroll_contents: IdMap<f32>,
     /// Drag anchors for `drag_field` and scrollbar thumbs, keyed by id.
-    pub(crate) drags: HashMap<u64, DragAnchor>,
+    pub(crate) drags: IdMap<DragAnchor>,
     /// Scrollbars waiting to be drawn by `scroll_end`: a scroll view paints
     /// its thumb over its content, not under it.
     pub(crate) scroll_thumbs: Vec<(u64, Rect, f32, f32)>,
     /// Wheel remainder passed from a nested scroll view to its parent
     /// (scroll chaining), with the frame it was written on: the parent picks
     /// it up on the next build, and an entry nobody claims expires.
-    pub(crate) scroll_chain: HashMap<u64, (f32, u64)>,
+    pub(crate) scroll_chain: IdMap<(f32, u64)>,
     /// One-shot pulses (icon engage pop), keyed by id.
-    pulses: HashMap<u64, Pulse>,
+    pulses: IdMap<Pulse>,
     /// Menus whose highlighted row is the keyboard's, not the pointer's
     /// (id -> last frame touched). A menu is absent until an arrow key moves
     /// its focus and absent again once the pointer enters it or it starts
     /// closing, so an untouched menu shows no highlight at all.
-    menu_keyboard: HashMap<u64, u64>,
+    menu_keyboard: IdMap<u64>,
     /// Looping animations (caret blink, spinners), keyed like widget ids.
-    loops: HashMap<u64, LoopState>,
+    loops: IdMap<LoopState>,
     /// Interactive overlay surfaces registered this frame and last frame
     /// (input gating: [`Self::hit`], [`Self::input_allowed`]).
     surfaces_cur: Vec<InputSurface>,
@@ -444,8 +444,8 @@ pub struct Ui {
     /// Toast ids rendered last frame / this frame: a toast only ages once
     /// it has spent a frame on screen, so a notification pushed during a
     /// long idle gap does not arrive pre-expired.
-    toasts_prev: HashSet<u64>,
-    toasts_cur: HashSet<u64>,
+    toasts_prev: IdSet,
+    toasts_cur: IdSet,
     scroll_prev: Vec<ScrollRegion>,
     /// Whether this frame's wheel was already consumed (a wheel tick is
     /// spent exactly once, by the deepest eligible view).
@@ -468,13 +468,15 @@ pub struct Ui {
     /// means "advance by the real frame time" (the display's own rate).
     rate_stack: Vec<f32>,
     /// Per-scope accumulators for [`Self::rate_scope`], keyed by scope id.
-    rates: HashMap<u64, RateBucket>,
+    rates: IdMap<RateBucket>,
     /// Shared text metrics the unstyled widgets read from.
     text_metrics: UiTextMetrics,
     /// Per-field editor state (caret/selection/undo), keyed by widget id.
-    editors: HashMap<u64, editor::EditorState>,
+    editors: IdMap<editor::EditorState>,
     /// Retained undo bytes across all fields — the global 2 MiB bound.
     edit_history_bytes: usize,
+    /// True when any editor's undo history changed or stale editors retired.
+    pub(crate) editors_dirty: bool,
     /// Text a field asked the host to put on the clipboard (copy/cut).
     clipboard_out: Option<String>,
     /// Segment cell scratch (reused each frame — no per-frame Vec).
@@ -501,9 +503,21 @@ pub struct Ui {
     /// through [`Self::set_motion_scale`]; the default is `1.0`, so the
     /// framework asserts no policy of its own.
     motion_scale: f32,
-    /// Glyph placement for every text draw; see [`TextAa`]. Default
-    /// [`TextAa::Subpixel`].
-    text_aa: TextAa,
+    /// Cursor shape requested by hovered/active widgets this frame.
+    cursor: UiCursor,
+}
+
+/// Cursor shape requested by BedFrame widgets for the current frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UiCursor {
+    #[default]
+    Default,
+    Pointer,
+    Text,
+    EwResize,
+    NsResize,
+    Grab,
+    Grabbing,
 }
 
 /// Shared text metrics for widgets that don't take an explicit style —
@@ -565,7 +579,7 @@ impl Ui {
             cache: GlyphCache::new(super::atlas::Atlas::new(atlas_config)),
             draw: DrawList::new(),
             input: UiInput::default(),
-            state: HashMap::new(),
+            state: IdMap::default(),
             scopes: Vec::new(),
             scope_seed: FNV_OFFSET,
             hot_id: None,
@@ -576,20 +590,20 @@ impl Ui {
             icons: super::icons::IconSet::new(),
             layouts: layout_cache::LayoutCache::default(),
             fonts_rev: 0,
-            anims_f32: HashMap::new(),
-            anims_color: HashMap::new(),
-            anims_spring: HashMap::new(),
+            anims_f32: IdMap::default(),
+            anims_color: IdMap::default(),
+            anims_spring: IdMap::default(),
             scroll_config: ScrollConfig::default(),
             scrollbar: ScrollbarStyle::default(),
             blocked: None,
-            scrolls: HashMap::new(),
-            scroll_contents: HashMap::new(),
-            drags: HashMap::new(),
+            scrolls: IdMap::default(),
+            scroll_contents: IdMap::default(),
+            drags: IdMap::default(),
             scroll_thumbs: Vec::new(),
-            scroll_chain: HashMap::new(),
-            pulses: HashMap::new(),
-            menu_keyboard: HashMap::new(),
-            loops: HashMap::new(),
+            scroll_chain: IdMap::default(),
+            pulses: IdMap::default(),
+            menu_keyboard: IdMap::default(),
+            loops: IdMap::default(),
             surfaces_cur: Vec::new(),
             surfaces_prev: Vec::new(),
             clip_scopes: Vec::new(),
@@ -600,21 +614,21 @@ impl Ui {
             building: false,
             tooltip_dwell: None,
             scroll_cur: Vec::new(),
-            toasts_prev: HashSet::new(),
-            toasts_cur: HashSet::new(),
+            toasts_prev: IdSet::default(),
+            toasts_cur: IdSet::default(),
             scroll_prev: Vec::new(),
             wheel_taken: false,
             press_consumed: false,
             wake_in: None,
             scale: 1.0,
             motion_scale: 1.0,
-            text_aa: TextAa::default(),
             theme,
             rate_stack: Vec::new(),
-            rates: HashMap::new(),
+            rates: IdMap::default(),
             text_metrics,
-            editors: HashMap::new(),
+            editors: IdMap::default(),
             edit_history_bytes: 0,
+            editors_dirty: false,
             clipboard_out: None,
             seg_cells: Vec::new(),
             hooks: hooks::Hooks::default(),
@@ -626,6 +640,7 @@ impl Ui {
             focus_rings: false,
             focus_visible: false,
             atlas_epoch: 0,
+            cursor: UiCursor::Default,
         };
         ui.atlas_epoch = ui.cache.epoch();
         ui
@@ -799,19 +814,6 @@ impl Ui {
         self.scale
     }
 
-    /// Glyph placement for every label drawn after this call; see
-    /// [`TextAa`]. Default [`TextAa::Subpixel`]: letters keep the shaper's
-    /// fractional advances, so spacing stays even at any scale.
-    pub fn set_text_aa(&mut self, aa: TextAa) {
-        self.text_aa = aa;
-        self.draw.set_text_aa(aa);
-    }
-
-    /// The glyph placement mode in force (see [`Self::set_text_aa`]).
-    pub fn text_aa(&self) -> TextAa {
-        self.text_aa
-    }
-
     /// How long until a pending UI clock (a tooltip mid-dwell, a toast
     /// approaching expiry) needs the host to build a frame. `None` means
     /// nothing is waiting — the host may park until input arrives. A
@@ -862,6 +864,16 @@ impl Ui {
             return None;
         }
         self.editing_caret.or(self.focus_rect)
+    }
+
+    /// Cursor shape requested by widgets this frame (`UiCursor::Default` if none).
+    pub fn cursor(&self) -> UiCursor {
+        self.cursor
+    }
+
+    /// Request a cursor shape for this frame.
+    pub fn set_cursor(&mut self, cursor: UiCursor) {
+        self.cursor = cursor;
     }
 
     /// The focused editor reports its caret rect this frame.
@@ -929,12 +941,12 @@ impl Ui {
         self.screen = screen_size;
         self.draw.begin(screen_size);
         self.draw.set_scale(self.scale);
-        self.draw.set_text_aa(self.text_aa);
         self.scopes.clear();
         self.scope_seed = FNV_OFFSET;
         self.hot_id = None;
         self.blocked = None;
         self.focus_seen = false;
+        self.cursor = UiCursor::Default;
         self.rate_stack.clear();
         self.clip_scopes.clear();
         self.press_consumed = false;
@@ -1060,8 +1072,10 @@ impl Ui {
         if self.frame.is_multiple_of(60) {
             self.retire_stale_state();
         }
-        self.enforce_edit_history_bound();
-        let mut frame = std::mem::take(&mut self.draw).finish(screen);
+        if self.editors_dirty {
+            self.enforce_edit_history_bound();
+        }
+        let mut frame = self.draw.finish_reuse(screen);
         frame.atlas_snapshot = Some(snapshot);
         self.building = false;
         frame
@@ -1114,8 +1128,12 @@ impl Ui {
             .retain(|_, rate| frame.saturating_sub(rate.last_frame) < STALE_FRAMES);
         self.menu_keyboard
             .retain(|_, touched| frame.saturating_sub(*touched) < STALE_FRAMES);
+        let prev_editors = self.editors.len();
         self.editors
             .retain(|_, state| frame.saturating_sub(state.last_frame) < STALE_FRAMES);
+        if self.editors.len() != prev_editors {
+            self.editors_dirty = true;
+        }
         if self.editors.capacity() > 1024 && self.editors.len() * 4 < self.editors.capacity() {
             self.editors.shrink_to_fit();
         }
@@ -1131,18 +1149,20 @@ impl Ui {
         let focus = self.focus_id;
         let protected = |id: u64| Some(id) == active || Some(id) == focus;
         fn evict_eldest<V>(
-            map: &mut HashMap<u64, V>,
+            map: &mut IdMap<V>,
             last: impl Fn(&V) -> u64,
             protected: &dyn Fn(u64) -> bool,
             frame_now: u64,
         ) {
             if map.len() > MAX_ENTRIES {
                 let removals = map.len() - MAX_ENTRIES;
-                let mut ages: Vec<(u64, u64)> = map
-                    .iter()
-                    .filter(|&(&id, value)| last(value) != frame_now && !protected(id))
-                    .map(|(&id, value)| (id, last(value)))
-                    .collect();
+                let mut ages = Vec::with_capacity(map.len());
+                for (&id, value) in map.iter() {
+                    let touched = last(value);
+                    if touched != frame_now && !protected(id) {
+                        ages.push((id, touched));
+                    }
+                }
                 if removals < ages.len() {
                     ages.select_nth_unstable_by_key(removals - 1, |&(_, last_frame)| last_frame);
                     ages.truncate(removals);
@@ -1297,25 +1317,32 @@ impl Ui {
     }
 
     fn hover_level(&mut self, id: u64, hovered: bool) -> f32 {
-        if hovered {
-            self.hot_id = Some(id);
-        }
         let frame = self.frame;
         let dt = self.anim_dt();
-        let state = self.state.entry(id).or_insert_with(WidgetState::new);
-        state.last_frame = frame;
         // Retarget only on change: a settled hover must stay *finished* so
-        // `Ui::animating` can go false and the app can idle.
-        let target = if hovered { 1.0 } else { 0.0 };
-        if state.hover.target() != target {
-            let motion = self.theme.tokens.motion;
-            let (duration, ease) = if hovered {
-                (motion.hover_in, Ease::CubicOut)
-            } else {
-                (motion.hover_out, Ease::CubicOut)
-            };
-            state.hover.animate_to(target, duration, ease);
+        // `Ui::animating` can go false and the app can idle. Unhovered widgets
+        // allocate no state entry at all until actually hovered.
+        if hovered {
+            self.hot_id = Some(id);
+            let hover_in = self.theme.tokens.motion.hover_in;
+            let state = self.state.entry(id).or_insert_with(WidgetState::new);
+            state.last_frame = frame;
+            if state.hover.target() != 1.0 {
+                state.hover.animate_to(1.0, hover_in, Ease::CubicOut);
+            }
+            return state.hover.update(dt);
         }
+        let Some(state) = self.state.get_mut(&id) else {
+            return 0.0;
+        };
+        if state.hover.target() != 0.0 {
+            let hover_out = self.theme.tokens.motion.hover_out;
+            state.hover.animate_to(0.0, hover_out, Ease::CubicOut);
+        }
+        if state.hover.finished() && state.hover.target() == 0.0 {
+            return state.hover.value();
+        }
+        state.last_frame = frame;
         state.hover.update(dt)
     }
 

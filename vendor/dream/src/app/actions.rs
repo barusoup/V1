@@ -146,6 +146,7 @@ impl App {
         }
         self.retired_previews.retain(|(_, frames)| *frames > 0);
 
+        let mut release_warmup_scene = false;
         if let Some(warmup) = self.thumb_warmup.take() {
             self.pending_thumb_capture = None;
             let viewport = self.physical_rect(self.layout.viewport);
@@ -165,6 +166,7 @@ impl App {
                 self.scene.load_debug();
             } else if !warmup.debug_was_loaded {
                 self.scene.unload_debug();
+                release_warmup_scene = true;
             }
             self.renderer.reset_history();
         } else if let Some(pixels) = self.renderer.take_scene_thumbnail()
@@ -173,40 +175,39 @@ impl App {
             self.store_preview(id, pixels);
         }
         // More scenes may still need their first shot; keep frames coming.
-        if self.main_pane_page == MainPanePage::SceneManager
+        let more_warmups = self.main_pane_page == MainPanePage::SceneManager
             && self.scene_manager.scenes.iter().any(|s| {
-                !self.preview_pixels.contains_key(&s.id) && !self.thumb_failed.contains(&s.id)
-            })
-        {
+                !self.preview_textures.contains_key(&s.id) && !self.thumb_failed.contains(&s.id)
+            });
+        if more_warmups {
             self.dirty = true;
+        } else if release_warmup_scene && self.main_pane_page == MainPanePage::SceneManager {
+            self.renderer.release_scene_resources();
         }
     }
 
-    /// Keep a finished capture as the scene's card preview, unless the scene
-    /// was deleted while its capture was in flight.
+    /// Upload a finished capture as the scene's card preview texture, unless the
+    /// scene was deleted while its capture was in flight. The uncompressed CPU
+    /// copy is evicted immediately after GPU upload to keep resident memory small.
     fn store_preview(&mut self, id: u64, pixels: Vec<u8>) {
         if !self.scene_manager.scenes.iter().any(|s| s.id == id) {
             return;
         }
-        self.preview_pixels
-            .insert(id, super::main_pane::PreviewImage { pixels });
-        self.upload_thumbnail(id);
+        self.upload_thumbnail_pixels(id, &pixels);
+        self.preview_pixels.remove(&id);
     }
 
-    /// Upload (or refresh) one scene's card preview texture.
-    fn upload_thumbnail(&mut self, id: u64) {
-        let Some(preview) = self.preview_pixels.get(&id) else {
-            return;
-        };
+    /// Upload (or refresh) one scene's card preview texture from top-first RGBA8 pixels.
+    fn upload_thumbnail_pixels(&mut self, id: u64, pixels: &[u8]) {
         let size = super::main_pane::THUMB_SIZE;
-        debug_assert_eq!(preview.pixels.len(), size as usize * size as usize * 4);
+        debug_assert_eq!(pixels.len(), size as usize * size as usize * 4);
         // Cards show only the top band (rows are top-first), so upload just
         // those rows: the card's rounded UVs then span the texture exactly.
         let rows = super::main_pane::CARD_H as u32;
         let texture = std::sync::Arc::new(crate::texture::GpuTexture::from_rgba8(
             self.renderer.context(),
             &format!("scene preview {id}"),
-            &preview.pixels[..size as usize * rows as usize * 4],
+            &pixels[..size as usize * rows as usize * 4],
             size,
             rows,
             crate::texture::TextureOptions {
@@ -234,7 +235,7 @@ impl App {
             return;
         }
         let next = self.scene_manager.scenes.iter().find(|s| {
-            !self.preview_pixels.contains_key(&s.id) && !self.thumb_failed.contains(&s.id)
+            !self.preview_textures.contains_key(&s.id) && !self.thumb_failed.contains(&s.id)
         });
         let Some(scene) = next else { return };
         let (id, is_debug) = (scene.id, scene.is_debug);

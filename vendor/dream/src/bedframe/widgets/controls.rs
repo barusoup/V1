@@ -119,7 +119,7 @@ impl Ui {
 
     /// The shared tail of [`Self::label`]: position the physical layout
     /// inside `rect` by the style and draw it scaled back to logical.
-    fn draw_label(
+    pub(super) fn draw_label(
         &mut self,
         rect: Rect,
         layout: &std::sync::Arc<super::super::font::TextLayout>,

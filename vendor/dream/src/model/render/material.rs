@@ -23,6 +23,44 @@ pub(crate) fn pbr_vertex_buffer(
     )
 }
 
+/// Shared neutral 1x1 fallback textures reused across all PBR materials whose
+/// slots omit a map (saves up to 5 images/samplers/one_shots per material).
+pub(crate) struct PbrFallbacks {
+    pub white_srgb: Arc<GpuTexture>,
+    pub white_linear: Arc<GpuTexture>,
+    pub flat_normal: Arc<GpuTexture>,
+    pub black_srgb: Arc<GpuTexture>,
+}
+
+impl PbrFallbacks {
+    pub(crate) fn new(ctx: &Arc<GpuContext>) -> Self {
+        let one_by_one = |label: &str, rgba: [u8; 4], format: TextureFormat| {
+            Arc::new(GpuTexture::from_rgba8(
+                ctx,
+                label,
+                &rgba,
+                1,
+                1,
+                TextureOptions {
+                    format,
+                    mip_levels: Some(1),
+                    ..Default::default()
+                },
+            ))
+        };
+        Self {
+            white_srgb: one_by_one("pbr fallback white srgb", [255; 4], TextureFormat::Srgb),
+            white_linear: one_by_one("pbr fallback white linear", [255; 4], TextureFormat::Linear),
+            flat_normal: one_by_one(
+                "pbr fallback normal",
+                [128, 128, 255, 255],
+                TextureFormat::Linear,
+            ),
+            black_srgb: one_by_one("pbr fallback black", [0; 4], TextureFormat::Srgb),
+        }
+    }
+}
+
 /// One material map: real pixels when present, else a neutral 1x1 that is
 /// identity under the factor multiply (black for emissive, flat normal for
 /// the normal map, white elsewhere).
@@ -32,7 +70,8 @@ fn map_texture(
     map: Option<&crate::model::TextureRef>,
     fallback: [u8; 4],
     format: TextureFormat,
-) -> GpuTexture {
+    shared_fallback: Option<&Arc<GpuTexture>>,
+) -> Arc<GpuTexture> {
     match map {
         Some(reference) => {
             // The file can ask per-axis wrap/filter; the sampler has one
@@ -51,7 +90,7 @@ fn map_texture(
                 },
                 anisotropy: true,
             };
-            GpuTexture::from_rgba8(
+            Arc::new(GpuTexture::from_rgba8(
                 ctx,
                 label,
                 &reference.texture.pixels,
@@ -62,20 +101,25 @@ fn map_texture(
                     sampler,
                     mip_levels: None,
                 },
-            )
+            ))
         }
-        None => GpuTexture::from_rgba8(
-            ctx,
-            label,
-            &fallback,
-            1,
-            1,
-            TextureOptions {
-                format,
-                mip_levels: Some(1),
-                ..Default::default()
-            },
-        ),
+        None => {
+            if let Some(shared) = shared_fallback {
+                return Arc::clone(shared);
+            }
+            Arc::new(GpuTexture::from_rgba8(
+                ctx,
+                label,
+                &fallback,
+                1,
+                1,
+                TextureOptions {
+                    format,
+                    mip_levels: Some(1),
+                    ..Default::default()
+                },
+            ))
+        }
     }
 }
 
@@ -99,15 +143,17 @@ impl PbrMaterialGpu {
         ctx: &Arc<GpuContext>,
         layout: vk::DescriptorSetLayout,
         material: &Material,
+        fallbacks: Option<&PbrFallbacks>,
     ) -> Self {
         let name = material.name.as_str();
-        let textures: Vec<Arc<GpuTexture>> = [
+        let textures: Vec<Arc<GpuTexture>> = vec![
             map_texture(
                 ctx,
                 &format!("{name} base"),
                 material.base_color_map.as_ref(),
                 [255; 4],
                 TextureFormat::Srgb,
+                fallbacks.map(|f| &f.white_srgb),
             ),
             map_texture(
                 ctx,
@@ -115,6 +161,7 @@ impl PbrMaterialGpu {
                 material.metallic_roughness_texture.as_ref(),
                 [255; 4],
                 TextureFormat::Linear,
+                fallbacks.map(|f| &f.white_linear),
             ),
             map_texture(
                 ctx,
@@ -122,6 +169,7 @@ impl PbrMaterialGpu {
                 material.normal_texture.as_ref(),
                 [128, 128, 255, 255],
                 TextureFormat::Linear,
+                fallbacks.map(|f| &f.flat_normal),
             ),
             map_texture(
                 ctx,
@@ -129,6 +177,7 @@ impl PbrMaterialGpu {
                 material.occlusion_texture.as_ref(),
                 [255; 4],
                 TextureFormat::Linear,
+                fallbacks.map(|f| &f.white_linear),
             ),
             map_texture(
                 ctx,
@@ -136,11 +185,9 @@ impl PbrMaterialGpu {
                 material.emissive_texture.as_ref(),
                 [0; 4],
                 TextureFormat::Srgb,
+                fallbacks.map(|f| &f.black_srgb),
             ),
-        ]
-        .into_iter()
-        .map(Arc::new)
-        .collect();
+        ];
 
         let maps: [Option<&crate::model::TextureRef>; 5] = [
             material.base_color_map.as_ref(),
@@ -342,11 +389,13 @@ impl PbrState {
         let pipeline_blended =
             create_pbr_pipeline(ctx, shader, layout, color_formats, depth_format, true);
         unsafe { ctx.device().destroy_shader_module(shader, None) };
+        let fallbacks = PbrFallbacks::new(ctx);
         Self {
             pipeline,
             pipeline_blended,
             layout,
             dsl_material,
+            fallbacks,
         }
     }
 }

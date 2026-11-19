@@ -57,6 +57,11 @@ impl fmt::Display for ImpostorInstanceError {
 
 impl std::error::Error for ImpostorInstanceError {}
 
+/// Check a `Mat4` against the impostor card contract without building a full instance.
+pub(super) fn check_transform_mat4(m: Mat4) -> Result<(), ImpostorInstanceError> {
+    check_transform(&m.to_cols_array_2d())
+}
+
 /// Check one 4x4 column-major matrix: finite, affine last row, orthogonal
 /// basis with a positive uniform scale (rotation + uniform scale +
 /// translation only).
@@ -1050,7 +1055,7 @@ fn create_impostor_pipeline(
         .push_next(&mut rendering);
     unsafe {
         ctx.device()
-            .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+            .create_graphics_pipelines(ctx.pipeline_cache(), &[info], None)
             .map_err(|(_, err)| err)
             .expect("create impostor pipeline")[0]
     }

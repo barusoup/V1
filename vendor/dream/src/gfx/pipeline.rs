@@ -280,7 +280,7 @@ pub(super) fn create_graphics_pipeline_fs(
 
     unsafe {
         ctx.device()
-            .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+            .create_graphics_pipelines(ctx.pipeline_cache(), &[info], None)
             .map_err(|(_, err)| err)
             .expect("create graphics pipeline")[0]
     }

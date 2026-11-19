@@ -79,8 +79,9 @@ or icon for their own product.
 ## Credits
 
 - **Dream Engine** and **Dream Media Handler** by Hunter Lehr ([Barusoup](https://github.com/barusoup)),
-  vendored in `vendor/`. `vendor/dream-media` carries local changes, described in
-  [its README](vendor/dream-media/README-v1.md).
+  vendored in `vendor/`. Both carry local changes, described in
+  [Dream's README](vendor/dream/README-v1.md) and
+  [Dream Media's README](vendor/dream-media/README-v1.md).
 - Fonts and icons are listed in [NOTICE](NOTICE). Rust dependencies and their licenses are listed
   in [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).
 

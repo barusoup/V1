@@ -49,6 +49,8 @@ pub struct DebugScene {
     /// The spinning hero box, rebuilt each animated frame.
     hero: DynamicBuffers,
     hero_index_count: u32,
+    hero_vertices: Vec<ColorVertex>,
+    hero_indices: Vec<u32>,
     pub objects: Vec<SceneObject>,
     pub hero_spin: f32,
 }
@@ -235,6 +237,8 @@ impl Scene {
             statics_index_count: indices.len() as u32,
             hero: DynamicBuffers::new(&ctx, "debug hero", 36 * 16, 36 * 4),
             hero_index_count: 0,
+            hero_vertices: Vec::with_capacity(24),
+            hero_indices: Vec::with_capacity(36),
             objects: vec![
                 SceneObject::new("crate", Vec3::new(-3.5, 0.75, 1.5), 1.5, CRATE_COLOR),
                 SceneObject::new("shell", Vec3::new(3.0, 0.6, -1.0), 1.2, SHELL_COLOR),
@@ -315,18 +319,26 @@ impl SceneObject {
 }
 
 impl DebugScene {
-    /// Rebuild the spinning hero box (36 vertices; trivial on the CPU).
+    /// Rebuild the spinning hero box into reused scratch buffers (zero per-frame heap allocations).
     fn rebuild_hero(&mut self) {
         let hero = &self.objects[3];
         let rotation = glam::Mat4::from_rotation_y(self.hero_spin)
             * glam::Mat4::from_rotation_x(self.hero_spin * 0.35);
-        let (vertices, indices) =
-            box_geometry(hero.position, hero.size, hero.color, Some(rotation));
-        self.hero.update(
-            bytemuck::cast_slice(&vertices),
-            bytemuck::cast_slice(&indices),
+        self.hero_vertices.clear();
+        self.hero_indices.clear();
+        box_geometry_into(
+            hero.position,
+            hero.size,
+            hero.color,
+            Some(rotation),
+            &mut self.hero_vertices,
+            &mut self.hero_indices,
         );
-        self.hero_index_count = indices.len() as u32;
+        self.hero.update(
+            bytemuck::cast_slice(&self.hero_vertices),
+            bytemuck::cast_slice(&self.hero_indices),
+        );
+        self.hero_index_count = self.hero_indices.len() as u32;
     }
 }
 
@@ -400,6 +412,20 @@ pub fn box_geometry(
     color: Color,
     spin: Option<glam::Mat4>,
 ) -> (Vec<ColorVertex>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity(24);
+    let mut indices = Vec::with_capacity(36);
+    box_geometry_into(center, size, color, spin, &mut vertices, &mut indices);
+    (vertices, indices)
+}
+
+fn box_geometry_into(
+    center: Vec3,
+    size: f32,
+    color: Color,
+    spin: Option<glam::Mat4>,
+    vertices: &mut Vec<ColorVertex>,
+    indices: &mut Vec<u32>,
+) {
     let half = size * 0.5;
     // (normal, shade, corners wound CW as seen from outside the box)
     let faces: [([f32; 3], f32, [[f32; 3]; 4]); 6] = [
@@ -464,8 +490,6 @@ pub fn box_geometry(
             ],
         ),
     ];
-    let mut vertices = Vec::with_capacity(24);
-    let mut indices = Vec::with_capacity(36);
     for (_, shade, corners) in faces {
         let shaded = crate::ui::theme::mix(color, Color::BLACK, (shade - 1.0).max(0.0) * 0.55);
         let shaded = if shade > 1.0 {
@@ -487,7 +511,6 @@ pub fn box_geometry(
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
-    (vertices, indices)
 }
 
 fn quad(

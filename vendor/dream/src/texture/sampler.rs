@@ -1,5 +1,7 @@
+#[cfg(not(target_os = "macos"))]
 use crate::gfx::vulkan::GpuContext;
 
+#[cfg(not(target_os = "macos"))]
 use ash::vk;
 
 /// Magnification/minification filter.
@@ -59,6 +61,7 @@ impl SamplerDesc {
 
 /// Create a `vk::Sampler` from a [`SamplerDesc`]. Shared by textures and any
 /// custom sampling the game needs.
+#[cfg(not(target_os = "macos"))]
 pub fn create_sampler(
     ctx: &GpuContext,
     label: &str,

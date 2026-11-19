@@ -117,11 +117,14 @@ pub fn rail(app: &mut App) {
 /// Rows of the viewport context menu, top to bottom. The menu only opens on
 /// the viewport page, so every row is an action on the view itself; scene
 /// management and page navigation live on the scene manager page.
-fn menu_items() -> Vec<MenuItem> {
-    vec![
-        MenuItem::new("Reset camera"),
-        MenuItem::new("Capture frame"),
-    ]
+fn menu_items() -> &'static [MenuItem] {
+    static ITEMS: std::sync::LazyLock<[MenuItem; 2]> = std::sync::LazyLock::new(|| {
+        [
+            MenuItem::new("Reset camera"),
+            MenuItem::new("Capture frame"),
+        ]
+    });
+    ITEMS.as_slice()
 }
 
 /// The popup's rect for this frame, or `None` while it is closed. The app
@@ -136,7 +139,7 @@ pub fn context_menu_rect(app: &App) -> Option<Rect> {
     // A little slack for the popup's slide-in offset.
     Some(
         app.ui
-            .context_menu_rect(app.menu_at, &items, &style)
+            .context_menu_rect(app.menu_at, items, &style)
             .expand(12.0),
     )
 }
@@ -160,7 +163,7 @@ pub fn context_menu(app: &mut App) {
     let mut focus = app.menu_focus;
     let chosen = app
         .ui
-        .context_menu("viewport-menu", &mut open, at, &items, &mut focus, style);
+        .context_menu("viewport-menu", &mut open, at, items, &mut focus, style);
     app.menu_focus = focus;
     // The widget clears the latch when the pointer clicks away or Escape is
     // pressed; it then keeps drawing the exit for a few frames.

@@ -115,7 +115,34 @@ fn resident_bytes() -> Option<(u64, u64)> {
     ))
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(target_os = "linux")]
+fn resident_bytes() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let mut rss = None;
+    let mut hwm = None;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            rss = rest
+                .split_whitespace()
+                .next()
+                .and_then(|kb| kb.parse::<u64>().ok())
+                .map(|kb| kb * 1024);
+        } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+            hwm = rest
+                .split_whitespace()
+                .next()
+                .and_then(|kb| kb.parse::<u64>().ok())
+                .map(|kb| kb * 1024);
+        }
+        if rss.is_some() && hwm.is_some() {
+            break;
+        }
+    }
+    let rss = rss?;
+    Some((rss, hwm.unwrap_or(rss).max(rss)))
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 fn resident_bytes() -> Option<(u64, u64)> {
     None
 }

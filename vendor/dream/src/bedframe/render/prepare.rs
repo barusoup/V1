@@ -191,6 +191,22 @@ fn try_instances(
     Some(quads as u32)
 }
 
+/// Non-mutating check of [`try_instances`] for merge boundaries in the indexed fallback.
+fn can_instance_cmd(vertices: &[UiVertex], frame_indices: &[u32], draw: &DrawCmd) -> bool {
+    if draw.index_count == 0 || !draw.index_count.is_multiple_of(6) {
+        return false;
+    }
+    let quads = (draw.index_count / 6) as usize;
+    for q in 0..quads {
+        let ok =
+            quad_verts_at(frame_indices, draw, q).and_then(|verts| convert_quad(vertices, verts));
+        if ok.is_none() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether two adjacent draws share the merge-relevant state: the same
 /// texture and scissor mean they can record as one call.
 fn mergeable(a: &DrawCmd, b: &DrawCmd) -> bool {
@@ -265,27 +281,12 @@ pub(crate) fn prepare_into(
             None => {
                 let first = out.indices.len() as u32;
                 let mut count = 0u32;
-                let mut j = i;
-                // Merge adjacent indexed draws sharing texture+scissor —
-                // never across an instanced draw.
-                while j < cmds.len() && mergeable(draw, &cmds[j]) {
-                    // Probe appends before it knows — ALWAYS roll the
-                    // tail back, whether the next command converted
-                    // (merge stop) or not (merge continues).
-                    let checkpoint = out.instances.len();
-                    let blocked = enabled
-                        && try_instances(vertices, frame_indices, &cmds[j], &mut out.instances)
-                            .is_some();
-                    out.instances.truncate(checkpoint);
-                    if blocked {
-                        break;
-                    }
-                    if !remap_ready {
-                        out.remap.clear();
-                        out.remap.resize(vertices.len(), u32::MAX);
-                        remap_ready = true;
-                    }
-                    let src = &cmds[j];
+                if !remap_ready {
+                    out.remap.clear();
+                    out.remap.resize(vertices.len(), u32::MAX);
+                    remap_ready = true;
+                }
+                let mut push_indexed = |src: &DrawCmd| {
                     let base = src.first_index as usize;
                     for k in 0..src.index_count as usize {
                         let old = frame_indices[base + k] as usize;
@@ -299,6 +300,16 @@ pub(crate) fn prepare_into(
                         out.indices.push(new);
                     }
                     count += src.index_count;
+                };
+                // `cmds[i]` already failed `try_instances` above, so emit it without
+                // re-probing and only probe subsequent merge candidates.
+                push_indexed(draw);
+                let mut j = i + 1;
+                while j < cmds.len()
+                    && mergeable(draw, &cmds[j])
+                    && !(enabled && can_instance_cmd(vertices, frame_indices, &cmds[j]))
+                {
+                    push_indexed(&cmds[j]);
                     j += 1;
                 }
                 out.draws.push(PreparedDraw {

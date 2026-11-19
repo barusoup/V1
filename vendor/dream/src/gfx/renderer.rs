@@ -44,7 +44,14 @@ impl Renderer {
     /// Build a renderer whose UI blends in [`UiBlend::default()`]
     /// ([`UiBlend::Gamma`], browser-matching).
     pub fn new(window: Arc<Window>, shader_src: &str, settings: Settings) -> Self {
-        Self::new_inner(window, shader_src, None, settings, UiBlend::default())
+        Self::new_inner(
+            window,
+            shader_src,
+            None,
+            settings,
+            UiBlend::default(),
+            crate::gfx::GpuPreference::HighPerformance,
+        )
     }
 
     /// Like [`Self::new`], with the UI pass blending in `blend`'s colour
@@ -58,7 +65,25 @@ impl Renderer {
         settings: Settings,
         blend: UiBlend,
     ) -> Self {
-        Self::new_inner(window, shader_src, None, settings, blend)
+        Self::new_inner(
+            window,
+            shader_src,
+            None,
+            settings,
+            blend,
+            crate::gfx::GpuPreference::HighPerformance,
+        )
+    }
+
+    /// Like [`Self::new_with_ui_blend`], selecting an adapter according to `preference`.
+    pub fn new_with_options(
+        window: Arc<Window>,
+        shader_src: &str,
+        settings: Settings,
+        blend: UiBlend,
+        preference: crate::gfx::GpuPreference,
+    ) -> Self {
+        Self::new_inner(window, shader_src, None, settings, blend, preference)
     }
 
     /// Like [`Self::new`], but additionally compiles `pulling_shader_src` as
@@ -78,6 +103,7 @@ impl Renderer {
             Some(pulling_shader_src),
             settings,
             UiBlend::default(),
+            crate::gfx::GpuPreference::HighPerformance,
         )
     }
 
@@ -87,12 +113,13 @@ impl Renderer {
         pulling_shader_src: Option<&str>,
         settings: Settings,
         ui_blend: UiBlend,
+        preference: crate::gfx::GpuPreference,
     ) -> Self {
         let size = window.inner_size();
         let display_size = (size.width.max(1), size.height.max(1)); // requested
         // The context keeps the window alive until its own teardown destroys
         // the surface: the caller's Arc may drop as soon as `new` returns.
-        let ctx = GpuContext::new_owned(window.clone());
+        let ctx = GpuContext::new_owned_with_preference(window.clone(), preference);
 
         let temporal = matches!(settings.aa, AaMode::Fsr);
         let render_scale = if temporal {
@@ -154,46 +181,10 @@ impl Renderer {
             ],
         );
 
-        let scene_shader = ctx.compile_shader(shader_src, "game shader");
-        let blit_shader = ctx.compile_shader(include_str!("../blit.wgsl"), "blit");
-
         let scene_layout = create_pipeline_layout(&ctx, "scene layout", &[scene_dsl], &[]);
-        let vertex_binding = vk::VertexInputBindingDescription::default()
-            .binding(0)
-            .stride(std::mem::size_of::<ColorVertex>() as u32)
-            .input_rate(vk::VertexInputRate::VERTEX);
-        let vertex_attrs = [
-            vk::VertexInputAttributeDescription::default()
-                .location(0)
-                .binding(0)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(0),
-            vk::VertexInputAttributeDescription::default()
-                .location(1)
-                .binding(0)
-                .format(vk::Format::R8G8B8A8_UNORM)
-                .offset(12),
-        ];
-        let scene_pipeline = create_graphics_pipeline(
-            &ctx,
-            scene_shader,
-            &[vertex_binding],
-            &vertex_attrs,
-            scene_layout,
-            &[SCENE_FORMAT, VELOCITY_FORMAT],
-            Some(DEPTH_FORMAT),
-        );
         let blit_layout = create_pipeline_layout(&ctx, "blit layout", &[blit_dsl], &[]);
-        let blit_pipeline = create_graphics_pipeline_fs(
-            &ctx,
-            blit_shader,
-            &[],
-            &[],
-            blit_layout,
-            &[display_fmt],
-            None,
-            if gamma { c"fs_gamma" } else { c"fs_main" },
-        );
+        let scene_pipeline = None;
+        let blit_pipeline = None;
 
         let pulling = pulling_shader_src.map(|source| {
             // Set 1 binds one packed-quad storage buffer per mesh; the
@@ -226,11 +217,6 @@ impl Renderer {
             unsafe { ctx.device().destroy_shader_module(shader, None) };
             (pipeline, layout, pulled_dsl)
         });
-
-        unsafe {
-            ctx.device().destroy_shader_module(scene_shader, None);
-            ctx.device().destroy_shader_module(blit_shader, None);
-        }
 
         let descriptor_pool = create_descriptor_pool(&ctx, ctx.max_frames_in_flight());
         let (scene_sets, blit_set, present_set) =
@@ -284,20 +270,8 @@ impl Renderer {
             .size(12);
         let present_layout =
             create_pipeline_layout(&ctx, "present layout", &[blit_dsl], &[present_push]);
-        let present_shader = ctx.compile_shader(include_str!("../present.wgsl"), "present");
-        let present_pipeline = create_graphics_pipeline_fs(
-            &ctx,
-            present_shader,
-            &[],
-            &[],
-            present_layout,
-            &[swapchain.format],
-            None,
-            // Present samples the display image, which is only encoded when
-            // it is UNORM and the swapchain is sRGB (see `present_fragment_entry`).
-            present_fragment_entry(ui_blend, swapchain.format),
-        );
-        unsafe { ctx.device().destroy_shader_module(present_shader, None) };
+        let present_pipeline = None;
+        let _ = gamma;
         let ui = crate::ui::render::UiRenderer::new_with_blend(
             &ctx,
             display_fmt,
@@ -319,12 +293,14 @@ impl Renderer {
             ctx,
             swapchain,
             scene_pipeline,
+            scene_shader_src: shader_src.to_string(),
             scene_layout,
             scene_dsl,
             pulling,
             blit_pipeline,
             blit_layout,
             blit_dsl,
+            display_fmt,
             descriptor_pool,
             scene_sets,
             blit_set,
@@ -374,6 +350,92 @@ impl Renderer {
         };
         renderer.write_sets();
         renderer
+    }
+
+    pub(super) fn ensure_scene_pipeline(&mut self) -> vk::Pipeline {
+        if let Some(p) = self.scene_pipeline {
+            return p;
+        }
+        let scene_shader = self
+            .ctx
+            .compile_shader(&self.scene_shader_src, "game shader");
+        let vertex_binding = vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(std::mem::size_of::<ColorVertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX);
+        let vertex_attrs = [
+            vk::VertexInputAttributeDescription::default()
+                .location(0)
+                .binding(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(0),
+            vk::VertexInputAttributeDescription::default()
+                .location(1)
+                .binding(0)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .offset(12),
+        ];
+        let pipeline = create_graphics_pipeline(
+            &self.ctx,
+            scene_shader,
+            &[vertex_binding],
+            &vertex_attrs,
+            self.scene_layout,
+            &[SCENE_FORMAT, VELOCITY_FORMAT],
+            Some(DEPTH_FORMAT),
+        );
+        unsafe { self.ctx.device().destroy_shader_module(scene_shader, None) };
+        self.scene_pipeline = Some(pipeline);
+        pipeline
+    }
+
+    pub(super) fn ensure_blit_pipeline(&mut self) -> vk::Pipeline {
+        if let Some(p) = self.blit_pipeline {
+            return p;
+        }
+        let gamma = self.ui_blend == UiBlend::Gamma;
+        let blit_shader = self
+            .ctx
+            .compile_shader(include_str!("../blit.wgsl"), "blit");
+        let pipeline = create_graphics_pipeline_fs(
+            &self.ctx,
+            blit_shader,
+            &[],
+            &[],
+            self.blit_layout,
+            &[self.display_fmt],
+            None,
+            if gamma { c"fs_gamma" } else { c"fs_main" },
+        );
+        unsafe { self.ctx.device().destroy_shader_module(blit_shader, None) };
+        self.blit_pipeline = Some(pipeline);
+        pipeline
+    }
+
+    pub(super) fn ensure_present_pipeline(&mut self) -> vk::Pipeline {
+        if let Some(p) = self.present_pipeline {
+            return p;
+        }
+        let present_shader = self
+            .ctx
+            .compile_shader(include_str!("../present.wgsl"), "present");
+        let pipeline = create_graphics_pipeline_fs(
+            &self.ctx,
+            present_shader,
+            &[],
+            &[],
+            self.present_layout,
+            &[self.swapchain.format],
+            None,
+            present_fragment_entry(self.ui_blend, self.swapchain.format),
+        );
+        unsafe {
+            self.ctx
+                .device()
+                .destroy_shader_module(present_shader, None)
+        };
+        self.present_pipeline = Some(pipeline);
+        pipeline
     }
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
@@ -735,9 +797,16 @@ impl Renderer {
         if self.thumb.as_ref().is_some_and(|thumb| thumb.busy()) {
             return false;
         }
-        // Nothing in flight may touch the targets once they are freed.
+        // Wait for all submitted GPU work without shutting down the acquire
+        // worker: shutting down here would discard an acquired swapchain image
+        // without presenting or recreating the swapchain.
+        let submitted = self.ctx.submitted_serial();
         unsafe { self.ctx.device().device_wait_idle() }.expect("wait idle on scene release");
-        // Fsr3's Drop waits idle and destroys its own resources.
+        self.ctx.confirm_completed(submitted);
+        self.ctx.collect_retired_buffers();
+        if let Some(fsr) = self.fsr.as_mut() {
+            fsr.mark_idle_for_drop();
+        }
         self.fsr = None;
         if let Some(thumb) = self.thumb.take() {
             thumb.destroy(self.ctx.device());
@@ -806,9 +875,15 @@ impl Drop for Renderer {
         unsafe {
             let _ = self.ctx.device().device_wait_idle();
             let device = self.ctx.device();
-            device.destroy_pipeline(self.scene_pipeline, None);
-            device.destroy_pipeline(self.blit_pipeline, None);
-            device.destroy_pipeline(self.present_pipeline, None);
+            if let Some(p) = self.scene_pipeline {
+                device.destroy_pipeline(p, None);
+            }
+            if let Some(p) = self.blit_pipeline {
+                device.destroy_pipeline(p, None);
+            }
+            if let Some(p) = self.present_pipeline {
+                device.destroy_pipeline(p, None);
+            }
             if let Some(thumb) = self.thumb.as_ref() {
                 thumb.destroy(device);
             }

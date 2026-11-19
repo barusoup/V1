@@ -37,7 +37,11 @@ pub fn decode(bytes: &[u8]) -> Result<AudioData, String> {
 /// Decode with a filename hint, which helps the probe pick a format for
 /// extension-less data.
 pub fn decode_with_hint(bytes: &[u8], hint: Hint) -> Result<AudioData, String> {
-    let mss = MediaSourceStream::new(Box::new(Cursor::new(bytes.to_vec())), Default::default());
+    decode_owned_with_hint(bytes.to_vec(), hint)
+}
+
+fn decode_owned_with_hint(bytes: Vec<u8>, hint: Hint) -> Result<AudioData, String> {
+    let mss = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
     let probed = symphonia::default::get_probe()
         .format(
             &hint,
@@ -54,11 +58,16 @@ pub fn decode_with_hint(bytes: &[u8], hint: Hint) -> Result<AudioData, String> {
         .ok_or("no decodable audio track")?;
     let track_id = track.id;
     let sample_rate = track.codec_params.sample_rate.unwrap_or(44_100);
+    let estimated_samples = track
+        .codec_params
+        .n_frames
+        .map_or(0, |n| (n as usize).saturating_mul(2).min(16 * 1024 * 1024));
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|err| format!("create decoder: {err}"))?;
 
-    let mut samples: Vec<f32> = Vec::new();
+    let mut samples: Vec<f32> = Vec::with_capacity(estimated_samples);
+    let mut sample_buf: Option<(u64, symphonia::core::audio::SignalSpec, SampleBuffer<f32>)> = None;
     loop {
         let packet = match format.next_packet() {
             Ok(packet) => packet,
@@ -78,7 +87,7 @@ pub fn decode_with_hint(bytes: &[u8], hint: Hint) -> Result<AudioData, String> {
             Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
             Err(err) => return Err(format!("decode packet: {err}")),
         };
-        append_decoded(&mut samples, decoded);
+        append_decoded(&mut samples, &mut sample_buf, decoded);
     }
 
     let frames = samples.len() / 2;
@@ -97,13 +106,24 @@ pub fn decode_file(path: impl AsRef<std::path::Path>) -> Result<AudioData, Strin
     if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(extension);
     }
-    decode_with_hint(&bytes, hint)
+    decode_owned_with_hint(bytes, hint)
 }
 
-fn append_decoded(samples: &mut Vec<f32>, decoded: AudioBufferRef<'_>) {
-    // SampleBuffer converts any decoded format to interleaved f32.
+fn append_decoded(
+    samples: &mut Vec<f32>,
+    sample_buf: &mut Option<(u64, symphonia::core::audio::SignalSpec, SampleBuffer<f32>)>,
+    decoded: AudioBufferRef<'_>,
+) {
+    // Reuse the SampleBuffer when capacity and spec match across packets.
     let spec = *decoded.spec();
-    let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+    let cap = decoded.capacity() as u64;
+    let buffer = match sample_buf {
+        Some((prev_cap, prev_spec, buf)) if *prev_cap >= cap && *prev_spec == spec => buf,
+        _ => {
+            *sample_buf = Some((cap, spec, SampleBuffer::<f32>::new(cap, spec)));
+            &mut sample_buf.as_mut().expect("set above").2
+        }
+    };
     buffer.copy_interleaved_ref(decoded);
     let channels = spec.channels.count().max(1);
     let interleaved = buffer.samples();

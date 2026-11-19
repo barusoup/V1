@@ -97,14 +97,13 @@ impl ResizePolicy {
 }
 
 struct FrameSlot {
-    vertices: vulkan::GpuBuffer,
-    indices: vulkan::GpuBuffer,
+    vertices: Option<vulkan::GpuBuffer>,
+    indices: Option<vulkan::GpuBuffer>,
     vertex_policy: ResizePolicy,
     index_policy: ResizePolicy,
     /// Transfer-staging buffer for this slot's atlas uploads (grows with
-    /// the same lazy-shrink policy). Always allocated: `resolve` only
-    /// *replaces* it, a small frame cannot leave a slot staging-less.
-    staging: vulkan::GpuBuffer,
+    /// the same lazy-shrink policy, allocated on first atlas upload).
+    staging: Option<vulkan::GpuBuffer>,
     staging_policy: ResizePolicy,
     /// Every texture the slot's last-recorded commands can touch — atlas
     /// pages (current and retired epochs), custom textures, the white
@@ -153,13 +152,13 @@ struct AtlasGpu {
 /// Records [`UiFrame`]s onto a render target. See the module docs.
 pub struct UiRenderer {
     ctx: Arc<GpuContext>,
-    pipeline: vk::Pipeline,
+    /// Legacy indexed pipeline — built lazily if a draw falls back from instancing.
+    pipeline: Option<vk::Pipeline>,
     /// Private instanced-quad pipeline (same layout/dsl/push).
     instance_pipeline: vk::Pipeline,
-    /// Frosted-glass variants of `pipeline` and `instance_pipeline`. Equal to
-    /// them in linear mode; see the note in `new_with_blend`.
-    backdrop_pipeline: vk::Pipeline,
-    backdrop_instance_pipeline: vk::Pipeline,
+    /// Frosted-glass variants in gamma mode — built lazily on first glass draw.
+    backdrop_pipeline: Option<vk::Pipeline>,
+    backdrop_instance_pipeline: Option<vk::Pipeline>,
     /// Compact instancing path — `set_instancing(false)` renders the old
     /// raw-indexed path byte-for-byte.
     instancing: bool,
@@ -170,7 +169,8 @@ pub struct UiRenderer {
     /// Frosted-glass backdrop textures, one set per frame slot, made on first use.
     backdrop: Vec<Option<backdrop::Backdrop>>,
     backdrop_format: vk::Format,
-    blur: backdrop::BlurPipelines,
+    blend: UiBlend,
+    blur: Option<backdrop::BlurPipelines>,
     /// GPU memory of the atlas identity the last frame carried.
     atlas: Option<AtlasGpu>,
     page_size: u32,
@@ -231,87 +231,10 @@ impl UiRenderer {
             unsafe { ctx.device().create_pipeline_layout(&info, None) }.expect("ui pipeline layout")
         };
         let shader = ctx.compile_shader(include_str!("ui.wgsl"), "ui");
-        let binding = vk::VertexInputBindingDescription::default()
-            .binding(0)
-            .stride(std::mem::size_of::<UiVertex>() as u32)
-            .input_rate(vk::VertexInputRate::VERTEX);
-        let attrs = [
-            vk::VertexInputAttributeDescription::default()
-                .location(0)
-                .binding(0)
-                .format(vk::Format::R32G32_SFLOAT)
-                .offset(0),
-            vk::VertexInputAttributeDescription::default()
-                .location(1)
-                .binding(0)
-                .format(vk::Format::R32G32_SFLOAT)
-                .offset(8),
-            vk::VertexInputAttributeDescription::default()
-                .location(2)
-                .binding(0)
-                .format(vk::Format::R8G8B8A8_UNORM)
-                .offset(16),
-            // Shape parameters: half-size, corner radius, mode.
-            vk::VertexInputAttributeDescription::default()
-                .location(3)
-                .binding(0)
-                .format(vk::Format::R32G32B32A32_SFLOAT)
-                .offset(20),
-            // Extra shape data (the rounded clip's half extent; zero for
-            // every other mode).
-            vk::VertexInputAttributeDescription::default()
-                .location(4)
-                .binding(0)
-                .format(vk::Format::R32G32_SFLOAT)
-                .offset(36),
-        ];
-        let pipeline = create_ui_pipeline(
-            ctx,
-            shader,
-            &binding,
-            &attrs,
-            layout,
-            format,
-            c"vs_main",
-            if gamma { c"fs_main_gamma" } else { c"fs_main" },
-        );
-        // Private instanced pipeline: 60-byte instance records at
-        // INSTANCE rate on binding 0, `vs_instance`/`fs_linear` entries
-        // in the same module.
         // Instance records arrive on binding 1 (rate INSTANCE) so the
         // shared pass can keep both buffers bound — indexed draws use
         // binding 0, instanced draws use binding 1.
-        let instance_binding = vk::VertexInputBindingDescription::default()
-            .binding(1)
-            .stride(std::mem::size_of::<UiInstance>() as u32)
-            .input_rate(vk::VertexInputRate::INSTANCE);
-        let instance_attrs = [
-            vk::VertexInputAttributeDescription::default()
-                .location(0)
-                .binding(1)
-                .format(vk::Format::R32G32B32A32_SFLOAT)
-                .offset(0),
-            vk::VertexInputAttributeDescription::default()
-                .location(1)
-                .binding(1)
-                .format(vk::Format::R32G32B32A32_SFLOAT)
-                .offset(16),
-            vk::VertexInputAttributeDescription::default()
-                .location(2)
-                .binding(1)
-                .format(vk::Format::R8G8B8A8_UNORM)
-                .offset(32),
-            vk::VertexInputAttributeDescription::default()
-                .location(3)
-                .binding(1)
-                .format(vk::Format::R32G32B32A32_SFLOAT)
-                .offset(36),
-            vk::VertexInputAttributeDescription::default()
-                .location(4)
-                .binding(1)
-                .format(vk::Format::R32G32_SFLOAT)
-                .offset(52),
-        ];
+        let (instance_binding, instance_attrs) = instance_vertex_desc();
         let instance_pipeline = create_ui_pipeline(
             ctx,
             shader,
@@ -330,36 +253,6 @@ impl UiRenderer {
                 c"fs_linear"
             },
         );
-        // Frosted glass samples its backdrop undecoded. In gamma mode the
-        // shared fragment entries re-encode every sample, so glass needs its
-        // own entry that decodes first (`fs_backdrop`). Linear mode already
-        // samples raw and shares the ordinary pipelines.
-        let (backdrop_pipeline, backdrop_instance_pipeline) = if gamma {
-            (
-                create_ui_pipeline(
-                    ctx,
-                    shader,
-                    &binding,
-                    &attrs,
-                    layout,
-                    format,
-                    c"vs_main",
-                    c"fs_backdrop",
-                ),
-                create_ui_pipeline(
-                    ctx,
-                    shader,
-                    &instance_binding,
-                    &instance_attrs,
-                    layout,
-                    format,
-                    c"vs_instance_gamma",
-                    c"fs_backdrop",
-                ),
-            )
-        } else {
-            (pipeline, instance_pipeline)
-        };
         unsafe { ctx.device().destroy_shader_module(shader, None) };
 
         let white = Arc::new(GpuTexture::white(ctx));
@@ -367,14 +260,13 @@ impl UiRenderer {
             .map(|_| new_slot(ctx, 8 * 1024, 4 * 1024))
             .collect();
         let backdrop = (0..slots.len()).map(|_| None).collect();
-        let blur = backdrop::BlurPipelines::new(ctx, dsl, format);
 
         Self {
             ctx: Arc::clone(ctx),
-            pipeline,
+            pipeline: None,
             instance_pipeline,
-            backdrop_pipeline,
-            backdrop_instance_pipeline,
+            backdrop_pipeline: None,
+            backdrop_instance_pipeline: None,
             instancing: true,
             layout,
             dsl,
@@ -382,7 +274,8 @@ impl UiRenderer {
             slots,
             backdrop,
             backdrop_format: format,
-            blur,
+            blend,
+            blur: None,
             atlas: None,
             page_size,
             draws: 0,
@@ -393,6 +286,76 @@ impl UiRenderer {
             last_raw_tris: 0,
             last_draws: 0,
         }
+    }
+
+    fn ensure_legacy_pipeline(&mut self) -> vk::Pipeline {
+        if let Some(p) = self.pipeline {
+            return p;
+        }
+        let gamma = self.blend == UiBlend::Gamma;
+        let shader = self.ctx.compile_shader(include_str!("ui.wgsl"), "ui");
+        let (binding, attrs) = raw_vertex_desc();
+        let p = create_ui_pipeline(
+            &self.ctx,
+            shader,
+            &binding,
+            &attrs,
+            self.layout,
+            self.backdrop_format,
+            c"vs_main",
+            if gamma { c"fs_main_gamma" } else { c"fs_main" },
+        );
+        unsafe { self.ctx.device().destroy_shader_module(shader, None) };
+        self.pipeline = Some(p);
+        p
+    }
+
+    fn ensure_backdrop_pipeline(&mut self) -> vk::Pipeline {
+        if self.blend != UiBlend::Gamma {
+            return self.ensure_legacy_pipeline();
+        }
+        if let Some(p) = self.backdrop_pipeline {
+            return p;
+        }
+        let shader = self.ctx.compile_shader(include_str!("ui.wgsl"), "ui");
+        let (binding, attrs) = raw_vertex_desc();
+        let p = create_ui_pipeline(
+            &self.ctx,
+            shader,
+            &binding,
+            &attrs,
+            self.layout,
+            self.backdrop_format,
+            c"vs_main",
+            c"fs_backdrop",
+        );
+        unsafe { self.ctx.device().destroy_shader_module(shader, None) };
+        self.backdrop_pipeline = Some(p);
+        p
+    }
+
+    fn ensure_backdrop_instance_pipeline(&mut self) -> vk::Pipeline {
+        if self.blend != UiBlend::Gamma {
+            return self.instance_pipeline;
+        }
+        if let Some(p) = self.backdrop_instance_pipeline {
+            return p;
+        }
+        let shader = self.ctx.compile_shader(include_str!("ui.wgsl"), "ui");
+        let (binding, attrs) = instance_vertex_desc();
+        let p = create_ui_pipeline(
+            &self.ctx,
+            shader,
+            &binding,
+            &attrs,
+            self.layout,
+            self.backdrop_format,
+            c"vs_instance_gamma",
+            c"fs_backdrop",
+        );
+        unsafe { self.ctx.device().destroy_shader_module(shader, None) };
+        self.backdrop_instance_pipeline = Some(p);
+        p
     }
 
     /// Compact instanced-quad path (default on). `false` renders the
@@ -412,10 +375,10 @@ impl UiRenderer {
         self.slots
             .iter()
             .map(|slot| {
-                slot.vertex_policy.capacity()
-                    + slot.index_policy.capacity()
-                    + slot.instances_policy.capacity()
-                    + slot.staging_policy.capacity()
+                slot.vertices.as_ref().map_or(0, |b| b.size)
+                    + slot.indices.as_ref().map_or(0, |b| b.size)
+                    + slot.instances.size
+                    + slot.staging.as_ref().map_or(0, |b| b.size)
             })
             .sum()
     }
@@ -441,18 +404,12 @@ impl UiRenderer {
             slot.index_policy.reset_to_floor();
             slot.instances_policy.reset_to_floor();
             slot.staging_policy.reset_to_floor();
-            slot.vertices = self
-                .ctx
-                .create_host_vertex_buffer("ui vertices", slot.vertex_policy.capacity());
-            slot.indices = self
-                .ctx
-                .create_host_index_buffer("ui indices", slot.index_policy.capacity());
+            slot.vertices = None;
+            slot.indices = None;
             slot.instances = self
                 .ctx
                 .create_host_vertex_buffer("ui instances", slot.instances_policy.capacity());
-            slot.staging = self
-                .ctx
-                .create_transfer_buffer("ui atlas staging", slot.staging_policy.capacity());
+            slot.staging = None;
         }
     }
 
@@ -505,6 +462,33 @@ impl UiRenderer {
         frame: &UiFrame,
         layout: vk::ImageLayout,
     ) {
+        self.record_in_layout_with_clear(
+            cmd,
+            frame_slot,
+            target_image,
+            target_view,
+            extent,
+            frame,
+            layout,
+            None,
+        );
+    }
+
+    /// [`Self::record_in_layout`], optionally merging an opaque `clear`
+    /// colour into the initial UI render pass so UI-only frames skip an extra
+    /// empty clear pass.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_in_layout_with_clear(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        frame_slot: usize,
+        target_image: vk::Image,
+        target_view: vk::ImageView,
+        extent: (u32, u32),
+        frame: &UiFrame,
+        layout: vk::ImageLayout,
+        clear: Option<[f32; 4]>,
+    ) {
         let device = self.ctx.device().clone();
         // The *last-record* counters reset every call — an empty-upload
         // or no-cmd frame reports zeros, never a stale previous frame.
@@ -552,47 +536,73 @@ impl UiRenderer {
             let index_bytes = (slot.prepared.indices.len() * 4) as u64;
             let instance_bytes =
                 (slot.prepared.instances.len() * std::mem::size_of::<UiInstance>()) as u64;
-            if let Some(capacity) = slot.vertex_policy.resolve(vertex_bytes) {
-                slot.vertices = self.ctx.create_host_vertex_buffer("ui vertices", capacity);
-            }
-            if let Some(capacity) = slot.index_policy.resolve(index_bytes) {
-                slot.indices = self.ctx.create_host_index_buffer("ui indices", capacity);
-            }
-            // Staging sees idle frames too (a snapshot or legacy upload
-            // resolves it itself with the real size when one runs): a
-            // peak-capacity staging buffer can shrink back over the
-            // policy window.
+            let ctx = &self.ctx;
+            resize_optional_buffer(
+                &mut slot.vertices,
+                &mut slot.vertex_policy,
+                vertex_bytes,
+                |cap| ctx.create_host_vertex_buffer("ui vertices", cap),
+            );
+            resize_optional_buffer(
+                &mut slot.indices,
+                &mut slot.index_policy,
+                index_bytes,
+                |cap| ctx.create_host_index_buffer("ui indices", cap),
+            );
+            // Staging sees idle frames too when already allocated.
             let uploads_due = frame.atlas_snapshot.is_some() || !frame.atlas_updates.is_empty();
-            if !uploads_due && let Some(capacity) = slot.staging_policy.resolve(0) {
-                slot.staging = self
-                    .ctx
-                    .create_transfer_buffer("ui atlas staging", capacity);
+            if !uploads_due && slot.staging.is_some() {
+                resize_optional_buffer(&mut slot.staging, &mut slot.staging_policy, 0, |cap| {
+                    ctx.create_transfer_buffer("ui atlas staging", cap)
+                });
             }
             if let Some(capacity) = slot.instances_policy.resolve(instance_bytes) {
-                slot.instances = self.ctx.create_host_vertex_buffer("ui instances", capacity);
+                slot.instances = ctx.create_host_vertex_buffer("ui instances", capacity);
             }
         }
 
         // 2. Atlas uploads — recorded even when the frame has no draw
         //    commands (a pure-upload frame still owes the GPU the pixels).
-        //    Snapshot takes precedence: the two upload paths share the
-        //    slot's staging buffer, so interleaving them would queue one
-        //    copy against an offset another path overwrote. (Ui-produced
-        //    frames only ever carry a snapshot anyway.)
         if let Some(snapshot) = &frame.atlas_snapshot {
             self.upload_snapshot(cmd, slot_index, snapshot);
         } else if !frame.atlas_updates.is_empty() {
             self.upload_legacy(cmd, slot_index, frame);
         }
 
+        let scissor_full = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D {
+                width: extent.0,
+                height: extent.1,
+            },
+        };
         if frame.cmds.is_empty() {
+            if let Some(clear_color) = clear {
+                let attachment = vk::RenderingAttachmentInfo::default()
+                    .image_view(target_view)
+                    .image_layout(layout)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .clear_value(vk::ClearValue {
+                        color: vk::ClearColorValue {
+                            float32: clear_color,
+                        },
+                    });
+                unsafe {
+                    device.cmd_begin_rendering(
+                        cmd,
+                        &vk::RenderingInfo::default()
+                            .render_area(scissor_full)
+                            .layer_count(1)
+                            .color_attachments(std::slice::from_ref(&attachment)),
+                    );
+                    device.cmd_end_rendering(cmd);
+                }
+            }
             return;
         }
 
-        // 3. Write this frame's prepared geometry into the slot's
-        //    already-sized buffers. `draws` stays cumulative since
-        //    construction (the `Self::draws` contract) — the last-record
-        //    counters were already zeroed at the top of `record`.
+        // 3. Write this frame's prepared geometry into the slot's buffers.
         let slot = &mut self.slots[slot_index];
         self.last_vertex_bytes =
             (slot.prepared.vertices.len() * std::mem::size_of::<UiVertex>()) as u64;
@@ -601,40 +611,85 @@ impl UiRenderer {
         self.last_instances = slot.prepared.instances.len() as u64;
         self.last_instance_bytes =
             (slot.prepared.instances.len() * std::mem::size_of::<UiInstance>()) as u64;
-        // Work on a local copy: the draw loop calls back into
-        // `self.slots` for texture retention.
         let prepared = std::mem::take(&mut slot.prepared);
-        if !prepared.vertices.is_empty() {
-            slot.vertices
-                .write(0, bytemuck::cast_slice(&prepared.vertices));
+        if !prepared.vertices.is_empty()
+            && let Some(vertices) = slot.vertices.as_mut()
+        {
+            vertices.write(0, bytemuck::cast_slice(&prepared.vertices));
         }
-        if !prepared.indices.is_empty() {
-            slot.indices
-                .write(0, bytemuck::cast_slice(&prepared.indices));
+        if !prepared.indices.is_empty()
+            && let Some(indices) = slot.indices.as_mut()
+        {
+            indices.write(0, bytemuck::cast_slice(&prepared.indices));
         }
         if !prepared.instances.is_empty() {
             slot.instances
                 .write(0, bytemuck::cast_slice(&prepared.instances));
         }
 
-        // 4. Record the pass.
-        let scissor_full = vk::Rect2D {
-            offset: vk::Offset2D::default(),
-            extent: vk::Extent2D {
-                width: extent.0,
-                height: extent.1,
-            },
-        };
-        // The pass is begun again after a backdrop capture (see below), so its
-        // setup is a closure over copies of the handles it needs, not a borrow
-        // of the slot or of `self`.
-        let pipeline = self.pipeline;
-        let pipeline_layout = self.layout;
-        let vertex_buffer = slot.vertices.buffer;
-        let index_buffer = slot.indices.buffer;
+        let vertex_buffer = slot
+            .vertices
+            .as_ref()
+            .map_or(vk::Buffer::null(), |b| b.buffer);
+        let index_buffer = slot
+            .indices
+            .as_ref()
+            .map_or(vk::Buffer::null(), |b| b.buffer);
         let instance_buffer = slot.instances.buffer;
+
+        // Lazily compile only the pipeline variants this frame actually uses.
+        let mut need_legacy = false;
+        let mut need_backdrop_indexed = false;
+        let mut need_backdrop_instanced = false;
+        for prepared_draw in &prepared.draws {
+            let glass = matches!(
+                frame.cmds[prepared_draw.cmd_index].texture,
+                super::draw::CmdTexture::Backdrop
+            );
+            match prepared_draw.kind {
+                DrawKind::Indexed { .. } => {
+                    if glass {
+                        need_backdrop_indexed = true;
+                    } else {
+                        need_legacy = true;
+                    }
+                }
+                DrawKind::Instanced { .. } => {
+                    if glass {
+                        need_backdrop_instanced = true;
+                    }
+                }
+            }
+        }
+        let legacy_pipeline = if need_legacy {
+            self.ensure_legacy_pipeline()
+        } else {
+            vk::Pipeline::null()
+        };
+        let backdrop_pipeline = if need_backdrop_indexed {
+            self.ensure_backdrop_pipeline()
+        } else {
+            vk::Pipeline::null()
+        };
+        let backdrop_instance_pipeline = if need_backdrop_instanced {
+            self.ensure_backdrop_instance_pipeline()
+        } else {
+            self.instance_pipeline
+        };
+        let instance_pipeline = self.instance_pipeline;
+        let pipeline_layout = self.layout;
         let push = [frame.size.0, frame.size.1];
-        let begin_pass = |cmd: vk::CommandBuffer| unsafe {
+
+        let begin_pass = |cmd: vk::CommandBuffer, initial_clear: Option<[f32; 4]>| unsafe {
+            let (load_op, clear_val) = match initial_clear {
+                Some(c) => (
+                    vk::AttachmentLoadOp::CLEAR,
+                    vk::ClearValue {
+                        color: vk::ClearColorValue { float32: c },
+                    },
+                ),
+                None => (vk::AttachmentLoadOp::LOAD, vk::ClearValue::default()),
+            };
             device.cmd_begin_rendering(
                 cmd,
                 &vk::RenderingInfo::default()
@@ -643,8 +698,9 @@ impl UiRenderer {
                     .color_attachments(&[vk::RenderingAttachmentInfo::default()
                         .image_view(target_view)
                         .image_layout(layout)
-                        .load_op(vk::AttachmentLoadOp::LOAD)
-                        .store_op(vk::AttachmentStoreOp::STORE)]),
+                        .load_op(load_op)
+                        .store_op(vk::AttachmentStoreOp::STORE)
+                        .clear_value(clear_val)]),
             );
             device.cmd_set_viewport(
                 cmd,
@@ -658,11 +714,6 @@ impl UiRenderer {
                     max_depth: 1.0,
                 }],
             );
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            device.cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer], &[0]);
-            device.cmd_bind_index_buffer(cmd, index_buffer, 0, vk::IndexType::UINT32);
-            // Instance lane shares vertex buffer slot 0; its bind happens
-            // lazily on the first instanced draw below.
             device.cmd_bind_vertex_buffers(cmd, 1, &[instance_buffer], &[0]);
             device.cmd_push_constants(
                 cmd,
@@ -672,7 +723,7 @@ impl UiRenderer {
                 bytemuck::bytes_of(&push),
             );
         };
-        begin_pass(cmd);
+        begin_pass(cmd, clear);
         let mut captured = false;
 
         let mut bound_set = vk::DescriptorSet::null();
@@ -686,18 +737,19 @@ impl UiRenderer {
                 height: u32::MAX,
             },
         };
-        let mut bound_pipeline = self.pipeline;
+        let mut bound_pipeline = vk::Pipeline::null();
+        let mut bound_indexed_vb = false;
+        let mut last_retained_image = vk::Image::null();
         for prepared_draw in &prepared.draws {
             let draw = &frame.cmds[prepared_draw.cmd_index];
             // The first glass draw needs everything beneath it drawn. End the pass, blur the target so
-            // far, and begin again; cached bindings are stale after that and are re-established. With no
-            // target image there is nothing to copy, so the pass just carries on.
+            // far, and begin again; cached bindings are stale after that and are re-established.
             if matches!(draw.texture, super::draw::CmdTexture::Backdrop) && !captured {
                 captured = true;
                 if target_image != vk::Image::null() {
                     unsafe { device.cmd_end_rendering(cmd) };
                     self.capture_backdrop(slot_index, cmd, target_image, layout, extent);
-                    begin_pass(cmd);
+                    begin_pass(cmd, None);
                     bound_set = vk::DescriptorSet::null();
                     bound_scissor = vk::Rect2D {
                         offset: vk::Offset2D {
@@ -709,47 +761,36 @@ impl UiRenderer {
                             height: u32::MAX,
                         },
                     };
-                    bound_pipeline = pipeline;
+                    bound_pipeline = vk::Pipeline::null();
+                    bound_indexed_vb = false;
                 }
             }
-            let set = match &draw.texture {
-                super::draw::CmdTexture::Backdrop => self.backdrop_set(slot_index),
-                super::draw::CmdTexture::White => self.white.sampled_descriptor_set(),
-                super::draw::CmdTexture::AtlasPage(page) => self
-                    .atlas
-                    .as_ref()
-                    .and_then(|atlas| atlas.pages.get(*page))
-                    .and_then(|p| p.as_ref())
-                    .expect("atlas page referenced by a draw exists")
-                    .texture
-                    .sampled_descriptor_set(),
-                super::draw::CmdTexture::Custom(texture) => texture.sampled_descriptor_set(),
+            let glass = matches!(draw.texture, super::draw::CmdTexture::Backdrop);
+            let backdrop_tex = glass.then(|| self.backdrop_texture(slot_index));
+            let tex: &Arc<GpuTexture> = if let Some(ref b) = backdrop_tex {
+                b
+            } else {
+                match &draw.texture {
+                    super::draw::CmdTexture::Backdrop => unreachable!("handled above"),
+                    super::draw::CmdTexture::White => &self.white,
+                    super::draw::CmdTexture::AtlasPage(page) => {
+                        &self
+                            .atlas
+                            .as_ref()
+                            .and_then(|atlas| atlas.pages.get(*page))
+                            .and_then(|p| p.as_ref())
+                            .expect("atlas page referenced by a draw exists")
+                            .texture
+                    }
+                    super::draw::CmdTexture::Custom(texture) => texture,
+                }
             };
-            // Keep every bound texture alive until this slot's submission
-            // completes: a caller may drop its frame (and its `Arc`s) the
-            // moment `record` returns.
-            match &draw.texture {
-                super::draw::CmdTexture::Backdrop => {
-                    let texture = self.backdrop_texture(slot_index);
-                    self.slots[slot_index].retain(&texture);
-                }
-                super::draw::CmdTexture::White => {
-                    self.slots[slot_index].retain(&self.white);
-                }
-                super::draw::CmdTexture::AtlasPage(page) => {
-                    let texture = &self
-                        .atlas
-                        .as_ref()
-                        .and_then(|atlas| atlas.pages.get(*page))
-                        .and_then(|p| p.as_ref())
-                        .expect("checked above")
-                        .texture;
-                    self.slots[slot_index].retain(texture);
-                }
-                super::draw::CmdTexture::Custom(texture) => {
-                    self.slots[slot_index].retain(texture);
-                }
+            let img = tex.image();
+            if img != last_retained_image {
+                last_retained_image = img;
+                self.slots[slot_index].retain(tex);
             }
+            let set = tex.sampled_descriptor_set();
             unsafe {
                 if bound_set != set {
                     device.cmd_bind_descriptor_sets(
@@ -762,12 +803,13 @@ impl UiRenderer {
                     );
                     bound_set = set;
                 }
-                let mut scissor = to_scissor(draw, extent);
+                let mut scissor = to_scissor(draw, frame.size, extent);
                 if let Some(d) = frame.dirty_rect {
-                    let dx0 = (d.x.floor().max(0.0) as i32).min(extent.0 as i32);
-                    let dy0 = (d.y.floor().max(0.0) as i32).min(extent.1 as i32);
-                    let dx1 = ((d.x + d.w).ceil().max(0.0) as i32).min(extent.0 as i32);
-                    let dy1 = ((d.y + d.h).ceil().max(0.0) as i32).min(extent.1 as i32);
+                    let (sx, sy) = scissor_scale(frame.size, extent);
+                    let dx0 = (d.x * sx).floor().clamp(0.0, extent.0 as f32) as i32;
+                    let dy0 = (d.y * sy).floor().clamp(0.0, extent.1 as f32) as i32;
+                    let dx1 = ((d.x + d.w) * sx).ceil().clamp(0.0, extent.0 as f32) as i32;
+                    let dy1 = ((d.y + d.h) * sy).ceil().clamp(0.0, extent.1 as f32) as i32;
                     let sx0 = scissor.offset.x.max(dx0);
                     let sy0 = scissor.offset.y.max(dy0);
                     let sx1 = (scissor.offset.x + scissor.extent.width as i32).min(dx1);
@@ -787,13 +829,22 @@ impl UiRenderer {
                     device.cmd_set_scissor(cmd, 0, &[scissor]);
                     bound_scissor = scissor;
                 }
-                let glass = matches!(draw.texture, super::draw::CmdTexture::Backdrop);
                 match prepared_draw.kind {
                     DrawKind::Indexed { first, count } => {
+                        if !bound_indexed_vb {
+                            device.cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer], &[0]);
+                            device.cmd_bind_index_buffer(
+                                cmd,
+                                index_buffer,
+                                0,
+                                vk::IndexType::UINT32,
+                            );
+                            bound_indexed_vb = true;
+                        }
                         let wanted = if glass {
-                            self.backdrop_pipeline
+                            backdrop_pipeline
                         } else {
-                            self.pipeline
+                            legacy_pipeline
                         };
                         if bound_pipeline != wanted {
                             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, wanted);
@@ -803,9 +854,9 @@ impl UiRenderer {
                     }
                     DrawKind::Instanced { first, count } => {
                         let wanted = if glass {
-                            self.backdrop_instance_pipeline
+                            backdrop_instance_pipeline
                         } else {
-                            self.instance_pipeline
+                            instance_pipeline
                         };
                         if bound_pipeline != wanted {
                             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, wanted);
@@ -890,16 +941,22 @@ impl UiRenderer {
                 }
             }
         }
-        let slot = &mut self.slots[slot_index];
-        if let Some(capacity) = slot.staging_policy.resolve(needed) {
-            slot.staging = self
-                .ctx
-                .create_transfer_buffer("ui atlas staging", capacity);
-        }
         if !any_work {
+            if self.slots[slot_index].staging.is_some() {
+                let ctx = &self.ctx;
+                let slot = &mut self.slots[slot_index];
+                resize_optional_buffer(&mut slot.staging, &mut slot.staging_policy, 0, |cap| {
+                    ctx.create_transfer_buffer("ui atlas staging", cap)
+                });
+            }
             return;
         }
-        let staging = &mut slot.staging;
+        let ctx = &self.ctx;
+        let slot = &mut self.slots[slot_index];
+        resize_optional_buffer(&mut slot.staging, &mut slot.staging_policy, needed, |cap| {
+            ctx.create_transfer_buffer("ui atlas staging", cap)
+        });
+        let staging = slot.staging.as_mut().expect("staging allocated above");
         let device = self.ctx.device().clone();
         let mut offset: u64 = 0;
         for (index, page) in snapshot.pages.iter().enumerate() {
@@ -1085,13 +1142,15 @@ impl UiRenderer {
             .iter()
             .map(|u| (u.pixels.len() as u64 + 3) & !3)
             .sum();
+        let ctx = &self.ctx;
         let slot = &mut self.slots[slot_index];
-        if let Some(capacity) = slot.staging_policy.resolve(total.max(4)) {
-            slot.staging = self
-                .ctx
-                .create_transfer_buffer("ui atlas staging", capacity);
-        }
-        let staging = &mut slot.staging;
+        resize_optional_buffer(
+            &mut slot.staging,
+            &mut slot.staging_policy,
+            total.max(4),
+            |cap| ctx.create_transfer_buffer("ui atlas staging", cap),
+        );
+        let staging = slot.staging.as_mut().expect("staging allocated above");
         let device = self.ctx.device().clone();
         // Legacy pages are RGBA-UNORM under a synthetic identity — an
         // R8 snapshot atlas must not be reused for them (wrong format
@@ -1242,11 +1301,17 @@ impl UiRenderer {
         for (slot, frame_slot) in self.slots.iter().enumerate() {
             out.push((
                 format!("ui vertices[{slot}]"),
-                frame_slot.vertices.allocation_size(),
+                frame_slot
+                    .vertices
+                    .as_ref()
+                    .map_or(0, |b| b.allocation_size()),
             ));
             out.push((
                 format!("ui indices[{slot}]"),
-                frame_slot.indices.allocation_size(),
+                frame_slot
+                    .indices
+                    .as_ref()
+                    .map_or(0, |b| b.allocation_size()),
             ));
             out.push((
                 format!("ui instances[{slot}]"),
@@ -1254,7 +1319,10 @@ impl UiRenderer {
             ));
             out.push((
                 format!("ui staging[{slot}]"),
-                frame_slot.staging.allocation_size(),
+                frame_slot
+                    .staging
+                    .as_ref()
+                    .map_or(0, |b| b.allocation_size()),
             ));
         }
         let mut seen = std::collections::HashSet::new();
@@ -1304,22 +1372,38 @@ impl Drop for UiRenderer {
         unsafe {
             let _ = self.ctx.device().device_wait_idle();
             let device = self.ctx.device();
-            device.destroy_pipeline(self.pipeline, None);
-            device.destroy_pipeline(self.instance_pipeline, None);
-            if self.backdrop_pipeline != self.pipeline {
-                device.destroy_pipeline(self.backdrop_pipeline, None);
+            if let Some(p) = self.pipeline {
+                device.destroy_pipeline(p, None);
             }
-            if self.backdrop_instance_pipeline != self.instance_pipeline {
-                device.destroy_pipeline(self.backdrop_instance_pipeline, None);
+            device.destroy_pipeline(self.instance_pipeline, None);
+            if let Some(p) = self.backdrop_pipeline {
+                device.destroy_pipeline(p, None);
+            }
+            if let Some(p) = self.backdrop_instance_pipeline {
+                device.destroy_pipeline(p, None);
             }
             device.destroy_pipeline_layout(self.layout, None);
-            self.blur.destroy(&self.ctx);
+            if let Some(ref blur) = self.blur {
+                blur.destroy(&self.ctx);
+            }
             device.destroy_descriptor_set_layout(self.dsl, None);
         }
     }
 }
 
-fn to_scissor(draw: &DrawCmd, extent: (u32, u32)) -> vk::Rect2D {
+fn scissor_scale(frame_size: (f32, f32), extent: (u32, u32)) -> (f32, f32) {
+    if frame_size.0 > 0.0 && frame_size.1 > 0.0 {
+        let sx = extent.0 as f32 / frame_size.0;
+        let sy = extent.1 as f32 / frame_size.1;
+        let sx = if (sx - 1.0).abs() > 1e-5 { sx } else { 1.0 };
+        let sy = if (sy - 1.0).abs() > 1e-5 { sy } else { 1.0 };
+        (sx, sy)
+    } else {
+        (1.0, 1.0)
+    }
+}
+
+fn to_scissor(draw: &DrawCmd, frame_size: (f32, f32), extent: (u32, u32)) -> vk::Rect2D {
     let Some(rect) = draw.scissor else {
         return vk::Rect2D {
             offset: vk::Offset2D::default(),
@@ -1329,10 +1413,11 @@ fn to_scissor(draw: &DrawCmd, extent: (u32, u32)) -> vk::Rect2D {
             },
         };
     };
-    let x0 = rect.x.floor().clamp(0.0, extent.0 as f32) as i32;
-    let y0 = rect.y.floor().clamp(0.0, extent.1 as f32) as i32;
-    let x1 = (rect.x + rect.w).ceil().clamp(0.0, extent.0 as f32) as i32;
-    let y1 = (rect.y + rect.h).ceil().clamp(0.0, extent.1 as f32) as i32;
+    let (sx, sy) = scissor_scale(frame_size, extent);
+    let x0 = (rect.x * sx).floor().clamp(0.0, extent.0 as f32) as i32;
+    let y0 = (rect.y * sy).floor().clamp(0.0, extent.1 as f32) as i32;
+    let x1 = ((rect.x + rect.w) * sx).ceil().clamp(0.0, extent.0 as f32) as i32;
+    let y1 = ((rect.y + rect.h) * sy).ceil().clamp(0.0, extent.1 as f32) as i32;
     vk::Rect2D {
         offset: vk::Offset2D { x: x0, y: y0 },
         extent: vk::Extent2D {
@@ -1342,13 +1427,113 @@ fn to_scissor(draw: &DrawCmd, extent: (u32, u32)) -> vk::Rect2D {
     }
 }
 
+fn raw_vertex_desc() -> (
+    vk::VertexInputBindingDescription,
+    [vk::VertexInputAttributeDescription; 5],
+) {
+    let binding = vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(std::mem::size_of::<UiVertex>() as u32)
+        .input_rate(vk::VertexInputRate::VERTEX);
+    let attrs = [
+        vk::VertexInputAttributeDescription::default()
+            .location(0)
+            .binding(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(0),
+        vk::VertexInputAttributeDescription::default()
+            .location(1)
+            .binding(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(8),
+        vk::VertexInputAttributeDescription::default()
+            .location(2)
+            .binding(0)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .offset(16),
+        // Shape parameters: half-size, corner radius, mode.
+        vk::VertexInputAttributeDescription::default()
+            .location(3)
+            .binding(0)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .offset(20),
+        // Extra shape data (the rounded clip's half extent; zero for
+        // every other mode).
+        vk::VertexInputAttributeDescription::default()
+            .location(4)
+            .binding(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(36),
+    ];
+    (binding, attrs)
+}
+
+fn instance_vertex_desc() -> (
+    vk::VertexInputBindingDescription,
+    [vk::VertexInputAttributeDescription; 5],
+) {
+    let binding = vk::VertexInputBindingDescription::default()
+        .binding(1)
+        .stride(std::mem::size_of::<UiInstance>() as u32)
+        .input_rate(vk::VertexInputRate::INSTANCE);
+    let attrs = [
+        vk::VertexInputAttributeDescription::default()
+            .location(0)
+            .binding(1)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .offset(0),
+        vk::VertexInputAttributeDescription::default()
+            .location(1)
+            .binding(1)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .offset(16),
+        vk::VertexInputAttributeDescription::default()
+            .location(2)
+            .binding(1)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .offset(32),
+        vk::VertexInputAttributeDescription::default()
+            .location(3)
+            .binding(1)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .offset(36),
+        vk::VertexInputAttributeDescription::default()
+            .location(4)
+            .binding(1)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(52),
+    ];
+    (binding, attrs)
+}
+
+fn resize_optional_buffer(
+    buf: &mut Option<vulkan::GpuBuffer>,
+    policy: &mut ResizePolicy,
+    needed: u64,
+    make: impl FnOnce(u64) -> vulkan::GpuBuffer,
+) {
+    if needed == 0 {
+        if let Some(cap) = buf.as_ref().and_then(|_| policy.resolve(0)) {
+            *buf = Some(make(cap));
+        }
+        return;
+    }
+    let alloc_cap = match buf {
+        None => Some(policy.resolve(needed).unwrap_or_else(|| policy.capacity())),
+        Some(_) => policy.resolve(needed),
+    };
+    if let Some(cap) = alloc_cap {
+        *buf = Some(make(cap));
+    }
+}
+
 fn new_slot(ctx: &Arc<GpuContext>, vertex_capacity: u64, index_capacity: u64) -> FrameSlot {
     FrameSlot {
-        vertices: ctx.create_host_vertex_buffer("ui vertices", vertex_capacity),
-        indices: ctx.create_host_index_buffer("ui indices", index_capacity),
+        vertices: None,
+        indices: None,
         vertex_policy: ResizePolicy::new(vertex_capacity),
         index_policy: ResizePolicy::new(index_capacity),
-        staging: ctx.create_transfer_buffer("ui atlas staging", 16 * 1024),
+        staging: None,
         staging_policy: ResizePolicy::new(16 * 1024),
         retained: Vec::new(),
         retained_seen: std::collections::HashSet::new(),
@@ -1429,7 +1614,7 @@ fn create_ui_pipeline(
         .push_next(&mut rendering);
     unsafe {
         ctx.device()
-            .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+            .create_graphics_pipelines(ctx.pipeline_cache(), &[info], None)
             .map_err(|(_, err)| err)
             .expect("create ui pipeline")[0]
     }
@@ -1468,7 +1653,7 @@ mod tests {
             index_count: 0,
             layer: 0,
         };
-        let scissor = to_scissor(&draw, (100, 100));
+        let scissor = to_scissor(&draw, (100.0, 100.0), (100, 100));
         assert_eq!(scissor.offset, vk::Offset2D { x: 0, y: 0 });
         assert_eq!(scissor.extent.width, 40);
         assert_eq!(scissor.extent.height, 35);
@@ -1477,9 +1662,18 @@ mod tests {
             scissor: Some(crate::ui::Rect::new(80.0, 80.0, 50.0, 50.0)),
             ..draw
         };
-        let scissor = to_scissor(&draw, (100, 100));
+        let scissor = to_scissor(&draw, (100.0, 100.0), (100, 100));
         assert_eq!(scissor.extent.width, 20);
         assert_eq!(scissor.extent.height, 20);
+
+        let scaled_draw = DrawCmd {
+            scissor: Some(crate::ui::Rect::new(100.0, 50.0, 200.0, 100.0)),
+            ..draw
+        };
+        let scaled = to_scissor(&scaled_draw, (640.0, 480.0), (1280, 960));
+        assert_eq!(scaled.offset, vk::Offset2D { x: 200, y: 100 });
+        assert_eq!(scaled.extent.width, 400);
+        assert_eq!(scaled.extent.height, 200);
     }
 
     #[test]
@@ -1491,7 +1685,7 @@ mod tests {
             index_count: 0,
             layer: 0,
         };
-        let scissor = to_scissor(&draw, (640, 480));
+        let scissor = to_scissor(&draw, (640.0, 480.0), (640, 480));
         assert_eq!(scissor.extent.width, 640);
         assert_eq!(scissor.extent.height, 480);
     }

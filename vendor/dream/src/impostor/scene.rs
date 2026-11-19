@@ -70,7 +70,7 @@ impl LodBatch {
         // scale only — anything else (non-uniform scale, shear, reflection)
         // stays on the mesh so the opt-in path can't pick a card it can't
         // draw. Manual `draw` calls are unaffected.
-        if super::render::ImpostorInstance::try_new(transform, transform, 1.0).is_err() {
+        if super::render::check_transform_mat4(transform).is_err() {
             entry.choice = LodChoice::Mesh;
             return entry.choice;
         }

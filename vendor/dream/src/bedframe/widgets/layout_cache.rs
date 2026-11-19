@@ -24,7 +24,7 @@
 //! cap decide eviction for layouts of ordinary size.
 
 use super::super::font::{Align, FontId, TextLayout};
-use std::collections::HashMap;
+use super::super::hash::IdMap;
 use std::sync::Arc;
 
 const MAX_ENTRIES: usize = 2048;
@@ -117,7 +117,7 @@ pub(super) struct LayoutCache {
     free: Vec<usize>,
     /// Hash bucket -> head slot of its collision chain: hits compare
     /// every field, so a collision is just a slightly longer chain.
-    buckets: HashMap<u64, usize>,
+    buckets: IdMap<usize>,
     head: Option<usize>,
     tail: Option<usize>,
     entries: usize,

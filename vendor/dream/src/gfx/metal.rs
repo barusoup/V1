@@ -478,8 +478,8 @@ impl GpuContext {
         self.completed_serial.load(Ordering::Acquire)
     }
 
-    pub fn texture_object_stats(&self) -> super::vulkan::TextureObjectStats {
-        super::vulkan::TextureObjectStats {
+    pub fn texture_object_stats(&self) -> super::TextureObjectStats {
+        super::TextureObjectStats {
             samplers: self.shared_samplers.lock().unwrap().len(),
             descriptor_pools: 0,
             live_texture_sets: self.live_textures.load(Ordering::Relaxed),

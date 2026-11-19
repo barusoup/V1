@@ -118,9 +118,7 @@ impl TextureUploader {
         assert!(
             matches!(
                 texture.vk_format,
-                vk::Format::R8G8B8A8_SRGB
-                    | vk::Format::R8G8B8A8_UNORM
-                    | vk::Format::BC7_SRGB_BLOCK
+                vk::Format::R8G8B8A8_SRGB | vk::Format::R8G8B8A8_UNORM | vk::Format::BC7_SRGB_BLOCK
             ),
             "dynamic uploads need an RGBA8 or BC7 texture"
         );

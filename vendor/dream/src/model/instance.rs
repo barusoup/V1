@@ -8,12 +8,14 @@ impl ModelInstance {
     pub fn new(model: Arc<Model>) -> Self {
         let pose: Vec<NodePose> = model.nodes.iter().map(Node::rest_pose).collect();
         let globals = compute_globals(&model, &pose, Mat4::IDENTITY);
+        let stack = Vec::with_capacity(model.nodes.len());
         Self {
             model,
             player: Player::new(),
             pose,
             prev_globals: globals.clone(),
             globals,
+            stack,
             transform: Mat4::IDENTITY,
             prev_transform: Mat4::IDENTITY,
             last_transform: Mat4::IDENTITY,
@@ -47,8 +49,14 @@ impl ModelInstance {
         self.last_transform = self.transform;
         self.player
             .update(dt, self.model.nodes.len(), &mut self.pose);
-        self.prev_globals = self.globals.clone();
-        self.globals = compute_globals(&self.model, &self.pose, self.transform);
+        std::mem::swap(&mut self.prev_globals, &mut self.globals);
+        compute_globals_into(
+            &self.model,
+            &self.pose,
+            self.transform,
+            &mut self.globals,
+            &mut self.stack,
+        );
     }
 
     /// Global (model-space) transform of a node.
@@ -92,8 +100,23 @@ impl ModelInstance {
 /// Propagate local poses down the hierarchy, right-multiplying the instance
 /// transform at the roots.
 pub(super) fn compute_globals(model: &Model, pose: &[NodePose], transform: Mat4) -> Vec<Mat4> {
-    let mut globals = vec![Mat4::IDENTITY; model.nodes.len()];
-    let mut stack: Vec<(usize, Mat4)> = model.roots.iter().map(|&root| (root, transform)).collect();
+    let mut globals = Vec::with_capacity(model.nodes.len());
+    let mut stack = Vec::with_capacity(model.nodes.len());
+    compute_globals_into(model, pose, transform, &mut globals, &mut stack);
+    globals
+}
+
+pub(super) fn compute_globals_into(
+    model: &Model,
+    pose: &[NodePose],
+    transform: Mat4,
+    globals: &mut Vec<Mat4>,
+    stack: &mut Vec<(usize, Mat4)>,
+) {
+    globals.clear();
+    globals.resize(model.nodes.len(), Mat4::IDENTITY);
+    stack.clear();
+    stack.extend(model.roots.iter().map(|&root| (root, transform)));
     while let Some((index, parent)) = stack.pop() {
         let Some(node) = model.nodes.get(index) else {
             continue;
@@ -111,5 +134,4 @@ pub(super) fn compute_globals(model: &Model, pose: &[NodePose], transform: Mat4)
             stack.push((child, global));
         }
     }
-    globals
 }

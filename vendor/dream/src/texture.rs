@@ -36,19 +36,15 @@ mod sampler;
 mod upload;
 
 pub use decode::{DecodedTexture, decode_rgba8, mip_levels_for};
+#[cfg(target_os = "macos")]
+pub use gpu::GpuTexture;
 #[cfg(not(target_os = "macos"))]
 pub use gpu::{
     GpuTexture, SAMPLED_TEXTURE_SET_BINDINGS, TEXTURE_SET_BINDINGS,
     create_sampled_texture_set_layout, create_texture_set_layout,
 };
-#[cfg(target_os = "macos")]
-#[path = "texture/gpu.rs"]
-mod gpu_vk;
-#[cfg(target_os = "macos")]
-pub use gpu::GpuTexture;
-#[cfg(target_os = "macos")]
-pub use gpu_vk::{create_sampled_texture_set_layout, create_texture_set_layout};
 pub use manager::{TextureId, TextureManager, TextureStats};
+#[cfg(not(target_os = "macos"))]
 pub use sampler::create_sampler;
 pub use sampler::{AddressMode, Filter, MipFilter, SamplerDesc};
 pub use upload::TextureUploader;

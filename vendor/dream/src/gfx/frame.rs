@@ -236,18 +236,22 @@ impl Renderer {
         };
 
         // --- Scene pass ---
-        if self.ctx.timestamp_valid_bits() > 0 {
-            unsafe {
-                device.cmd_reset_query_pool(cmd, self.gpu_pool, frame as u32 * 2, 2);
-                device.cmd_write_timestamp(
-                    cmd,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    self.gpu_pool,
-                    frame as u32 * 2,
-                );
+        let scene_pipeline = if scene_enabled {
+            if self.ctx.timestamp_valid_bits() > 0 {
+                unsafe {
+                    device.cmd_reset_query_pool(cmd, self.gpu_pool, frame as u32 * 2, 2);
+                    device.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        self.gpu_pool,
+                        frame as u32 * 2,
+                    );
+                }
             }
-        }
-        let scene_pipeline = self.scene_pipeline;
+            self.ensure_scene_pipeline()
+        } else {
+            vk::Pipeline::null()
+        };
         let scene_layout = self.scene_layout;
         let scene_set = self.scene_sets[frame];
         let pulling = self.pulling.map(|(pipeline, layout, _)| (pipeline, layout));
@@ -332,7 +336,7 @@ impl Renderer {
         } else {
             0
         };
-        if self.ctx.timestamp_valid_bits() > 0 {
+        if scene_enabled && self.ctx.timestamp_valid_bits() > 0 {
             unsafe {
                 device.cmd_write_timestamp(
                     cmd,
@@ -394,7 +398,7 @@ impl Renderer {
             }
         }
 
-        if scene_enabled {
+        if scene_enabled && self.temporal {
             unsafe {
                 vulkan::image_barrier(
                     &device,
@@ -402,7 +406,7 @@ impl Renderer {
                     self.blit_source_image(),
                     vk::ImageLayout::GENERAL,
                     vk::ImageLayout::GENERAL,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::FRAGMENT_SHADER,
                     vk::AccessFlags::SHADER_WRITE,
                     vk::AccessFlags::SHADER_READ,
@@ -411,9 +415,16 @@ impl Renderer {
             }
         }
 
-        // --- Blit pass (FSR output -> target: the swapchain image when composing
-        // directly, otherwise the composed display image) ---
-        {
+        // --- Blit pass + UI overlay ---
+        // When there is no scene pass and we have a UI frame, merge the
+        // opaque clear directly into the UI rendering scope instead of paying
+        // an extra empty clear pass and synchronization barrier.
+        if scene_enabled || ui.is_none() {
+            let blit_pipeline = if scene_enabled {
+                self.ensure_blit_pipeline()
+            } else {
+                vk::Pipeline::null()
+            };
             let load = if scene_enabled {
                 vk::AttachmentLoadOp::DONT_CARE
             } else {
@@ -429,11 +440,7 @@ impl Renderer {
                 device.cmd_set_viewport(cmd, 0, &[target_viewport]);
                 device.cmd_set_scissor(cmd, 0, &[target_scissor]);
                 if scene_enabled {
-                    device.cmd_bind_pipeline(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.blit_pipeline,
-                    );
+                    device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, blit_pipeline);
                     device.cmd_bind_descriptor_sets(
                         cmd,
                         vk::PipelineBindPoint::GRAPHICS,
@@ -448,9 +455,8 @@ impl Renderer {
             }
         }
 
-        // --- UI overlay (display resolution, over the target) ---
         if let Some(ui) = ui {
-            if direct {
+            if scene_enabled && direct {
                 // The blit wrote the swapchain image that the UI pass loads
                 // in its own rendering scope; order the two explicitly.
                 let barrier = vk::MemoryBarrier::default()
@@ -481,7 +487,8 @@ impl Renderer {
             } else {
                 vk::Image::null()
             };
-            self.ui.record_in_layout(
+            let clear = (!scene_enabled).then_some([0.0, 0.0, 0.0, 1.0]);
+            self.ui.record_in_layout_with_clear(
                 cmd,
                 frame,
                 target_image,
@@ -489,18 +496,20 @@ impl Renderer {
                 target_size,
                 ui,
                 target_layout,
+                clear,
             );
         }
 
         if !direct {
+            let present_pipeline = self.ensure_present_pipeline();
             // The composed display image holds this frame now and becomes
             // readable for the present pass.
             self.display_written = true;
             unsafe {
                 device.cmd_pipeline_barrier(
                     cmd,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
                     vk::DependencyFlags::empty(),
                     &[],
                     &[],
@@ -534,11 +543,7 @@ impl Renderer {
                 device.cmd_begin_rendering(cmd, &info);
                 device.cmd_set_viewport(cmd, 0, &[swap_viewport]);
                 device.cmd_set_scissor(cmd, 0, &[swap_scissor]);
-                device.cmd_bind_pipeline(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.present_pipeline,
-                );
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, present_pipeline);
                 device.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,

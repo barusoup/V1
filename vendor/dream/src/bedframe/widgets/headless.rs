@@ -150,7 +150,7 @@ impl<'a> ToggleBehavior<'a> {
         ui.note_focusable(id, rect, enabled, false);
         let hover = ui.hover_level(id, hovered);
         let on_t = ui.anim_f32_id(
-            crate::ui::widgets::fnv_push2(ui.id(self.label), "", self.anim_suffix),
+            crate::ui::widgets::fnv_push2(id, "", self.anim_suffix),
             if *self.value { 1.0 } else { 0.0 },
             self.duration,
             Ease::CubicOut,
@@ -215,7 +215,7 @@ impl<'a> RadioBehavior<'a> {
         ui.note_focusable(id, rect, enabled, false);
         let hover = ui.hover_level(id, hovered);
         let on_t = ui.anim_f32_id(
-            crate::ui::widgets::fnv_push2(ui.id(self.label), "", self.anim_suffix),
+            crate::ui::widgets::fnv_push2(id, "", self.anim_suffix),
             if self.selected { 1.0 } else { 0.0 },
             self.duration,
             Ease::CubicOut,

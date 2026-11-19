@@ -43,6 +43,10 @@ impl fmt::Display for ImpostorInstanceError {
 
 impl std::error::Error for ImpostorInstanceError {}
 
+pub(super) fn check_transform_mat4(m: Mat4) -> Result<(), ImpostorInstanceError> {
+    check_transform(&m.to_cols_array_2d())
+}
+
 fn check_transform(m: &[[f32; 4]; 4]) -> Result<(), ImpostorInstanceError> {
     if !m.iter().flatten().all(|v| v.is_finite()) {
         return Err(ImpostorInstanceError::NonFiniteMatrix);

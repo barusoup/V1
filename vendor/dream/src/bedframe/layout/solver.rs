@@ -19,6 +19,7 @@ pub(crate) struct Node {
     pub leaf: Leaf,
     pub parent: u32,
     pub first_child: u32,
+    pub last_child: u32,
     pub next: u32,
     /// Absolute border box, *unsnapped* — children are positioned from
     /// this so shared edges snap identically.
@@ -153,6 +154,7 @@ impl LayoutTree {
             leaf,
             parent: NIL,
             first_child: NIL,
+            last_child: NIL,
             next: NIL,
             abs: Rect::new(0.0, 0.0, 0.0, 0.0),
             intrinsic: (0.0, 0.0),
@@ -162,15 +164,14 @@ impl LayoutTree {
         };
         if let Some(p) = parent {
             node.parent = p.0;
-            if self.nodes[p.0 as usize].first_child == NIL {
-                self.nodes[p.0 as usize].first_child = id;
+            let p_idx = p.0 as usize;
+            let prev_last = self.nodes[p_idx].last_child;
+            if prev_last == NIL {
+                self.nodes[p_idx].first_child = id;
             } else {
-                let mut c = self.nodes[p.0 as usize].first_child;
-                while self.nodes[c as usize].next != NIL {
-                    c = self.nodes[c as usize].next;
-                }
-                self.nodes[c as usize].next = id;
+                self.nodes[prev_last as usize].next = id;
             }
+            self.nodes[p_idx].last_child = id;
         }
         self.nodes.push(node);
         NodeId(id)

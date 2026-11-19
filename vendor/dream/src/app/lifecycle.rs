@@ -117,6 +117,8 @@ impl App {
             quit: false,
             hidden: false,
             memory: crate::memory::IdleTrim::new(),
+            consecutive_timeouts: 0,
+            timeout_until: None,
         }
     }
 
@@ -326,9 +328,14 @@ impl App {
         // Input and one-shot state answer at once, and re-anchor the grid to
         // the frame they get.
         if self.dirty || self.drag.is_some() {
+            self.timeout_until = None;
+            self.consecutive_timeouts = 0;
             self.pacing.sync(now);
             self.frames_immediate += 1;
             return true;
+        }
+        if self.timeout_until.is_some_and(|until| now < until) {
+            return false;
         }
         // A pending UI clock arriving (a tooltip mid-dwell, a toast nearing
         // expiry) wakes the loop once — like input, it is not paced.
@@ -353,6 +360,13 @@ impl App {
         if self.hidden {
             return None;
         }
+        if !self.dirty
+            && self.drag.is_none()
+            && let Some(until) = self.timeout_until
+            && now < until
+        {
+            return Some(until);
+        }
         earliest_frame_deadline(
             now,
             self.dirty || self.drag.is_some(),
@@ -367,7 +381,12 @@ impl App {
     /// warm-up and once after each quiet period. Host loops call this from
     /// `about_to_wait`. Returns `true` when a trim ran.
     pub fn idle_maintenance(&mut self, now: Instant) -> bool {
-        self.memory.trim_if_due(now)
+        if self.memory.trim_if_due(now) {
+            self.renderer.trim_memory();
+            true
+        } else {
+            false
+        }
     }
 
     /// When the host loop should next wake: the earlier of the next frame and
@@ -488,14 +507,23 @@ impl App {
         self.ui.recycle_frame(frame);
         if let Err(err) = presented {
             match classify_frame_failure(err) {
-                // A timed-out or stale frame is dropped; the next loop pass
-                // builds a fresh one. Nothing was presented, so no
-                // thumbnail capture or frame count.
+                // A timed-out frame backs off instead of spinning every 250ms
+                // when throttled by an occluded Wayland workspace.
                 FrameFailure::Retry => {
-                    self.dirty = true;
+                    self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+                    let backoff = std::time::Duration::from_millis(
+                        100 * u64::from(self.consecutive_timeouts.min(5)),
+                    );
+                    self.timeout_until = Some(Instant::now() + backoff);
+                    if self.consecutive_timeouts == 3 {
+                        self.renderer.trim_memory();
+                        crate::memory::trim_working_set();
+                    }
                     return;
                 }
                 FrameFailure::Recreate => {
+                    self.consecutive_timeouts = 0;
+                    self.timeout_until = None;
                     self.renderer.recreate_swapchain();
                     self.refresh_screen();
                     self.dirty = true;
@@ -504,6 +532,8 @@ impl App {
                 FrameFailure::Fatal => panic!("render frame: {err:?}"),
             }
         }
+        self.consecutive_timeouts = 0;
+        self.timeout_until = None;
         self.capture_pending_thumbnail();
         if !self.pending_captures.is_empty() {
             // This frame is the one the screenshots asked for: it was retained

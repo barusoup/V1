@@ -9,16 +9,51 @@ use std::sync::Arc;
 impl Model {
     /// Load a `.gltf` or `.glb` from bytes.
     pub fn load_gltf(bytes: &[u8]) -> Result<Arc<Self>, String> {
-        let (document, buffers, images) =
+        let (document, buffers, mut images) =
             gltf::import_slice(bytes).map_err(|err| format!("import gltf: {err}"))?;
         let mut model = Model::default();
+
+        // Decode/normalize each referenced glTF image once so materials sharing
+        // packed maps never duplicate conversions or buffers, and single-use
+        // RGBA8 images transfer ownership with zero copies.
+        let mut image_refs = vec![0usize; images.len()];
+        for material in document.materials() {
+            let pbr = material.pbr_metallic_roughness();
+            for tex in [
+                pbr.base_color_texture()
+                    .map(|info| info.texture().source().index()),
+                pbr.metallic_roughness_texture()
+                    .map(|info| info.texture().source().index()),
+                material
+                    .normal_texture()
+                    .map(|info| info.texture().source().index()),
+                material
+                    .occlusion_texture()
+                    .map(|info| info.texture().source().index()),
+                material
+                    .emissive_texture()
+                    .map(|info| info.texture().source().index()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Some(count) = image_refs.get_mut(tex) {
+                    *count += 1;
+                }
+            }
+        }
+        let mut decoded_images: Vec<Option<crate::texture::DecodedTexture>> = images
+            .iter_mut()
+            .enumerate()
+            .map(|(index, img)| (image_refs[index] > 0).then(|| take_rgba8_from_gltf(img)))
+            .collect();
 
         // Materials first; meshes reference them by index.
         for material in document.materials() {
             let pbr = material.pbr_metallic_roughness();
             let base_color_map = pbr
                 .base_color_texture()
-                .and_then(|info| texture_ref(&info, &images));
+                .and_then(|info| texture_ref(&info, &mut decoded_images, &mut image_refs));
             let base_color_texture = base_color_map.as_ref().map(|map| map.texture.clone());
             let mut unsupported = Vec::new();
             if let Some(extensions) = material.extensions() {
@@ -39,13 +74,14 @@ impl Model {
                 double_sided: material.double_sided(),
                 metallic_roughness_texture: pbr
                     .metallic_roughness_texture()
-                    .and_then(|info| texture_ref(&info, &images)),
+                    .and_then(|info| texture_ref(&info, &mut decoded_images, &mut image_refs)),
                 normal_texture: normal_map.as_ref().and_then(|info| {
                     map_ref(
                         &info.texture(),
                         info.tex_coord(),
                         info.extension_value("KHR_texture_transform"),
-                        &images,
+                        &mut decoded_images,
+                        &mut image_refs,
                     )
                 }),
                 normal_scale: normal_map.map(|info| info.scale()).unwrap_or(1.0),
@@ -54,13 +90,14 @@ impl Model {
                         &info.texture(),
                         info.tex_coord(),
                         info.extension_value("KHR_texture_transform"),
-                        &images,
+                        &mut decoded_images,
+                        &mut image_refs,
                     )
                 }),
                 occlusion_strength: occlusion_map.map(|info| info.strength()).unwrap_or(1.0),
                 emissive_texture: material
                     .emissive_texture()
-                    .and_then(|info| texture_ref(&info, &images)),
+                    .and_then(|info| texture_ref(&info, &mut decoded_images, &mut image_refs)),
                 emissive_factor: material.emissive_factor(),
                 emissive_strength: material.emissive_strength().unwrap_or(1.0),
                 base_color_map,
@@ -299,7 +336,11 @@ fn keys_from_values(times: &[f32], values: &[[f32; 4]], interpolation: Interpola
 
 /// Decode a `textureInfo` (the kind with `texture()`/`tex_coord()`) into a
 /// [`TextureRef`], returning `None` when the image has no decoded pixels.
-fn texture_ref(info: &gltf::texture::Info<'_>, images: &[gltf::image::Data]) -> Option<TextureRef> {
+fn texture_ref(
+    info: &gltf::texture::Info<'_>,
+    decoded_images: &mut [Option<crate::texture::DecodedTexture>],
+    image_refs: &mut [usize],
+) -> Option<TextureRef> {
     let texture = info.texture();
     let transform = info.texture_transform().map(|t| UvTransform {
         offset: t.offset(),
@@ -307,7 +348,13 @@ fn texture_ref(info: &gltf::texture::Info<'_>, images: &[gltf::image::Data]) -> 
         scale: t.scale(),
         tex_coord: t.tex_coord(),
     });
-    map_ref_parts(&texture, info.tex_coord(), transform, images)
+    map_ref_parts(
+        &texture,
+        info.tex_coord(),
+        transform,
+        decoded_images,
+        image_refs,
+    )
 }
 
 /// Same as [`texture_ref`] for the `NormalTexture`/`OcclusionTexture` shapes,
@@ -316,13 +363,15 @@ fn map_ref(
     texture: &gltf::Texture<'_>,
     tex_coord: u32,
     transform_value: Option<&gltf::json::Value>,
-    images: &[gltf::image::Data],
+    decoded_images: &mut [Option<crate::texture::DecodedTexture>],
+    image_refs: &mut [usize],
 ) -> Option<TextureRef> {
     map_ref_parts(
         texture,
         tex_coord,
         transform_value.and_then(parse_uv_transform),
-        images,
+        decoded_images,
+        image_refs,
     )
 }
 
@@ -330,9 +379,18 @@ fn map_ref_parts(
     texture: &gltf::Texture<'_>,
     tex_coord: u32,
     transform: Option<UvTransform>,
-    images: &[gltf::image::Data],
+    decoded_images: &mut [Option<crate::texture::DecodedTexture>],
+    image_refs: &mut [usize],
 ) -> Option<TextureRef> {
-    let image = images.get(texture.source().index())?;
+    let idx = texture.source().index();
+    let remaining = image_refs.get_mut(idx)?;
+    let decoded = if *remaining <= 1 {
+        *remaining = 0;
+        decoded_images.get_mut(idx)?.take()?
+    } else {
+        *remaining -= 1;
+        decoded_images.get(idx)?.as_ref()?.clone()
+    };
     let sampler = texture.sampler();
     let wrap = |mode| match mode {
         gltf::texture::WrappingMode::ClampToEdge => Wrap::ClampToEdge,
@@ -350,7 +408,7 @@ fn map_ref_parts(
         _ => TexelFilter::Linear,
     };
     Some(TextureRef {
-        texture: rgba8_from_gltf(image),
+        texture: decoded,
         tex_coord,
         transform,
         wrap_s: wrap(sampler.wrap_s()),
@@ -358,6 +416,26 @@ fn map_ref_parts(
         mag_filter: mag(sampler.mag_filter()),
         min_filter: min(sampler.min_filter()),
     })
+}
+
+fn take_rgba8_from_gltf(image: &mut gltf::image::Data) -> crate::texture::DecodedTexture {
+    let (width, height) = (image.width, image.height);
+    let texels = (width as usize) * (height as usize);
+    let (channels, sample_bytes) = gltf_image_layout(image.format);
+    if channels == 4
+        && sample_bytes == 1
+        && let Some(source_len) = texels.checked_mul(4)
+        && image.pixels.len() >= source_len
+    {
+        let mut pixels = std::mem::take(&mut image.pixels);
+        pixels.truncate(source_len);
+        return crate::texture::DecodedTexture {
+            pixels,
+            width,
+            height,
+        };
+    }
+    rgba8_from_gltf(image)
 }
 
 /// Parse a `KHR_texture_transform` extension blob found on a textureInfo.
@@ -489,7 +567,7 @@ fn opaque_black(width: u32, height: u32) -> crate::texture::DecodedTexture {
         .saturating_mul(height as usize)
         .saturating_mul(4);
     let mut pixels = vec![0u8; len];
-    for texel in pixels.chunks_exact_mut(4) {
+    for texel in pixels.as_chunks_mut::<4>().0 {
         texel[3] = 255;
     }
     crate::texture::DecodedTexture {

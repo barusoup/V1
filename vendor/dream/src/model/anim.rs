@@ -193,6 +193,7 @@ struct Slot {
 #[derive(Default)]
 pub struct Player {
     slots: Vec<Slot>,
+    blended: Vec<Option<(Vec3, Quat, Vec3, f32)>>,
 }
 
 impl Player {
@@ -255,10 +256,13 @@ impl Player {
         assert!(pose.len() >= nodes);
         // First channel wins per (node, target) inside one slot; slots blend
         // with weights. Accumulate per target across slots.
-        let mut blended: Vec<Option<(Vec3, Quat, Vec3, f32)>> = vec![None; nodes];
+        self.blended.clear();
+        self.blended.resize(nodes, None);
+        let slots = &mut self.slots;
+        let blended = &mut self.blended;
         let mut total_weight = 0.0f32;
 
-        for slot in &mut self.slots {
+        for slot in slots.iter_mut() {
             // Weight ramp.
             if (slot.weight - slot.target_weight).abs() > 1e-4 && slot.fade > 0.0 {
                 let step = dt / slot.fade;
@@ -337,7 +341,7 @@ impl Player {
         }
         let _ = total_weight;
 
-        for (index, entry) in blended.iter_mut().enumerate() {
+        for (index, entry) in self.blended.iter_mut().enumerate() {
             let Some((translation, rotation, scale, weight)) = *entry else {
                 continue;
             };
@@ -357,6 +361,9 @@ impl Player {
                 pose[index].scale = base.scale;
             }
         }
+        // Drop completed fade-outs so repeated crossfades never accumulate dead slots.
+        self.slots
+            .retain(|slot| slot.weight > 0.0 || slot.target_weight > 0.0);
     }
 
     /// True when every Once-mode slot has reached its end.

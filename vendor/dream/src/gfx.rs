@@ -32,13 +32,14 @@ mod shader;
 mod thumbnail;
 #[cfg(not(target_os = "macos"))]
 mod timing;
+#[cfg(not(target_os = "macos"))]
 pub mod vulkan;
 
 #[cfg(target_os = "macos")]
 pub(crate) use metal::align_up;
 #[cfg(target_os = "macos")]
 pub use metal::{DynamicBuffers, GpuBuffer, GpuContext, GpuImage, PulledMesh};
-pub use present::PresentMode;
+pub use present::{GpuPreference, PresentMode};
 #[cfg(not(target_os = "macos"))]
 pub use vulkan::{DynamicBuffers, GpuBuffer, GpuContext, GpuImage, PulledMesh};
 
@@ -61,6 +62,17 @@ pub const SCENE_FORMAT: metal::PixelFormat = metal::PixelFormat::RGBA16Float;
 pub const DEPTH_FORMAT: metal::PixelFormat = metal::PixelFormat::Depth32Float;
 #[cfg(target_os = "macos")]
 pub const VELOCITY_FORMAT: metal::PixelFormat = metal::PixelFormat::RG16Float;
+
+/// Diagnostic counts of the shared texture objects of one [`GpuContext`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextureObjectStats {
+    /// Distinct samplers alive in the shared cache.
+    pub samplers: usize,
+    /// Descriptor pool chunks alive.
+    pub descriptor_pools: usize,
+    /// Textures currently holding descriptor sets (one per texture).
+    pub live_texture_sets: usize,
+}
 
 /// Mirror of the errors the swapchain path can report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,16 +233,18 @@ pub struct Renderer {
     ctx: Arc<GpuContext>,
     swapchain: vulkan::Swapchain,
 
-    scene_pipeline: vk::Pipeline,
+    scene_pipeline: Option<vk::Pipeline>,
+    scene_shader_src: String,
     scene_layout: vk::PipelineLayout,
     scene_dsl: vk::DescriptorSetLayout,
     /// Vertex-pulling pipeline variant: zero vertex input, quad storage at
     /// set 1, a 16-byte vertex-stage origin push constant. Present only when
     /// the renderer was built by [`Self::new_with_pulling`].
     pulling: Option<(vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout)>,
-    blit_pipeline: vk::Pipeline,
+    blit_pipeline: Option<vk::Pipeline>,
     blit_layout: vk::PipelineLayout,
     blit_dsl: vk::DescriptorSetLayout,
+    display_fmt: vk::Format,
     descriptor_pool: vk::DescriptorPool,
 
     /// Per frame slot: slot N's set/uniform are only touched after its
@@ -292,7 +306,7 @@ pub struct Renderer {
     present_mode: vulkan::PresentMode,
     /// Set once a readback has found no retained frame and said so.
     capture_notice: bool,
-    present_pipeline: vk::Pipeline,
+    present_pipeline: Option<vk::Pipeline>,
     present_layout: vk::PipelineLayout,
     present_set: vk::DescriptorSet,
     /// UI overlay pass; recorded between the blit and the present pass.

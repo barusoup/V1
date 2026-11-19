@@ -12,10 +12,15 @@
 
 use super::App;
 use super::settings_page::draw_settings_page;
+use crate::texture::GpuTexture;
+use crate::ui::font::FontId;
 use crate::ui::icons::Icon;
+use crate::ui::theme::Theme;
 use crate::ui::tween::Ease;
-use crate::ui::widgets::{ButtonStyle, LabelStyle};
+use crate::ui::widgets::{ButtonStyle, LabelStyle, Ui};
 use crate::ui::{Color, Rect};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Default ID for the built-in debug scene.
 pub const DEBUG_SCENE_ID: u64 = 1;
@@ -466,9 +471,6 @@ fn draw_scene_manager_page(app: &mut App, area: Rect) {
         )
     };
 
-    let scenes_snapshot = app.scene_manager.scenes.clone();
-    let recent_snapshot = app.scene_manager.recent_scenes();
-
     // --- Row 1: Scenes (New Scene card first, then every scene) ---
     app.ui.label(
         Rect::new(x, y, container_w, LABEL_H),
@@ -480,7 +482,7 @@ fn draw_scene_manager_page(app: &mut App, area: Rect) {
     );
     y += LABEL_H;
     let strip = Rect::new(x, y, container_w, CARD);
-    let content_w = (1 + scenes_snapshot.len()) as f32 * (CARD + GAP);
+    let content_w = (1 + app.scene_manager.scenes.len()) as f32 * (CARD + GAP);
 
     let row_update = app
         .scene_manager
@@ -522,13 +524,14 @@ fn draw_scene_manager_page(app: &mut App, area: Rect) {
             20,
             theme.muted,
         );
-        draw_card_name(app, card, "New Scene");
+        draw_card_name(&mut app.ui, font, card, "New Scene");
         if clicked && !row_update.suppress_click {
             create_clicked = true;
         }
     }
 
-    for (i, scene) in scenes_snapshot.iter().enumerate() {
+    let mut boot_debug_card: Option<Rect> = None;
+    for (i, scene) in app.scene_manager.scenes.iter().enumerate() {
         let card = Rect::new(
             strip.x - offset + (i as f32 + 1.0) * (CARD + GAP),
             strip.y,
@@ -537,9 +540,10 @@ fn draw_scene_manager_page(app: &mut App, area: Rect) {
         );
         // Publish the debug scene's card for the scripted boot button.
         if scene.is_debug {
-            app.scene_manager.boot_debug_rect = card;
+            boot_debug_card = Some(card);
         }
-        app.ui.push_id(&format!("scenes_card_{}", scene.id));
+        app.ui.push_id("scenes_card");
+        app.ui.push_id_num(scene.id);
         let mut style = theme.button(font);
         style.normal = theme.g1;
         style.hover = theme.g2;
@@ -547,13 +551,25 @@ fn draw_scene_manager_page(app: &mut App, area: Rect) {
         let response = app.ui.button("", card, style);
         // The capture covers the button's own fill, so the same hover the
         // button would show is carried out and painted over the preview.
-        let hover = card_hover(app, "hover", response.hovered);
+        let hover = card_hover(&mut app.ui, "hover", response.hovered);
+        app.ui.pop_id();
         app.ui.pop_id();
 
-        draw_scene_card(app, card, scene, hover);
+        draw_scene_card(
+            &mut app.ui,
+            theme,
+            font,
+            &app.preview_textures,
+            card,
+            scene,
+            hover,
+        );
         if response.clicked && !row_update.suppress_click {
             scene_to_open = Some(scene.id);
         }
+    }
+    if let Some(card) = boot_debug_card {
+        app.scene_manager.boot_debug_rect = card;
     }
 
     app.ui.draw_list_mut().pop_clip();
@@ -570,7 +586,13 @@ fn draw_scene_manager_page(app: &mut App, area: Rect) {
     );
     y += LABEL_H;
     let recent_strip = Rect::new(x, y, container_w, CARD);
-    let recent_content_w = (recent_snapshot.len().max(1)) as f32 * (CARD + GAP);
+    let recent_count = app
+        .scene_manager
+        .recent_scene_ids
+        .iter()
+        .filter(|&&id| app.scene_manager.scenes.iter().any(|s| s.id == id))
+        .count();
+    let recent_content_w = recent_count.max(1) as f32 * (CARD + GAP);
 
     let recent_update = app.scene_manager.recent_row.update(
         recent_strip,
@@ -588,7 +610,7 @@ fn draw_scene_manager_page(app: &mut App, area: Rect) {
 
     let mut recent_to_open: Option<u64> = None;
     app.ui.draw_list_mut().push_clip(recent_strip);
-    if recent_snapshot.is_empty() {
+    if recent_count == 0 {
         app.ui.label(
             Rect::new(
                 recent_strip.x - recent_offset,
@@ -603,23 +625,38 @@ fn draw_scene_manager_page(app: &mut App, area: Rect) {
                 .vcenter(true),
         );
     } else {
-        for (i, scene) in recent_snapshot.iter().enumerate() {
+        let mut i = 0usize;
+        for &id in &app.scene_manager.recent_scene_ids {
+            let Some(scene) = app.scene_manager.scenes.iter().find(|s| s.id == id) else {
+                continue;
+            };
             let card = Rect::new(
                 recent_strip.x - recent_offset + i as f32 * (CARD + GAP),
                 recent_strip.y,
                 CARD,
                 CARD_H,
             );
-            app.ui.push_id(&format!("recent_card_{}", scene.id));
+            i += 1;
+            app.ui.push_id("recent_card");
+            app.ui.push_id_num(scene.id);
             let mut style = theme.button(font);
             style.normal = theme.g1;
             style.hover = theme.g2;
             style.size = 13.0;
             let response = app.ui.button("", card, style);
-            let hover = card_hover(app, "hover", response.hovered);
+            let hover = card_hover(&mut app.ui, "hover", response.hovered);
+            app.ui.pop_id();
             app.ui.pop_id();
 
-            draw_scene_card(app, card, scene, hover);
+            draw_scene_card(
+                &mut app.ui,
+                theme,
+                font,
+                &app.preview_textures,
+                card,
+                scene,
+                hover,
+            );
             if response.clicked && !recent_update.suppress_click {
                 recent_to_open = Some(scene.id);
             }
@@ -642,10 +679,9 @@ fn draw_scene_manager_page(app: &mut App, area: Rect) {
 
 /// Name shared by New Scene and scene cards, drawn in the strip beneath the
 /// preview (`card` is the preview rect).
-fn draw_card_name(app: &mut App, card: Rect, name: &str) {
-    let font = app.font();
+fn draw_card_name(ui: &mut Ui, font: FontId, card: Rect, name: &str) {
     let label_rect = Rect::new(card.x, card.max().1 + 10.0, card.w, 20.0);
-    app.ui.label(
+    ui.label(
         label_rect,
         name,
         LabelStyle::new(font)
@@ -658,14 +694,14 @@ fn draw_card_name(app: &mut App, card: Rect, name: &str) {
 /// Hover fade for one card, matching the button widget's timing: quicker in
 /// than out. Called inside the card's id scope, so rows and cards keep
 /// separate fades.
-fn card_hover(app: &mut App, key: &str, hovered: bool) -> f32 {
+fn card_hover(ui: &mut Ui, key: &str, hovered: bool) -> f32 {
     let (duration, ease) = if hovered {
         (0.12, Ease::CubicOut)
     } else {
         (0.18, Ease::CubicOut)
     };
     let target = if hovered { 1.0 } else { 0.0 };
-    app.ui.anim_f32(key, target, duration, ease)
+    ui.anim_f32(key, target, duration, ease)
 }
 
 /// One scene card: a real 3D capture of the scene plus its name beneath.
@@ -674,49 +710,58 @@ fn card_hover(app: &mut App, key: &str, hovered: bool) -> f32 {
 ///
 /// `hover` is the card button's 0..1 fade. The capture covers the button's
 /// own fill, so the lift is painted over the preview instead of under it.
-fn draw_scene_card(app: &mut App, card: Rect, scene: &ManagedScene, hover: f32) {
+fn draw_scene_card(
+    ui: &mut Ui,
+    theme: Theme,
+    font: FontId,
+    previews: &HashMap<u64, Arc<GpuTexture>>,
+    card: Rect,
+    scene: &ManagedScene,
+    hover: f32,
+) {
     /// Peak alpha of the hover lift, 0..1: the theme's ink (near-white in
     /// the dark theme, near-black in the light one) laid over the capture at
     /// a fraction of full strength, so a thumbnail reads as lifted without
     /// washing out — the preview's counterpart to the plain card's fill bump.
     const HOVER_LIFT: f32 = 0.14;
 
-    let theme = app.theme;
     let m = theme.metrics;
-    draw_scene_preview(app, card, scene.id);
-    app.ui
-        .draw_list_mut()
+    draw_scene_preview(ui, m.radius, previews, card, scene.id);
+    ui.draw_list_mut()
         .round_rect(card, m.radius, Color::BLACK.with_alpha(110));
     if hover > 0.0 {
         let lift = theme
             .fg
             .with_alpha((HOVER_LIFT * hover * 255.0).round() as u8);
-        app.ui.draw_list_mut().round_rect(card, m.radius, lift);
+        ui.draw_list_mut().round_rect(card, m.radius, lift);
     }
-    draw_card_name(app, card, &scene.name);
+    draw_card_name(ui, font, card, &scene.name);
 }
 
 /// Real 3D card preview: the scene's exit capture, or the flat canvas until
 /// its first shoot lands.
-fn draw_scene_preview(app: &mut App, card: Rect, scene_id: u64) {
+fn draw_scene_preview(
+    ui: &mut Ui,
+    radius: f32,
+    previews: &HashMap<u64, Arc<GpuTexture>>,
+    card: Rect,
+    scene_id: u64,
+) {
     // The strip already clips to its own rect; the card clip keeps a
     // half-scrolled preview out of the neighbouring cell.
-    let radius = app.theme.metrics.radius;
-    app.ui.draw_list_mut().push_clip(card);
-    if let Some(texture) = app.preview_textures.get(&scene_id).cloned() {
+    ui.draw_list_mut().push_clip(card);
+    if let Some(texture) = previews.get(&scene_id) {
         // The texture is already cropped to the card's aspect (see
-        // `upload_thumbnail`), so its UVs span the card exactly and the
+        // `upload_thumbnail_pixels`), so its UVs span the card exactly and the
         // rounded corners land on the card's own bottom edge.
-        app.ui
-            .draw_list_mut()
-            .image_rounded(card, &texture, Color::WHITE, radius);
+        ui.draw_list_mut()
+            .image_rounded(card, texture, Color::WHITE, radius);
     } else {
         // The viewport's own backdrop: blank canvas, not a placeholder.
-        app.ui
-            .draw_list_mut()
+        ui.draw_list_mut()
             .round_rect(card, radius, Color::rgb(0x1e, 0x1e, 0x1e));
     }
-    app.ui.draw_list_mut().pop_clip();
+    ui.draw_list_mut().pop_clip();
 }
 
 /// Subtle overlay drawn over the viewport when it is active. Only reachable

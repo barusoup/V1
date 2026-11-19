@@ -166,6 +166,7 @@ pub struct ModelInstance {
     pose: Vec<NodePose>,
     globals: Vec<Mat4>,
     prev_globals: Vec<Mat4>,
+    stack: Vec<(usize, Mat4)>,
     transform: Mat4,
     prev_transform: Mat4,
     /// Transform consumed by the previous [`Self::update`]; `set_transform`

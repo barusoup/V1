@@ -14,7 +14,7 @@
 
 use super::Rect;
 use super::atlas::{Atlas, Region};
-use std::collections::HashMap;
+use super::hash::FxHashMap;
 
 pub(crate) mod lazy_raster;
 mod metrics;
@@ -539,10 +539,13 @@ struct GlyphKey {
 pub struct GlyphCache {
     atlas: Atlas,
     /// Cached glyphs and their last-used tick (bounded, eldest evicted).
-    glyphs: HashMap<GlyphKey, (Glyph, u64)>,
+    glyphs: FxHashMap<GlyphKey, (Glyph, u64)>,
+    /// Hot direct-indexed ASCII table for the most recent `(FontId, px_eighth)`.
+    ascii_key: Option<(FontId, u32)>,
+    ascii_slots: [Option<Glyph>; 128],
     /// Native glyphs keyed (face identity, glyph id, canonical px).
     #[cfg(target_os = "macos")]
-    native_glyphs: HashMap<(u64, u16, u32), (Glyph, u64)>,
+    native_glyphs: FxHashMap<(u64, u16, u32), (Glyph, u64)>,
     tick: u64,
     /// Rasterizations performed (cache misses); tests assert this stops.
     rasterizations: usize,
@@ -561,9 +564,11 @@ impl GlyphCache {
         let epoch = atlas.epoch();
         Self {
             atlas,
-            glyphs: HashMap::new(),
+            glyphs: FxHashMap::default(),
+            ascii_key: None,
+            ascii_slots: [None; 128],
             #[cfg(target_os = "macos")]
-            native_glyphs: HashMap::new(),
+            native_glyphs: FxHashMap::default(),
             tick: 0,
             rasterizations: 0,
             last_epoch: epoch,
@@ -626,6 +631,8 @@ impl GlyphCache {
     pub fn reset_atlas(&mut self) {
         self.atlas.reset();
         self.glyphs.clear();
+        self.ascii_key = None;
+        self.ascii_slots = [None; 128];
         #[cfg(target_os = "macos")]
         self.native_glyphs.clear();
         self.last_epoch = self.atlas.epoch();
@@ -647,6 +654,8 @@ impl GlyphCache {
         if epoch != self.last_epoch {
             self.last_epoch = epoch;
             self.glyphs.clear();
+            self.ascii_key = None;
+            self.ascii_slots = [None; 128];
             #[cfg(target_os = "macos")]
             self.native_glyphs.clear();
             return true;
@@ -678,14 +687,29 @@ impl GlyphCache {
         } else {
             return Self::empty(0.0, 0.0);
         };
+        let px_eighth = (px * 8.0).round() as u32;
+        let is_ascii = (ch as u32) < 128;
+        self.tick += 1;
+        if is_ascii
+            && self.ascii_key == Some((font, px_eighth))
+            && let Some(glyph) = self.ascii_slots[ch as usize]
+        {
+            return glyph;
+        }
         let key = GlyphKey {
             font,
             ch,
-            px_eighth: (px * 8.0).round() as u32,
+            px_eighth,
         };
-        self.tick += 1;
         if let Some(&mut (glyph, ref mut tick)) = self.glyphs.get_mut(&key) {
             *tick = self.tick;
+            if is_ascii {
+                if self.ascii_key != Some((font, px_eighth)) {
+                    self.ascii_key = Some((font, px_eighth));
+                    self.ascii_slots = [None; 128];
+                }
+                self.ascii_slots[ch as usize] = Some(glyph);
+            }
             return glyph;
         }
         let hidden =
@@ -705,24 +729,30 @@ impl GlyphCache {
         let (metrics, coverage) = face.rasterize(ch, px);
         let width = metrics.width as u32;
         let height = metrics.height as u32;
-        let region = match self.insert_coverage(&coverage, width, height) {
-            Ok(region) => region,
-            Err(_) => {
-                // Oversized or over budget: an invisible glyph — and NOT
-                // cached, so a later reset re-rasterizes it for real.
-                return hidden(metrics);
+        // Skip inserting 0x0 glyphs (whitespace) into the atlas so blank
+        // frames never force page 0 allocation.
+        let glyph = if width == 0 || height == 0 {
+            Self::empty(metrics.advance_width, metrics.xmin as f32)
+        } else {
+            let region = match self.insert_coverage(&coverage, width, height) {
+                Ok(region) => region,
+                Err(_) => {
+                    // Oversized or over budget: an invisible glyph — and NOT
+                    // cached, so a later reset re-rasterizes it for real.
+                    return hidden(metrics);
+                }
+            };
+            Glyph {
+                region,
+                advance: metrics.advance_width,
+                x_offset: metrics.xmin as f32,
+                // fontdue's ymin is the bottom edge above the baseline (y up);
+                // screen space is y down, so the bitmap top sits at
+                // -(ymin + height) relative to the baseline.
+                y_offset: -(metrics.ymin as f32 + height as f32),
+                width: width as f32,
+                height: height as f32,
             }
-        };
-        let glyph = Glyph {
-            region,
-            advance: metrics.advance_width,
-            x_offset: metrics.xmin as f32,
-            // fontdue's ymin is the bottom edge above the baseline (y up);
-            // screen space is y down, so the bitmap top sits at
-            // -(ymin + height) relative to the baseline.
-            y_offset: -(metrics.ymin as f32 + height as f32),
-            width: width as f32,
-            height: height as f32,
         };
         // Bounded metadata: 16k glyph entries is far above a UI's live
         // set; the eldest fall out and rebake on demand. Regions stay
@@ -736,8 +766,18 @@ impl GlyphCache {
                 .map(|(key, _)| *key)
         {
             self.glyphs.remove(&eldest);
+            if self.ascii_key == Some((eldest.font, eldest.px_eighth)) && (eldest.ch as u32) < 128 {
+                self.ascii_slots[eldest.ch as usize] = None;
+            }
         }
         self.glyphs.insert(key, (glyph, self.tick));
+        if is_ascii {
+            if self.ascii_key != Some((font, px_eighth)) {
+                self.ascii_key = Some((font, px_eighth));
+                self.ascii_slots = [None; 128];
+            }
+            self.ascii_slots[ch as usize] = Some(glyph);
+        }
         glyph
     }
 
@@ -997,9 +1037,7 @@ fn cluster_font_map(fonts: &Fonts, font: FontId, text: &str) -> Vec<(usize, Opti
     map
 }
 
-/// The resolved `FontId` for the cluster containing `byte` (or `None`
-/// when that cluster is hidden).
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), test))]
 fn font_at(map: &[(usize, Option<FontId>)], byte: usize) -> Option<FontId> {
     map.partition_point(|&(start, _)| start <= byte)
         .checked_sub(1)
@@ -1026,37 +1064,92 @@ pub fn layout(
     if let Some(native_face) = face.native() {
         return native::layout_native(fonts, cache, &native_face, px, text, options);
     }
+    let line_advance = face.line_height(px) * options.line_height;
+    let ascent = face.ascent(px);
+    let space_adv = face.advance(' ', px);
+    // A tab stop every four space widths.
+    let tab_stop = space_adv * 4.0;
+    let ascii = text.is_ascii();
+
+    // Fast single-pass path for unwrapped left-aligned ASCII text (the
+    // overwhelming majority of UI labels): skips intermediate line Vecs and
+    // cluster mapping completely.
+    if ascii && options.wrap_width.is_none() && options.align == Align::Left {
+        let mut glyphs = Vec::with_capacity(text.len());
+        let mut stops = Vec::with_capacity(text.len() + 1);
+        let mut max_w = 0.0f32;
+        let mut pen_x = 0.0f32;
+        let mut line_idx = 0usize;
+        let mut baseline = ascent;
+        let mut prev_ch: Option<char> = None;
+        for (byte, &b) in text.as_bytes().iter().enumerate() {
+            if b == b'\n' {
+                max_w = max_w.max(pen_x);
+                pen_x = 0.0;
+                prev_ch = None;
+                line_idx += 1;
+                baseline = ascent + line_advance * line_idx as f32;
+                continue;
+            }
+            let ch = b as char;
+            let (stored, advance) = if b == b'\t' {
+                let next = ((pen_x / tab_stop.max(1e-3)).floor() + 1.0) * tab_stop;
+                (' ', (next - pen_x).max(space_adv))
+            } else {
+                (ch, face.advance(ch, px) + options.letter_spacing)
+            };
+            let kern = prev_ch
+                .map(|prev| face.kern(prev, stored, px))
+                .unwrap_or(0.0);
+            stops.push((pen_x + kern, byte));
+            if stored != ' ' {
+                let glyph = cache.glyph(fonts, font, stored, px);
+                glyphs.push(PositionedGlyph {
+                    glyph,
+                    x: pen_x + kern + glyph.x_offset,
+                    y: baseline + glyph.y_offset,
+                    ch: stored,
+                });
+            }
+            prev_ch = Some(stored);
+            pen_x += advance + kern;
+        }
+        let width = max_w.max(pen_x);
+        let line_count = line_idx + 1;
+        stops.push((width, text.len()));
+        return TextLayout {
+            glyphs,
+            width,
+            height: line_advance * line_count as f32,
+            line_count,
+            stops,
+            first_baseline: ascent,
+            line_advance,
+        };
+    }
+
     // Portable path: resolve every grapheme cluster to its script face (or
     // hidden) once, up front. The native path above never needs this.
-    #[cfg(not(target_os = "macos"))]
-    let ascii = text.is_ascii();
     #[cfg(not(target_os = "macos"))]
     let cluster_map = if ascii {
         Vec::new()
     } else {
         cluster_font_map(fonts, font, text)
     };
-    let line_advance = face.line_height(px) * options.line_height;
-    let ascent = face.ascent(px);
-    // A tab stop every four space widths.
-    let tab_stop = face.advance(' ', px) * 4.0;
+    #[cfg(not(target_os = "macos"))]
+    let mut cluster_idx = 0usize;
 
-    // Split into lines of `LineChar` first; wrap greedily on spaces.
-    // `line_w` tracks the line's width alongside `current` so the wrap
-    // check is O(1) per character instead of a re-sum per line.
-    let mut lines: Vec<Vec<LineChar>> = Vec::new();
-    // Unwrapped labels know their first line's capacity before layout.
-    let first_line_len = if options.wrap_width.is_none() {
-        text.split('\n').next().unwrap_or_default().chars().count()
-    } else {
-        0
-    };
-    let mut current: Vec<LineChar> = Vec::with_capacity(first_line_len);
+    // Split into lines inside one flat buffer `chars` indexed by `line_ranges`;
+    // wrap greedily on spaces.
+    let mut chars: Vec<LineChar> = Vec::with_capacity(text.len().min(4096));
+    let mut line_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut line_start = 0usize;
     let mut line_w = 0.0f32;
     let mut prev_ch: Option<char> = None;
     for (byte, ch) in text.char_indices() {
         if ch == '\n' {
-            lines.push(std::mem::take(&mut current));
+            line_ranges.push((line_start, chars.len()));
+            line_start = chars.len();
             line_w = 0.0;
             prev_ch = None;
             continue;
@@ -1068,11 +1161,14 @@ pub fn layout(
         let ch_font = if ascii {
             Some(font)
         } else {
-            font_at(&cluster_map, byte)
+            while cluster_idx + 1 < cluster_map.len() && cluster_map[cluster_idx + 1].0 <= byte {
+                cluster_idx += 1;
+            }
+            cluster_map.get(cluster_idx).and_then(|&(_, f)| f)
         };
         #[cfg(not(target_os = "macos"))]
         let Some(ch_font) = ch_font else {
-            current.push((ch, 0.0, 0.0, byte, None));
+            chars.push((ch, 0.0, 0.0, byte, None));
             prev_ch = None;
             continue;
         };
@@ -1089,53 +1185,61 @@ pub fn layout(
             .map(|prev| ch_face.kern(prev, stored, px))
             .unwrap_or(0.0);
         if let Some(wrap) = options.wrap_width
-            && !current.is_empty()
+            && line_start < chars.len()
             && line_w + kern + advance > wrap
         {
             // Break at the last space when there is one. The break space is
             // dropped, and so is any run of trailing whitespace before it —
             // trailing spaces at a wrap are invisible and must not count
             // toward the line's width or alignment.
-            if let Some(break_at) = current.iter().rposition(|&(c, _, _, _, _)| c == ' ') {
-                let mut rest: Vec<LineChar> = current.split_off(break_at + 1);
-                while matches!(current.last(), Some((' ', _, _, _, _))) {
-                    current.pop();
+            if let Some(rel_break) = chars[line_start..]
+                .iter()
+                .rposition(|&(c, _, _, _, _)| c == ' ')
+            {
+                let break_abs = line_start + rel_break;
+                let mut trim_end = break_abs;
+                while trim_end > line_start && chars[trim_end - 1].0 == ' ' {
+                    trim_end -= 1;
                 }
-                lines.push(std::mem::take(&mut current));
+                line_ranges.push((line_start, trim_end));
+                line_start = break_abs + 1;
                 // A new line starts fresh: no kerning across the break.
-                if let Some(first) = rest.first_mut() {
+                if let Some(first) = chars[line_start..].first_mut() {
                     first.2 = 0.0;
                 }
-                line_w = rest
+                line_w = chars[line_start..]
                     .iter()
                     .map(|&(_, advance, kern, _, _)| advance + kern)
                     .sum();
-                current = rest;
             } else {
-                lines.push(std::mem::take(&mut current));
+                line_ranges.push((line_start, chars.len()));
+                line_start = chars.len();
                 line_w = 0.0;
             }
             // The breaking char kerns against whatever now ends the line it
             // joins — nothing when the line is empty, the moved-down
             // remainder's last char otherwise.
-            kern = current
+            kern = chars[line_start..]
                 .last()
                 .map(|&(c, _, _, _, _)| ch_face.kern(c, stored, px))
                 .unwrap_or(0.0);
         }
         prev_ch = Some(stored);
         line_w += advance + kern;
-        current.push((stored, advance, kern, byte, Some(ch_font)));
+        chars.push((stored, advance, kern, byte, Some(ch_font)));
     }
-    lines.push(current);
+    line_ranges.push((line_start, chars.len()));
 
-    let line_count = lines.len();
-    let stop_count: usize = lines.iter().map(Vec::len).sum();
-    let glyph_count = lines
-        .iter()
-        .flatten()
-        .filter(|&&(ch, _, _, _, face)| face.is_some() && ch != ' ' && ch != '\t')
-        .count();
+    let line_count = line_ranges.len();
+    let mut stop_count = 0usize;
+    let mut glyph_count = 0usize;
+    for &(start, end) in &line_ranges {
+        stop_count += end - start;
+        glyph_count += chars[start..end]
+            .iter()
+            .filter(|&&(ch, _, _, _, face)| face.is_some() && ch != ' ' && ch != '\t')
+            .count();
+    }
     let mut out = TextLayout {
         glyphs: Vec::with_capacity(glyph_count),
         width: 0.0,
@@ -1146,7 +1250,8 @@ pub fn layout(
         line_advance,
     };
 
-    for (index, line) in lines.iter().enumerate() {
+    for (index, &(start, end)) in line_ranges.iter().enumerate() {
+        let line = &chars[start..end];
         let width: f32 = line
             .iter()
             .map(|&(_, advance, kern, _, _)| advance + kern)

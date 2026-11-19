@@ -14,8 +14,7 @@ use crate::gfx::vulkan::GpuContext;
 use crate::impostor::atlas::ImpostorAsset;
 use crate::impostor::atlas::ImpostorAssetLimits;
 use crate::impostor::{AXIS_COUNT, FallbackReason, VIEW_COUNT, VIEWS, projected_extent};
-use crate::model::render::PbrMaterialGpu;
-use crate::model::render::PbrVertex;
+use crate::model::render::{PbrFallbacks, PbrMaterialGpu, PbrVertex};
 use crate::model::{AlphaMode, Material};
 use ash::vk;
 use glam::{Mat4, Vec3};
@@ -85,6 +84,7 @@ impl ImpostorBaker {
             pack_layout,
             pack_dsl,
         };
+        let pbr_fallbacks = PbrFallbacks::new(ctx);
         Self {
             ctx: Arc::clone(ctx),
             pipeline,
@@ -92,6 +92,7 @@ impl ImpostorBaker {
             material_dsl,
             base_dsl,
             post,
+            pbr_fallbacks,
         }
     }
 
@@ -145,6 +146,7 @@ impl ImpostorBaker {
         }
 
         let mut voxel_cells = voxel_cells;
+        voxel_cells.reserve(triangle_refs.len() + triangle_records.len());
         voxel_cells.extend(triangle_refs);
         voxel_cells.extend(triangle_records);
 
@@ -173,11 +175,12 @@ impl ImpostorBaker {
             exts[f] = [ext_u, ext_v, ext_n];
         }
         let cap_start = std::time::Instant::now();
-        let (caps, _capture_depth) =
-            self.capture_views_gpu(&baked, cap, &mvps, &face_ns, center, &exts);
+        let caps = self.capture_views_gpu(&baked, cap, &mvps, &face_ns, center, &exts);
+        drop(baked);
         let capture_ms = cap_start.elapsed().as_secs_f32() * 1000.0;
         let post_start = std::time::Instant::now();
         let (images, tiles, dep_tiles, coverage_frac) = self.gpu_post(&caps, res, ss);
+        drop(caps);
         let post_ms = post_start.elapsed().as_secs_f32() * 1000.0;
         let voxel_bytes = voxel_cells.len() * std::mem::size_of::<u32>();
         let voxels = self.ctx.upload_buffer(
@@ -314,7 +317,12 @@ impl ImpostorBaker {
 
     /// One material's texture set + base-colour uniform, for capture draws.
     pub(super) fn bake_material(&self, material: &Material) -> BakeMaterial {
-        let pbr = PbrMaterialGpu::new(&self.ctx, self.material_dsl, material);
+        let pbr = PbrMaterialGpu::new(
+            &self.ctx,
+            self.material_dsl,
+            material,
+            Some(&self.pbr_fallbacks),
+        );
         let mut base = self.ctx.create_host_buffer("bake base", 16);
         base.write(0, bytemuck::bytes_of(&material.base_color));
         let pool_size = vk::DescriptorPoolSize::default()
@@ -357,7 +365,8 @@ impl ImpostorBaker {
     }
 
     /// Render all six views into 6-layer array images in one submission.
-    /// Returns (channel images, per-layer attachment views, depth images);
+    /// Returns the captured channel array images; the single temporary depth
+    /// attachment is released before returning.
     pub(super) fn capture_views_gpu(
         &self,
         baked: &[BakeBatch],
@@ -366,7 +375,7 @@ impl ImpostorBaker {
         face_ns: &[Vec3; VIEW_COUNT],
         center: Vec3,
         extents: &[[f32; 3]; VIEW_COUNT],
-    ) -> (Vec<GpuImage>, Vec<GpuImage>) {
+    ) -> Vec<GpuImage> {
         let ctx = &self.ctx;
         let device = ctx.device().clone();
         let mut images = Vec::with_capacity(5);
@@ -408,17 +417,13 @@ impl ImpostorBaker {
                     .collect()
             })
             .collect();
-        let depth: Vec<GpuImage> = (0..VIEW_COUNT)
-            .map(|_| {
-                ctx.create_image(
-                    "bake z",
-                    size,
-                    size,
-                    DEPTH_FORMAT,
-                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-                )
-            })
-            .collect();
+        let depth = ctx.create_image(
+            "bake z",
+            size,
+            size,
+            DEPTH_FORMAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+        );
 
         ctx.one_shot(|cmd| unsafe {
             // The colour targets are `VIEW_COUNT`-layer arrays. The barrier must
@@ -440,20 +445,18 @@ impl ImpostorBaker {
                     VIEW_COUNT as u32,
                 );
             }
-            for d in &depth {
-                vulkan::image_barrier(
-                    &device,
-                    cmd,
-                    d.image,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::GENERAL,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
-                    vk::AccessFlags::empty(),
-                    vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                    vk::ImageAspectFlags::DEPTH,
-                );
-            }
+            vulkan::image_barrier(
+                &device,
+                cmd,
+                depth.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                vk::ImageAspectFlags::DEPTH,
+            );
             let scissor = vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: vk::Extent2D {
@@ -470,6 +473,21 @@ impl ImpostorBaker {
                 max_depth: 1.0,
             };
             for f in 0..VIEW_COUNT {
+                if f > 0 {
+                    vulkan::image_barrier(
+                        &device,
+                        cmd,
+                        depth.image,
+                        vk::ImageLayout::GENERAL,
+                        vk::ImageLayout::GENERAL,
+                        vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                        vk::ImageAspectFlags::DEPTH,
+                    );
+                }
                 let mvp = mvps[f];
                 let push = {
                     let mut bytes = [0u8; 128];
@@ -501,10 +519,10 @@ impl ImpostorBaker {
                     })
                     .collect();
                 let depth_att = vk::RenderingAttachmentInfo::default()
-                    .image_view(depth[f].view)
+                    .image_view(depth.view)
                     .image_layout(vk::ImageLayout::GENERAL)
                     .load_op(vk::AttachmentLoadOp::CLEAR)
-                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
                     .clear_value(vk::ClearValue {
                         depth_stencil: vk::ClearDepthStencilValue {
                             depth: 1.0,
@@ -553,7 +571,7 @@ impl ImpostorBaker {
                 unsafe { device.destroy_image_view(v, None) };
             }
         }
-        (images, depth)
+        images
     }
 
     /// Render + read back one view's five attachments.
@@ -831,7 +849,7 @@ fn cs_pipeline(
         .layout(layout);
     let pipe = unsafe {
         device
-            .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+            .create_compute_pipelines(ctx.pipeline_cache(), &[info], None)
             .map_err(|(_, err)| err)
             .unwrap_or_else(|err| panic!("{label}: create compute pipeline: {err:?}"))[0]
     };
@@ -965,7 +983,7 @@ fn create_capture_pipeline(
         .push_next(&mut rendering);
     unsafe {
         ctx.device()
-            .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+            .create_graphics_pipelines(ctx.pipeline_cache(), &[info], None)
             .map_err(|(_, err)| err)
             .expect("create capture pipeline")[0]
     }

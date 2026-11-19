@@ -45,6 +45,9 @@ struct Studio {
     /// app's hidden state together with minimisation.
     occluded: bool,
     last_cursor_icon: Option<CursorIcon>,
+    last_ime_allowed: Option<bool>,
+    last_window_poll: Option<std::time::Instant>,
+    wayland: bool,
     /// Cached monitor refresh rate, so cursor-driven wake-ups do not query
     /// the display settings on every pass.
     monitor: MonitorRate,
@@ -134,6 +137,8 @@ impl Probe {
 
 impl Studio {
     fn new(selfcheck: bool, pace_probe: Option<f32>) -> Self {
+        let wayland = cfg!(target_os = "linux")
+            && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
         Self {
             app: None,
             window: None,
@@ -144,6 +149,9 @@ impl Studio {
             cursor_present: false,
             occluded: false,
             last_cursor_icon: None,
+            last_ime_allowed: None,
+            last_window_poll: None,
+            wayland,
             monitor: MonitorRate::new(),
         }
     }
@@ -177,8 +185,9 @@ impl ApplicationHandler for Studio {
                 .expect("create window"),
         );
         // Text composition is opt-in per window; the app keeps preedit
-        // uncommitted and places the candidate window at the focused field.
-        window.set_ime_allowed(true);
+        // IME stays off until a text field actually holds focus.
+        window.set_ime_allowed(false);
+        self.last_ime_allowed = Some(false);
         self.window = Some(Arc::clone(&window));
         let rounded = round_window_corners(&window);
         if self.selfcheck {
@@ -237,22 +246,24 @@ impl ApplicationHandler for Studio {
                 app.dirty = true;
                 self.cursor_present = false;
                 self.monitor.invalidate();
+                self.last_window_poll = None;
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 app.set_scale(scale_factor as f32);
                 // A density change arrives with a matching Resized on most
-                // platforms; rebuilding now also covers the ones that only
-                // report the factor.
-                app.renderer.resize(
-                    self.window
-                        .as_ref()
-                        .map(|w| w.inner_size())
-                        .unwrap_or_default(),
-                );
+                // platforms; only rebuild now if the size already changed.
+                if let Some(size) = self.window.as_ref().map(|w| w.inner_size())
+                    && size.width > 0
+                    && size.height > 0
+                    && (size.width, size.height) != app.renderer.display_size()
+                {
+                    app.renderer.resize(size);
+                }
                 app.refresh_screen();
                 app.dirty = true;
                 self.cursor_present = false;
                 self.monitor.invalidate();
+                self.last_window_poll = None;
             }
             WindowEvent::CursorMoved { position, .. } => {
                 // Physical pixels -> logical, exactly once.
@@ -318,6 +329,7 @@ impl ApplicationHandler for Studio {
                 self.occluded = occluded;
             }
             WindowEvent::Focused(focused) => {
+                self.last_window_poll = None;
                 if !focused {
                     // Keys/buttons held on the way out are gone: drop every
                     // held edge, drag and composition.
@@ -383,6 +395,7 @@ impl ApplicationHandler for Studio {
                     self.window.as_ref(),
                     event_loop,
                     &mut self.last_cursor_icon,
+                    &mut self.last_ime_allowed,
                 );
                 if let (Some(seconds), true) =
                     (self.pace_probe, app.frames_rendered > rendered_before)
@@ -408,30 +421,35 @@ impl ApplicationHandler for Studio {
         let Some(app) = self.app.as_mut() else {
             return;
         };
-        if let Some(window) = &self.window {
-            // The window bar's maximize glyph mirrors the real window
-            // state, and continuous animation paces to the monitor's
-            // refresh (never rendering faster than the display). The rate is
-            // re-read here every pass, so moving the window to another
-            // monitor, changing a monitor's rate or unplugging one is picked
-            // up on the next frame rather than at startup.
-            app.window_maximized = window.is_maximized();
-            app.pacing
-                .set_display_hz(self.monitor.get(window, std::time::Instant::now()));
-            // A completely hidden window owes no frames: none it builds can
-            // be seen. Minimisation is polled here — the platform has no
-            // event for it, and Wayland never answers (`None` keeps the
-            // normal on-demand behaviour) — and full occlusion arrives as
-            // `Occluded` where the platform can see it. `set_hidden` acts on
-            // the transition only, so the show repaints immediately.
-            app.set_hidden(self.occluded || window.is_minimized().unwrap_or(false));
-        }
-        // Schedule only: the frame itself decides. Asking the app whether a
-        // frame is due here *and* again inside `tick` would spend the frame
-        // twice — the schedule question is a pure query, and `needs_render`
-        // moves the pacing grid when it answers yes. The wake may also be a
-        // pending memory trim, which runs here rather than in a frame.
         let now = std::time::Instant::now();
+        if let Some(window) = &self.window {
+            // Querying maximized / minimized state triggers synchronous X11
+            // round-trips and is a no-op for `is_minimized` on Wayland, so
+            // throttle it off cursor-move frequency.
+            if self
+                .last_window_poll
+                .is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_millis(250))
+            {
+                app.window_maximized = window.is_maximized();
+                let minimized = if self.wayland {
+                    false
+                } else {
+                    window.is_minimized().unwrap_or(false)
+                };
+                app.set_hidden(self.occluded || minimized);
+                self.last_window_poll = Some(now);
+            } else if self.wayland {
+                // Wayland reports no minimisation, so occlusion is the whole
+                // answer and it still arrives as an event between polls.
+                app.set_hidden(self.occluded);
+            } else {
+                // X11 knows minimisation only from the throttled query, so keep
+                // the answer it last gave; occlusion still applies immediately.
+                app.set_hidden(self.occluded || app.hidden);
+            }
+            let display_hz = self.monitor.get(window, now).or(Some(60.0));
+            app.pacing.set_display_hz(display_hz);
+        }
         // Probe and selfcheck runs skip trims, so they must not wake for one
         // either: an unclaimed trim deadline would keep the loop redrawing.
         let maintain = self.pace_probe.is_none() && !self.selfcheck;
@@ -584,13 +602,18 @@ fn drain_window_commands(
     window: Option<&Arc<Window>>,
     event_loop: &ActiveEventLoop,
     last_cursor_icon: &mut Option<CursorIcon>,
+    last_ime_allowed: &mut Option<bool>,
 ) {
     let Some(window) = window else { return };
     // The IME candidate window rides on the focused text field, which the
     // app reports in the same logical coordinates the window takes — and
     // composition is offered only while an editor is actually focused.
     let editing = app.ime_cursor_rect();
-    window.set_ime_allowed(editing.is_some());
+    let want_ime = editing.is_some();
+    if *last_ime_allowed != Some(want_ime) {
+        window.set_ime_allowed(want_ime);
+        *last_ime_allowed = Some(want_ime);
+    }
     if let Some(rect) = editing {
         window.set_ime_cursor_area(
             winit::dpi::LogicalPosition::new(rect.x as f64, rect.y as f64),

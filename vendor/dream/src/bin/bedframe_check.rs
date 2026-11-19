@@ -279,7 +279,7 @@ struct Check {
     redraw_pending: bool,
     /// Set while a real window resize is in flight — the step renders
     /// only after `WindowEvent::Resized` lands.
-    resize_pending: Option<(u32, u32)>,
+    resize_pending: Option<(u32, u32, std::time::Instant)>,
     /// Pixels captured by the compact pass of `compact-vs-legacy`.
     compact_capture: Option<(Vec<u8>, u32, u32)>,
     /// Retained frame A for the atlas-reset step.
@@ -475,17 +475,19 @@ fn gallery_bands(ui: &Ui) -> Vec<Rect> {
 
 /// The gallery scene: every stock widget at rest, drawn with theme
 /// builders only — a skin diff is a data diff, so this frame is where a
-/// wrong role or token shows up first. 640x480 logical units.
-fn build_gallery_frame(ui: &mut Ui, scale: f32, light: bool) -> UiFrame {
+/// wrong role or token shows up first. 640x480 logical layout, expanded
+/// if the window manager gave a larger surface.
+fn build_gallery_frame(ui: &mut Ui, scale: f32, logical: (f32, f32), light: bool) -> UiFrame {
     let theme = if light {
         Theme::light()
     } else {
         Theme::dark_theme()
     };
+    let canvas = (logical.0.max(640.0), logical.1.max(480.0));
     ui.set_theme(&theme);
     ui.set_scale(scale);
-    ui.begin(UiInput::default(), (640.0, 480.0));
-    ui.rect(Rect::new(0.0, 0.0, 640.0, 480.0), theme.bg);
+    ui.begin(UiInput::default(), canvas);
+    ui.rect(Rect::new(0.0, 0.0, canvas.0, canvas.1), theme.bg);
     let f = FontId(0);
     use dream::ui::layout::{LayoutAlign, Style};
     use dream::ui::view::Paint;
@@ -1037,15 +1039,24 @@ where
     F: for<'a> Fn(&mut dream::gfx::DrawCtx<'a>) -> usize + Copy,
 {
     let camera = Camera::default();
-    match renderer.render_ui(&camera, None, draw, Some(frame)) {
-        Ok(visible) => visible,
-        Err(dream::gfx::SurfaceError::Outdated) => {
-            resize_to_window(renderer, window, label);
-            renderer
-                .render_ui(&camera, None, draw, Some(frame))
-                .unwrap_or_else(|err| panic!("{label}: {err:?} after rebuilding the swapchain"))
+    let mut timeouts = 0;
+    loop {
+        match renderer.render_ui(&camera, None, draw, Some(frame)) {
+            Ok(visible) => return visible,
+            Err(dream::gfx::SurfaceError::Outdated) => {
+                resize_to_window(renderer, window, label);
+                return renderer
+                    .render_ui(&camera, None, draw, Some(frame))
+                    .unwrap_or_else(|err| {
+                        panic!("{label}: {err:?} after rebuilding the swapchain")
+                    });
+            }
+            Err(dream::gfx::SurfaceError::Timeout) if timeouts < 10 => {
+                timeouts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(err) => panic!("{label}: {err:?}"),
         }
-        Err(err) => panic!("{label}: {err:?}"),
     }
 }
 
@@ -1056,15 +1067,23 @@ fn render_only_settled(
     label: &str,
     frame: &UiFrame,
 ) {
-    match renderer.render_ui_only(Some(frame)) {
-        Ok(()) => {}
-        Err(dream::gfx::SurfaceError::Outdated) => {
-            resize_to_window(renderer, window, label);
-            renderer
-                .render_ui_only(Some(frame))
-                .unwrap_or_else(|err| panic!("{label}: {err:?} after rebuilding the swapchain"));
+    let mut timeouts = 0;
+    loop {
+        match renderer.render_ui_only(Some(frame)) {
+            Ok(()) => return,
+            Err(dream::gfx::SurfaceError::Outdated) => {
+                resize_to_window(renderer, window, label);
+                renderer.render_ui_only(Some(frame)).unwrap_or_else(|err| {
+                    panic!("{label}: {err:?} after rebuilding the swapchain")
+                });
+                return;
+            }
+            Err(dream::gfx::SurfaceError::Timeout) if timeouts < 10 => {
+                timeouts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(err) => panic!("{label}: {err:?}"),
         }
-        Err(err) => panic!("{label}: {err:?}"),
     }
 }
 
@@ -1076,20 +1095,48 @@ impl Check {
         let renderer = self.renderer.as_mut().expect("renderer");
         let ui = self.ui.as_mut().expect("ui");
         let texture = self.texture.as_ref().expect("texture");
-        if let Some((w, h)) = step.resize_to
-            && self.resize_pending.is_none()
-        {
-            // Real resize: ask the window, then park this step until the
-            // actual `Resized` event lands — no racing a capture against a
-            // swapchain still being rebuilt.
-            self.resize_pending = Some((w, h));
-            let window = self.window.as_ref().expect("window");
-            let _ = window.request_inner_size(PhysicalSize::new(w, h));
-            window.request_redraw();
-            return;
-        }
-        if self.resize_pending.is_some() {
-            // The resize arrived and `resize` already ran on the event.
+        if let Some((w, h)) = step.resize_to {
+            if let Some(window) = self.window.as_deref() {
+                let size = window.inner_size();
+                if (size.width, size.height) == (w, h)
+                    && (size.width, size.height) != renderer.display_size()
+                {
+                    resize_to_window(renderer, Some(window), "sync resize");
+                }
+            }
+            if renderer.display_size() != (w, h) {
+                match self.resize_pending {
+                    None => {
+                        self.resize_pending = Some((w, h, std::time::Instant::now()));
+                        let window = self.window.as_ref().expect("window");
+                        #[cfg(target_os = "linux")]
+                        {
+                            window.set_min_inner_size::<PhysicalSize<u32>>(None);
+                            window.set_max_inner_size::<PhysicalSize<u32>>(None);
+                            window.set_min_inner_size(Some(PhysicalSize::new(w, h)));
+                            window.set_max_inner_size(Some(PhysicalSize::new(w, h)));
+                        }
+                        let _ = window.request_inner_size(PhysicalSize::new(w, h));
+                        #[cfg(target_os = "linux")]
+                        let _ = renderer.render_ui_only(None);
+                        return;
+                    }
+                    Some((rw, rh, since)) => {
+                        if since.elapsed() < std::time::Duration::from_millis(500)
+                            && self
+                                .window
+                                .as_ref()
+                                .is_some_and(|win| win.inner_size() != PhysicalSize::new(rw, rh))
+                        {
+                            return;
+                        }
+                        self.resize_pending = None;
+                    }
+                }
+            } else {
+                self.resize_pending = None;
+            }
+        } else {
             self.resize_pending = None;
         }
         // An unsolicited or late resize (a window manager, or X11 applying
@@ -1490,7 +1537,7 @@ impl Check {
             }
             Some(Extra::Gallery(light)) => {
                 blocking_before = renderer.context().blocking_submissions();
-                let frame = build_gallery_frame(ui, step.scale, light);
+                let frame = build_gallery_frame(ui, step.scale, logical, light);
                 let _ = &frame;
                 render_settled(
                     renderer,
@@ -1504,7 +1551,7 @@ impl Check {
             Some(Extra::GalleryDevtools) => {
                 blocking_before = renderer.context().blocking_submissions();
                 ui.set_devtools(dream::ui::devtools::DevtoolsMode::Outlines);
-                let frame = build_gallery_frame(ui, step.scale, false);
+                let frame = build_gallery_frame(ui, step.scale, logical, false);
                 ui.set_devtools(dream::ui::devtools::DevtoolsMode::Off);
                 render_settled(
                     renderer,
@@ -2249,14 +2296,19 @@ fn check_texture_objects_are_shared(ctx: &Arc<GpuContext>) {
 
 impl ApplicationHandler for Check {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let mut attrs = Window::default_attributes()
+            .with_title("bedframe check")
+            .with_visible(false)
+            .with_inner_size(PhysicalSize::new(WIDTH, HEIGHT));
+        #[cfg(target_os = "linux")]
+        {
+            attrs = attrs
+                .with_min_inner_size(PhysicalSize::new(WIDTH, HEIGHT))
+                .with_max_inner_size(PhysicalSize::new(WIDTH, HEIGHT));
+        }
         let window = Arc::new(
             event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("bedframe check")
-                        .with_visible(false)
-                        .with_inner_size(PhysicalSize::new(WIDTH, HEIGHT)),
-                )
+                .create_window(attrs)
                 .expect("create hidden window"),
         );
         self.window = Some(Arc::clone(&window));
@@ -2304,6 +2356,11 @@ impl ApplicationHandler for Check {
                 // Every resize, not just one this harness asked for: the
                 // window manager can change the size at any time, and the
                 // swapchain must follow before the next present.
+                if let Some((w, h, _)) = self.resize_pending
+                    && (size.width, size.height) == (w, h)
+                {
+                    self.resize_pending = None;
+                }
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
                     if let Some(window) = &self.window {
@@ -2321,6 +2378,14 @@ impl ApplicationHandler for Check {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.done {
+            return;
+        }
+        if let Some((_, _, since)) = self.resize_pending
+            && since.elapsed() < std::time::Duration::from_millis(500)
+        {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(20),
+            ));
             return;
         }
         if let Some(window) = &self.window {

@@ -64,8 +64,9 @@
 //! - **Input.** Mouse, wheel, keyboard, IME and clipboard are translated for
 //!   you. Keyboard focus rings are on.
 //!
-//! Cursor icons are not handled: BedFrame has no cursor-request API yet. Set
-//! one through [`AppContext::window`] if you need it.
+//! - **Cursor icons.** Widgets set [`Ui::cursor`] automatically (for text
+//!   fields, splitters and sliders) and [`run`] forwards it to the window;
+//!   custom code can override it via [`Ui::set_cursor`].
 //!
 //! # Environment
 //!
@@ -85,8 +86,9 @@ use super::atlas::AtlasConfig;
 use super::font::Fonts;
 use super::render::UiBlend;
 use super::theme::Theme;
-use super::widgets::{Composition, Key, KeyFeed, Ui, UiInput};
-use crate::gfx::{PresentMode, Renderer, SurfaceError};
+use super::widgets::{Composition, Key, KeyFeed, Ui, UiCursor, UiInput};
+use crate::app::FramePacing;
+use crate::gfx::{GpuPreference, PresentMode, Renderer, SurfaceError};
 use crate::memory::{IdleTrim, trim_working_set};
 use crate::settings::Settings;
 use std::fmt;
@@ -98,7 +100,7 @@ use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Theme as WinitTheme, Window, WindowId};
+use winit::window::{CursorIcon, Theme as WinitTheme, Window, WindowId};
 
 /// Window, renderer and UI settings for [`run`].
 #[derive(Clone, Debug)]
@@ -121,6 +123,10 @@ pub struct AppOptions {
     /// Return the process working set to the OS while the app is quiet and
     /// when it is hidden. Default `true`. See [`crate::memory::IdleTrim`].
     pub idle_trim: bool,
+    /// GPU adapter preference for the created [`Renderer`]. Default
+    /// [`GpuPreference::HighPerformance`]; UI-only apps on hybrid laptops can
+    /// opt into [`GpuPreference::LowPower`] via [`AppOptions::low_power_gpu`].
+    pub gpu_preference: GpuPreference,
 }
 
 impl Default for AppOptions {
@@ -134,6 +140,7 @@ impl Default for AppOptions {
             present_mode: PresentMode::Fifo,
             ui_blend: UiBlend::default(),
             idle_trim: true,
+            gpu_preference: GpuPreference::HighPerformance,
         }
     }
 }
@@ -156,6 +163,22 @@ impl AppOptions {
     /// Set the colour palette.
     pub fn theme(mut self, theme: ThemeMode) -> Self {
         self.theme = theme;
+        self
+    }
+
+    /// Set the GPU adapter preference.
+    pub fn gpu_preference(mut self, preference: GpuPreference) -> Self {
+        self.gpu_preference = preference;
+        self
+    }
+
+    /// Prefer an integrated/low-power GPU (`true`) or high-performance GPU (`false`).
+    pub fn low_power_gpu(mut self, low_power: bool) -> Self {
+        self.gpu_preference = if low_power {
+            GpuPreference::LowPower
+        } else {
+            GpuPreference::HighPerformance
+        };
         self
     }
 }
@@ -400,16 +423,31 @@ struct Runner<A> {
     hidden: bool,
     /// A frame must be built at the next opportunity.
     dirty: bool,
-    /// When the last presented frame finished.
+    /// When the last presented or evaluated frame finished (for `UiInput::dt`).
     last_frame: Option<Instant>,
     /// The last frame's animations are still moving.
     animating: bool,
-    /// The monitor's refresh period and when it was read (see `pacing_period`).
-    refresh_cache: Option<(Instant, Duration)>,
+    /// Phase-locked frame pacing grid (prevents timer jitter from slipping fps).
+    pacing: FramePacing,
+    /// Cached monitor refresh rate in Hz and when it was read.
+    refresh_cache: Option<(Instant, Option<f32>)>,
     /// When the UI's next timer (`Ui::next_wake_in`) is due.
     ui_wake: Option<Instant>,
     exit_requested: bool,
     memory: IdleTrim,
+    /// Whether IME composition is currently enabled on the window.
+    ime_allowed: bool,
+    /// Last cursor icon applied to the window.
+    last_cursor: Option<CursorIcon>,
+    /// Fingerprint of the last presented UI-only frame (to skip no-op submits).
+    last_presented_sig: Option<(u64, u64, usize, usize, usize)>,
+    /// Consecutive `SurfaceError::Timeout` retries (used to back off on occluded Wayland surfaces).
+    consecutive_timeouts: u32,
+    timeout_until: Option<Instant>,
+    /// Last time `is_minimized` was polled (throttled so X11 doesn't round-trip per cursor move).
+    last_window_poll: Option<Instant>,
+    window_minimised: bool,
+    wayland: bool,
     /// The handle [`AppContext::waker`] clones from.
     waker: AppWaker,
 }
@@ -421,6 +459,8 @@ impl<A: UiApp> Runner<A> {
         exit_at: Option<Instant>,
         proxy: EventLoopProxy<WakeEvent>,
     ) -> Self {
+        let wayland = cfg!(target_os = "linux")
+            && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
         Self {
             options,
             app,
@@ -444,10 +484,19 @@ impl<A: UiApp> Runner<A> {
             dirty: true,
             last_frame: None,
             animating: false,
+            pacing: FramePacing::default(),
             refresh_cache: None,
             ui_wake: None,
             exit_requested: false,
             memory: IdleTrim::new(),
+            ime_allowed: false,
+            last_cursor: None,
+            last_presented_sig: None,
+            consecutive_timeouts: 0,
+            timeout_until: None,
+            last_window_poll: None,
+            window_minimised: false,
+            wayland,
         }
     }
 
@@ -487,6 +536,7 @@ impl<A: UiApp> Runner<A> {
         if !hidden {
             self.dirty = true;
             self.last_frame = None;
+            self.last_presented_sig = None;
             return;
         }
         if let Some(live) = self.live.as_mut() {
@@ -501,14 +551,14 @@ impl<A: UiApp> Runner<A> {
         self.ui_wake = None;
     }
 
-    /// The refresh period of the monitor the window is on, for software pacing.
-    fn refresh_period(&self) -> Duration {
+    /// Refresh rate of the monitor the window is on, in Hz (60 Hz when unknown).
+    fn monitor_hz(&self) -> f32 {
         let millihertz = self
             .live
             .as_ref()
             .and_then(|live| live.window.current_monitor())
             .and_then(|monitor| monitor.refresh_rate_millihertz());
-        frame_period(millihertz)
+        1.0 / frame_period(millihertz).as_secs_f32()
     }
 
     /// Build one frame from the accumulated input, present it, and record
@@ -518,6 +568,10 @@ impl<A: UiApp> Runner<A> {
             return;
         }
         let now = Instant::now();
+        if self.timeout_until.is_some_and(|until| now < until) && !self.dirty {
+            return;
+        }
+        let was_dirty = self.dirty;
         let mut input = std::mem::take(&mut self.pending);
         input.dt = frame_dt(self.last_frame.map(|at| now.duration_since(at)));
         // Pointer position and held buttons persist across frames; edges do
@@ -543,23 +597,66 @@ impl<A: UiApp> Runner<A> {
         };
         let frame = live.ui.end();
         live.ui.flush_clipboard();
+        let want_ime = live.ui.editing();
+        if self.ime_allowed != want_ime {
+            live.window.set_ime_allowed(want_ime);
+            self.ime_allowed = want_ime;
+        }
         if let Some(rect) = live.ui.editing_rect() {
             live.window.set_ime_cursor_area(
                 LogicalPosition::new(f64::from(rect.x), f64::from(rect.y)),
                 LogicalSize::new(f64::from(rect.w), f64::from(rect.h)),
             );
         }
+        let cursor = to_winit_cursor(live.ui.cursor());
+        if self.last_cursor != Some(cursor) {
+            live.window.set_cursor(cursor);
+            self.last_cursor = Some(cursor);
+        }
         self.animating = live.ui.animating();
         let wake = live.ui.next_wake_in();
+        let frame_sig = if self.animating {
+            None
+        } else {
+            frame.content_signature()
+        };
+        if !self.animating
+            && self.last_presented_sig.is_some()
+            && frame_sig == self.last_presented_sig
+        {
+            live.ui.recycle_frame(frame);
+            let done = Instant::now();
+            self.last_frame = Some(done);
+            self.ui_wake = wake.map(|after| done + after);
+            self.memory.activity(done);
+            if self.exit_requested {
+                event_loop.exit();
+            }
+            return;
+        }
         let presented = live.renderer.render_ui_only(Some(&frame));
         live.ui.recycle_frame(frame);
         if let Err(err) = presented {
+            self.last_presented_sig = None;
             match classify_frame_failure(err) {
                 FrameFailure::Retry => {
-                    self.dirty = true;
+                    self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+                    let backoff =
+                        Duration::from_millis(100 * u64::from(self.consecutive_timeouts.min(5)));
+                    let wake_at = Instant::now() + backoff;
+                    self.timeout_until = Some(wake_at);
+                    self.ui_wake = earliest(self.ui_wake, Some(wake_at));
+                    if self.consecutive_timeouts == 3 {
+                        live.renderer.trim_memory();
+                        if self.options.idle_trim {
+                            trim_working_set();
+                        }
+                    }
                     return;
                 }
                 FrameFailure::Recreate => {
+                    self.consecutive_timeouts = 0;
+                    self.timeout_until = None;
                     live.renderer.recreate_swapchain();
                     self.dirty = true;
                     return;
@@ -571,7 +668,15 @@ impl<A: UiApp> Runner<A> {
                 }
             }
         }
+        self.consecutive_timeouts = 0;
+        self.timeout_until = None;
+        self.last_presented_sig = frame_sig;
         let done = Instant::now();
+        if was_dirty {
+            self.pacing.sync(done);
+        } else if self.animating {
+            let _ = self.pacing.due_now(now);
+        }
         self.last_frame = Some(done);
         self.ui_wake = wake.map(|after| done + after);
         self.memory.activity(done);
@@ -614,22 +719,22 @@ impl<A: UiApp> Runner<A> {
         }
     }
 
-    /// The period an animation is paced to: the monitor's refresh period
-    /// while animating (every present mode, see the module docs), zero
-    /// otherwise. The monitor query is cached for half a second.
-    fn pacing_period(&mut self) -> Duration {
+    /// Update `pacing` to the monitor's refresh rate while animating (cached
+    /// for 500 ms and invalidated on move/resize) and return the next due slot.
+    fn next_anim_due(&mut self, now: Instant) -> Option<Instant> {
         if !self.animating {
-            return Duration::ZERO;
+            return None;
         }
-        let now = Instant::now();
-        match self.refresh_cache {
-            Some((at, period)) if now.duration_since(at) < Duration::from_millis(500) => period,
+        let hz = match self.refresh_cache {
+            Some((at, hz)) if now.duration_since(at) < Duration::from_millis(500) => hz,
             _ => {
-                let period = self.refresh_period();
-                self.refresh_cache = Some((now, period));
-                period
+                let hz = Some(self.monitor_hz());
+                self.refresh_cache = Some((now, hz));
+                hz
             }
-        }
+        };
+        self.pacing.set_display_hz(hz);
+        self.pacing.next_due(now)
     }
 }
 
@@ -663,17 +768,18 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
                 return;
             }
         };
-        // Composition is opt-in per window. The runner keeps it on so IME works
-        // in any field, and places the candidate window at the focused editor.
-        window.set_ime_allowed(true);
+        // IME stays off until a text field actually holds focus.
+        window.set_ime_allowed(false);
+        self.ime_allowed = false;
         self.scale = sanitize_scale(window.scale_factor());
         self.system_dark = window.theme().is_none_or(|theme| theme == WinitTheme::Dark);
 
-        let mut renderer = Renderer::new_with_ui_blend(
+        let mut renderer = Renderer::new_with_options(
             Arc::clone(&window),
             crate::DEFAULT_SCENE_WGSL,
             Settings::default(),
             self.options.ui_blend,
+            self.options.gpu_preference,
         );
         renderer.set_present_mode(self.options.present_mode);
         let mut ui = Ui::new(Fonts::bundled(), AtlasConfig::default());
@@ -711,6 +817,8 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
         // Any event but a redraw is user activity, which restarts the quiet
         // period before the next idle trim.
         self.memory.activity(Instant::now());
+        self.consecutive_timeouts = 0;
+        self.timeout_until = None;
         match event {
             WindowEvent::Resized(size) => {
                 // Minimising reports 0x0. Keep the last real size; the window
@@ -719,6 +827,9 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
                     if let Some(live) = self.live.as_mut() {
                         live.renderer.resize(size);
                     }
+                    self.refresh_cache = None;
+                    self.last_window_poll = None;
+                    self.last_presented_sig = None;
                     self.dirty = true;
                 }
             }
@@ -726,9 +837,22 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
                 self.scale = sanitize_scale(scale_factor);
                 if let Some(live) = self.live.as_mut() {
                     live.ui.set_scale(self.scale);
-                    live.renderer.resize(live.window.inner_size());
+                    let size = live.window.inner_size();
+                    if size.width > 0
+                        && size.height > 0
+                        && (size.width, size.height) != live.renderer.display_size()
+                    {
+                        live.renderer.resize(size);
+                    }
                 }
+                self.refresh_cache = None;
+                self.last_window_poll = None;
+                self.last_presented_sig = None;
                 self.dirty = true;
+            }
+            WindowEvent::Moved(_) => {
+                self.refresh_cache = None;
+                self.last_window_poll = None;
             }
             WindowEvent::ThemeChanged(theme) => {
                 self.system_dark = theme == WinitTheme::Dark;
@@ -837,28 +961,45 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
-        // Minimisation has no event on most platforms, so it is polled here.
-        let minimised = self
-            .live
-            .as_ref()
-            .is_some_and(|live| live.window.is_minimized() == Some(true));
-        self.set_hidden(self.occluded || minimised);
-
         let now = Instant::now();
+        // Minimisation has no event on most platforms, so it is polled at low
+        // cadence off Wayland (Wayland never answers `is_minimized()`).
+        if !self.wayland
+            && self
+                .last_window_poll
+                .is_none_or(|at| now.duration_since(at) >= Duration::from_millis(250))
+        {
+            self.window_minimised = self
+                .live
+                .as_ref()
+                .is_some_and(|live| live.window.is_minimized() == Some(true));
+            self.last_window_poll = Some(now);
+        }
+        self.set_hidden(self.occluded || self.window_minimised);
+
         let trim_at = if self.hidden || !self.options.idle_trim {
             None
         } else {
-            self.memory.trim_if_due(now);
+            if self.memory.trim_if_due(now)
+                && let Some(live) = self.live.as_mut()
+            {
+                live.renderer.trim_memory();
+            }
             self.memory.next_deadline()
+        };
+        let throttled = self.timeout_until.is_some_and(|until| now < until);
+        let anim_due = if throttled {
+            None
+        } else {
+            self.next_anim_due(now)
         };
         let decision = schedule(ScheduleInput {
             now,
             hidden: self.hidden,
-            dirty: self.dirty,
-            animating: self.animating,
-            last_frame: self.last_frame,
-            frame_period: self.pacing_period(),
-            ui_wake: self.ui_wake,
+            dirty: self.dirty && !throttled,
+            animating: self.animating && !throttled,
+            anim_due,
+            ui_wake: earliest(self.ui_wake, self.timeout_until),
             trim_at,
             exit_at: self.exit_at,
         });
@@ -896,10 +1037,8 @@ struct ScheduleInput {
     hidden: bool,
     dirty: bool,
     animating: bool,
-    /// When the last presented frame finished.
-    last_frame: Option<Instant>,
-    /// The monitor's refresh period, the pace of a running animation.
-    frame_period: Duration,
+    /// Next paced slot from [`FramePacing::next_due`] while animating.
+    anim_due: Option<Instant>,
     ui_wake: Option<Instant>,
     trim_at: Option<Instant>,
     exit_at: Option<Instant>,
@@ -912,7 +1051,7 @@ struct ScheduleInput {
 /// 1. A reached exit deadline ends the loop.
 /// 2. A hidden window owes no frames, so it parks, waking only for the exit.
 /// 3. Input, a resize or a request is a frame now.
-/// 4. Animation waits one refresh period after the last frame, whatever the
+/// 4. Animation waits until the next slot on the pacing grid, whatever the
 ///    present mode: sleeping here instead of blocking in the driver keeps a
 ///    high-refresh animation cheap.
 /// 5. A UI timer that is due is a frame; a future one is a wake-up.
@@ -924,8 +1063,7 @@ fn schedule(input: ScheduleInput) -> Schedule {
         hidden,
         dirty,
         animating,
-        last_frame,
-        frame_period,
+        anim_due,
         ui_wake,
         trim_at,
         exit_at,
@@ -941,15 +1079,10 @@ fn schedule(input: ScheduleInput) -> Schedule {
     }
     let mut due = None;
     if animating {
-        match last_frame {
+        match anim_due {
             None => return Schedule::Redraw,
-            Some(last) => {
-                let at = last + frame_period;
-                if now >= at {
-                    return Schedule::Redraw;
-                }
-                due = earliest(due, Some(at));
-            }
+            Some(at) if now >= at => return Schedule::Redraw,
+            Some(at) => due = earliest(due, Some(at)),
         }
     }
     if let Some(at) = ui_wake {
@@ -961,6 +1094,18 @@ fn schedule(input: ScheduleInput) -> Schedule {
     due = earliest(due, trim_at);
     due = earliest(due, exit_at);
     due.map_or(Schedule::Park, Schedule::WaitUntil)
+}
+
+fn to_winit_cursor(cursor: UiCursor) -> CursorIcon {
+    match cursor {
+        UiCursor::Default => CursorIcon::Default,
+        UiCursor::Pointer => CursorIcon::Pointer,
+        UiCursor::Text => CursorIcon::Text,
+        UiCursor::EwResize => CursorIcon::EwResize,
+        UiCursor::NsResize => CursorIcon::NsResize,
+        UiCursor::Grab => CursorIcon::Grab,
+        UiCursor::Grabbing => CursorIcon::Grabbing,
+    }
 }
 
 /// The earlier of two optional instants, `None` only when both are `None`.
@@ -1103,8 +1248,7 @@ mod tests {
             hidden: false,
             dirty: false,
             animating: false,
-            last_frame: None,
-            frame_period: Duration::from_millis(16),
+            anim_due: None,
             ui_wake: None,
             trim_at: None,
             exit_at: None,
@@ -1252,7 +1396,7 @@ mod tests {
         let now = Instant::now();
         let first = ScheduleInput {
             animating: true,
-            last_frame: None,
+            anim_due: None,
             ..idle_at(now)
         };
         assert_eq!(schedule(first), Schedule::Redraw);
@@ -1261,21 +1405,19 @@ mod tests {
     #[test]
     fn app_runner_schedule_animating_paces_in_software() {
         let now = Instant::now();
-        let last = now - Duration::from_millis(5);
-        let period = Duration::from_millis(16);
+        let next = now + Duration::from_millis(11);
         let mailbox = ScheduleInput {
             animating: true,
-            last_frame: Some(last),
-            frame_period: period,
+            anim_due: Some(next),
             ..idle_at(now)
         };
         assert_eq!(
             schedule(mailbox),
-            Schedule::WaitUntil(last + period),
+            Schedule::WaitUntil(next),
             "wait for the next refresh, never spin"
         );
         let late = ScheduleInput {
-            last_frame: Some(now - Duration::from_millis(20)),
+            anim_due: Some(now - Duration::from_millis(4)),
             ..mailbox
         };
         assert_eq!(
@@ -1284,7 +1426,7 @@ mod tests {
             "a late refresh is due now"
         );
         let immediate = ScheduleInput {
-            last_frame: None,
+            anim_due: None,
             ..mailbox
         };
         assert_eq!(schedule(immediate), Schedule::Redraw);
@@ -1338,8 +1480,7 @@ mod tests {
         assert_eq!(schedule(input), Schedule::WaitUntil(ui));
         let animating = ScheduleInput {
             animating: true,
-            last_frame: Some(now),
-            frame_period: Duration::from_millis(16),
+            anim_due: Some(now + Duration::from_millis(16)),
             ..input
         };
         assert_eq!(

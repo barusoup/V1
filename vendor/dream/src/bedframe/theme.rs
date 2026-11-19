@@ -132,76 +132,82 @@ pub struct Theme {
 impl Theme {
     /// Neutral off-white.
     pub fn light() -> Self {
-        Self {
-            dark: false,
-            bg: Color::rgb(0xf4, 0xf4, 0xf4),
-            fg: Color::rgb(0x18, 0x18, 0x18),
-            muted: Color::rgb(0x52, 0x52, 0x52),
-            faint: Color::rgb(0x70, 0x70, 0x70),
-            border: Color::rgb(0xd8, 0xd8, 0xd8),
-            g1: Color::rgb(0xff, 0xff, 0xff),
-            g2: Color::rgb(0xf0, 0xf0, 0xf0),
-            g3: Color::rgb(0xe4, 0xe4, 0xe4),
-            pressed: Color::rgb(0xdc, 0xdc, 0xdc),
-            pane: Color::rgb(0xff, 0xff, 0xff),
-            pane_alpha_bg: Color::rgb(0xff, 0xff, 0xff),
-            pane_alpha_g2: Color::rgb(0xf0, 0xf0, 0xf0),
-            wave: [
-                Color::rgb(0xf4, 0xf4, 0xf4),
-                Color::rgb(0xec, 0xec, 0xec),
-                Color::rgb(0xe4, 0xe4, 0xe4),
-                Color::rgb(0xdb, 0xdb, 0xdb),
-            ],
-            accent: Color::rgb(0x3c, 0x3c, 0x3c),
-            accent_dim: Color::rgb(0x70, 0x70, 0x70),
-            accent_text: Color::rgb(0xff, 0xff, 0xff),
-            chk: [Color::rgb(0xf0, 0xf0, 0xf0), Color::rgb(0xe4, 0xe4, 0xe4)],
-            danger: Color::rgb(0xdc, 0x26, 0x26),
-            warn: Color::rgb(0xd9, 0x77, 0x06),
-            ok: Color::rgb(0x16, 0xa3, 0x4a),
-            info: Color::rgb(0x52, 0x52, 0x52),
-            metrics: Metrics::default(),
-            roles: ColorRoles::PLACEHOLDER,
-            tokens: Tokens::new(false, Color::TRANSPARENT),
-        }
-        .finish()
+        static LIGHT: std::sync::LazyLock<Theme> = std::sync::LazyLock::new(|| {
+            Theme {
+                dark: false,
+                bg: Color::rgb(0xf4, 0xf4, 0xf4),
+                fg: Color::rgb(0x18, 0x18, 0x18),
+                muted: Color::rgb(0x52, 0x52, 0x52),
+                faint: Color::rgb(0x70, 0x70, 0x70),
+                border: Color::rgb(0xd8, 0xd8, 0xd8),
+                g1: Color::rgb(0xff, 0xff, 0xff),
+                g2: Color::rgb(0xf0, 0xf0, 0xf0),
+                g3: Color::rgb(0xe4, 0xe4, 0xe4),
+                pressed: Color::rgb(0xdc, 0xdc, 0xdc),
+                pane: Color::rgb(0xff, 0xff, 0xff),
+                pane_alpha_bg: Color::rgb(0xff, 0xff, 0xff),
+                pane_alpha_g2: Color::rgb(0xf0, 0xf0, 0xf0),
+                wave: [
+                    Color::rgb(0xf4, 0xf4, 0xf4),
+                    Color::rgb(0xec, 0xec, 0xec),
+                    Color::rgb(0xe4, 0xe4, 0xe4),
+                    Color::rgb(0xdb, 0xdb, 0xdb),
+                ],
+                accent: Color::rgb(0x3c, 0x3c, 0x3c),
+                accent_dim: Color::rgb(0x70, 0x70, 0x70),
+                accent_text: Color::rgb(0xff, 0xff, 0xff),
+                chk: [Color::rgb(0xf0, 0xf0, 0xf0), Color::rgb(0xe4, 0xe4, 0xe4)],
+                danger: Color::rgb(0xdc, 0x26, 0x26),
+                warn: Color::rgb(0xd9, 0x77, 0x06),
+                ok: Color::rgb(0x16, 0xa3, 0x4a),
+                info: Color::rgb(0x52, 0x52, 0x52),
+                metrics: Metrics::default(),
+                roles: ColorRoles::PLACEHOLDER,
+                tokens: Tokens::new(false, Color::TRANSPARENT),
+            }
+            .finish()
+        });
+        *LIGHT
     }
 
     /// Neutral charcoal — the default engine theme.
     pub fn dark_theme() -> Self {
-        Self {
-            dark: true,
-            bg: Color::rgb(0x18, 0x18, 0x18),
-            fg: Color::rgb(0xe8, 0xe8, 0xe8),
-            muted: Color::rgb(0x9a, 0x9a, 0x9a),
-            faint: Color::rgb(0x8a, 0x8a, 0x8a),
-            border: Color::rgb(0x34, 0x34, 0x34),
-            g1: Color::rgb(0x1e, 0x1e, 0x1e),
-            g2: Color::rgb(0x28, 0x28, 0x28),
-            g3: Color::rgb(0x33, 0x33, 0x33),
-            pressed: Color::rgb(0x23, 0x23, 0x23),
-            pane: Color::rgb(0x1e, 0x1e, 0x1e),
-            pane_alpha_bg: Color::rgb(0x1e, 0x1e, 0x1e),
-            pane_alpha_g2: Color::rgb(0x28, 0x28, 0x28),
-            wave: [
-                Color::rgb(0x18, 0x18, 0x18),
-                Color::rgb(0x1c, 0x1c, 0x1c),
-                Color::rgb(0x20, 0x20, 0x20),
-                Color::rgb(0x26, 0x26, 0x26),
-            ],
-            accent: Color::rgb(0xcc, 0xcc, 0xcc),
-            accent_dim: Color::rgb(0x80, 0x80, 0x80),
-            accent_text: Color::rgb(0x18, 0x18, 0x18),
-            chk: [Color::rgb(0x20, 0x20, 0x20), Color::rgb(0x28, 0x28, 0x28)],
-            danger: Color::rgb(0xe5, 0x48, 0x4d),
-            warn: Color::rgb(0xe2, 0xa3, 0x36),
-            ok: Color::rgb(0x46, 0xa7, 0x58),
-            info: Color::rgb(0x9a, 0x9a, 0x9a),
-            metrics: Metrics::default(),
-            roles: ColorRoles::PLACEHOLDER,
-            tokens: Tokens::new(false, Color::TRANSPARENT),
-        }
-        .finish()
+        static DARK: std::sync::LazyLock<Theme> = std::sync::LazyLock::new(|| {
+            Theme {
+                dark: true,
+                bg: Color::rgb(0x18, 0x18, 0x18),
+                fg: Color::rgb(0xe8, 0xe8, 0xe8),
+                muted: Color::rgb(0x9a, 0x9a, 0x9a),
+                faint: Color::rgb(0x8a, 0x8a, 0x8a),
+                border: Color::rgb(0x34, 0x34, 0x34),
+                g1: Color::rgb(0x1e, 0x1e, 0x1e),
+                g2: Color::rgb(0x28, 0x28, 0x28),
+                g3: Color::rgb(0x33, 0x33, 0x33),
+                pressed: Color::rgb(0x23, 0x23, 0x23),
+                pane: Color::rgb(0x1e, 0x1e, 0x1e),
+                pane_alpha_bg: Color::rgb(0x1e, 0x1e, 0x1e),
+                pane_alpha_g2: Color::rgb(0x28, 0x28, 0x28),
+                wave: [
+                    Color::rgb(0x18, 0x18, 0x18),
+                    Color::rgb(0x1c, 0x1c, 0x1c),
+                    Color::rgb(0x20, 0x20, 0x20),
+                    Color::rgb(0x26, 0x26, 0x26),
+                ],
+                accent: Color::rgb(0xcc, 0xcc, 0xcc),
+                accent_dim: Color::rgb(0x80, 0x80, 0x80),
+                accent_text: Color::rgb(0x18, 0x18, 0x18),
+                chk: [Color::rgb(0x20, 0x20, 0x20), Color::rgb(0x28, 0x28, 0x28)],
+                danger: Color::rgb(0xe5, 0x48, 0x4d),
+                warn: Color::rgb(0xe2, 0xa3, 0x36),
+                ok: Color::rgb(0x46, 0xa7, 0x58),
+                info: Color::rgb(0x9a, 0x9a, 0x9a),
+                metrics: Metrics::default(),
+                roles: ColorRoles::PLACEHOLDER,
+                tokens: Tokens::new(false, Color::TRANSPARENT),
+            }
+            .finish()
+        });
+        *DARK
     }
 
     /// Fill `roles` and `tokens` from the base fields — every palette

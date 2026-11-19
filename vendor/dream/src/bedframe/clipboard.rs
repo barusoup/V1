@@ -4,8 +4,9 @@
 //! - **Windows:** reads and writes the Win32 clipboard (`CF_UNICODETEXT`,
 //!   UTF-16LE), falling back to an in-process buffer if the clipboard cannot
 //!   be opened (for example in a headless service session).
-//! - **Linux:** the desktop clipboard through Wayland's data-control protocol, or X11 when no
-//!   Wayland session is present (`arboard` chooses).
+//! - **Linux:** reads and writes via `wl-paste` / `wl-copy` on Wayland or
+//!   `xclip` / `xsel` on X11, falling back to an in-process UTF-8 buffer when
+//!   no display clipboard tool is available.
 //! - **Other platforms:** in-process UTF-8 buffer.
 
 use std::sync::Mutex;
@@ -197,37 +198,100 @@ mod imp {
     }
 }
 
-/// Linux: the desktop clipboard, through Wayland's data-control protocol when a compositor
-/// offers it and X11 otherwise.
 #[cfg(target_os = "linux")]
 mod imp {
-    use std::cell::RefCell;
+    use std::io::{ErrorKind, Write};
+    use std::process::{Command, Stdio};
 
-    thread_local! {
-        /// One clipboard per thread. On Wayland the clipboard owns the selection through a
-        /// data-control source, so the handle has to outlive the write.
-        static CLIPBOARD: RefCell<Option<arboard::Clipboard>> = const { RefCell::new(None) };
+    enum LinuxBackend {
+        Wayland,
+        X11,
+        None,
     }
 
-    fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> T) -> Option<T> {
-        CLIPBOARD.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if slot.is_none() {
-                *slot = arboard::Clipboard::new().ok();
-            }
-            slot.as_mut().map(f)
-        })
+    fn backend() -> LinuxBackend {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()) {
+            LinuxBackend::Wayland
+        } else if std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty()) {
+            LinuxBackend::X11
+        } else {
+            LinuxBackend::None
+        }
+    }
+
+    fn run_read(program: &str, args: &[&str]) -> Result<Option<String>, ErrorKind> {
+        let out = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|err| err.kind())?;
+        if out.status.success() {
+            Ok(String::from_utf8(out.stdout).ok())
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn run_write(program: &str, args: &[&str], text: &str) -> Result<(), ErrorKind> {
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|err| err.kind())?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+        Ok(())
     }
 
     pub fn read() -> Option<String> {
-        with_clipboard(|clipboard| clipboard.get_text().ok())
-            .flatten()
-            .or_else(super::fallback_read)
+        match backend() {
+            LinuxBackend::Wayland => match run_read("wl-paste", &["--no-newline"]) {
+                Ok(text) => text.or_else(super::fallback_read),
+                Err(_) => super::fallback_read(),
+            },
+            LinuxBackend::X11 => {
+                if let Ok(text) = run_read("xclip", &["-selection", "clipboard", "-o"]) {
+                    return text.or_else(super::fallback_read);
+                }
+                if let Ok(text) = run_read("xsel", &["--clipboard", "--output"]) {
+                    return text.or_else(super::fallback_read);
+                }
+                super::fallback_read()
+            }
+            LinuxBackend::None => super::fallback_read(),
+        }
     }
 
     pub fn write(text: &str) {
         super::fallback_write(text);
-        let _ = with_clipboard(|clipboard| clipboard.set_text(text.to_owned()));
+        match backend() {
+            LinuxBackend::Wayland => {
+                if text.is_empty() {
+                    let _ = Command::new("wl-copy")
+                        .arg("--clear")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                } else {
+                    let _ = run_write("wl-copy", &[], text);
+                }
+            }
+            LinuxBackend::X11 => {
+                if matches!(
+                    run_write("xclip", &["-selection", "clipboard", "-i"], text),
+                    Err(ErrorKind::NotFound)
+                ) {
+                    let _ = run_write("xsel", &["--clipboard", "--input"], text);
+                }
+            }
+            LinuxBackend::None => {}
+        }
     }
 }
 

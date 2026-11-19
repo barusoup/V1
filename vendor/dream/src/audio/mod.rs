@@ -24,6 +24,7 @@ pub use decode::{AudioData, decode, decode_file};
 pub use mixer::{Bus, Listener, MAX_VOICES, Mixer, PlayParams, VoiceHandle};
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Decoded clip storage with path deduplication, mirroring
@@ -149,19 +150,23 @@ impl Audio {
         let config: cpal::StreamConfig = config.into();
 
         let mixer = Arc::new(Mutex::new(Mixer::new(sample_rate)));
+        let active_hint = mixer.lock().unwrap().active_hint();
         let stream_mixer = Arc::clone(&mixer);
         // Owned by the callback: grows to the largest period seen, then is
         // reused, so the real-time thread does not allocate per callback.
         let mut scratch: Vec<f32> = Vec::new();
         let stream = match sample_format {
             cpal::SampleFormat::F32 => build_stream(&device, &config, move |out| {
-                fill::<f32>(out, channels, &stream_mixer, &mut scratch)
+                fill_hinted::<f32>(out, channels, &stream_mixer, &active_hint, &mut scratch)
             }),
             cpal::SampleFormat::I16 => build_stream(&device, &config, move |out| {
-                fill::<i16>(out, channels, &stream_mixer, &mut scratch)
+                fill_hinted::<i16>(out, channels, &stream_mixer, &active_hint, &mut scratch)
             }),
             cpal::SampleFormat::U16 => build_stream(&device, &config, move |out| {
-                fill::<u16>(out, channels, &stream_mixer, &mut scratch)
+                fill_hinted::<u16>(out, channels, &stream_mixer, &active_hint, &mut scratch)
+            }),
+            cpal::SampleFormat::I32 => build_stream(&device, &config, move |out| {
+                fill_hinted::<i32>(out, channels, &stream_mixer, &active_hint, &mut scratch)
             }),
             format => return Err(format!("unsupported output sample format {format:?}")),
         }?;
@@ -239,6 +244,25 @@ where
             None,
         )
         .map_err(|err| format!("build stream: {err}"))
+}
+
+/// Lock-free pre-check wrapper for the real-time callback: skips locking
+/// `mixer` completely when `active_hint` is `false`.
+fn fill_hinted<T>(
+    out: &mut [T],
+    channels: usize,
+    mixer: &Arc<Mutex<Mixer>>,
+    active_hint: &AtomicBool,
+    scratch: &mut Vec<f32>,
+) where
+    f32: cpal::FromSample<T> + cpal::SizedSample,
+    T: cpal::Sample + cpal::FromSample<f32>,
+{
+    if !active_hint.load(Ordering::Acquire) {
+        out.fill(T::EQUILIBRIUM);
+        return;
+    }
+    fill(out, channels, mixer, scratch);
 }
 
 /// Convert mixed f32 stereo into the device's buffer shape.
@@ -406,5 +430,18 @@ mod tests {
         fill::<f32>(&mut small, 2, &mixer, &mut scratch);
         assert_eq!(scratch.len(), 512, "a smaller period never shrinks it");
         assert!(small.iter().any(|s| *s != 0.0), "still audible");
+    }
+
+    #[test]
+    fn fill_hinted_skips_mixer_lock_when_idle() {
+        let mixer = Arc::new(Mutex::new(Mixer::new(48_000)));
+        let hint = mixer.lock().unwrap().active_hint();
+        let _held = mixer.lock().unwrap();
+        let mut out = vec![1i32; 16];
+        let mut scratch = Vec::new();
+        // If `fill_hinted` attempted to lock `mixer` while `_held` is alive
+        // on the same thread, this would deadlock.
+        fill_hinted::<i32>(&mut out, 2, &mixer, &hint, &mut scratch);
+        assert!(out.iter().all(|&s| s == 0));
     }
 }

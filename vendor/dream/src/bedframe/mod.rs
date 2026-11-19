@@ -86,6 +86,7 @@ pub mod clipboard;
 pub mod devtools;
 pub mod draw;
 pub mod font;
+mod hash;
 pub mod icons;
 pub mod layout;
 pub mod pixel;
@@ -234,15 +235,33 @@ impl tween::LerpValue for Color {
     /// own alpha and dividing out the interpolated alpha avoids the dip: the
     /// colour stays at its final value and only its coverage ramps.
     fn lerp_value(a: Self, b: Self, t: f32) -> Self {
-        let t = t.clamp(0.0, 1.0);
+        if t <= 0.0 || a == b {
+            return a;
+        }
+        if t >= 1.0 {
+            return b;
+        }
+        if a.a == b.a {
+            let chan = |x: u8, y: u8| {
+                (f32::from(x) + (f32::from(y) - f32::from(x)) * t)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            };
+            return Self {
+                r: chan(a.r, b.r),
+                g: chan(a.g, b.g),
+                b: chan(a.b, b.b),
+                a: a.a,
+            };
+        }
         let mix = |x: f32, y: f32| x + (y - x) * t;
-        let alpha = mix(a.a as f32, b.a as f32);
+        let alpha = mix(f32::from(a.a), f32::from(b.a));
         let channel = |x: u8, y: u8| {
             if alpha <= 0.0 {
                 return 0;
             }
             // Premultiplied endpoints, divided back out by the mixed alpha.
-            let premultiplied = mix(x as f32 * a.a as f32, y as f32 * b.a as f32);
+            let premultiplied = mix(f32::from(x) * f32::from(a.a), f32::from(y) * f32::from(b.a));
             (premultiplied / alpha).round().clamp(0.0, 255.0) as u8
         };
         Self {

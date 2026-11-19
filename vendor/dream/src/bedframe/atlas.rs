@@ -293,7 +293,7 @@ impl Atlas {
                 .max(config.page_size as usize * config.page_size as usize),
             id: NEXT_ATLAS_ID.fetch_add(1, Ordering::Relaxed),
             epoch: 0,
-            pages: vec![Page::new(config.page_size, AtlasFormat::Coverage)],
+            pages: Vec::new(),
             placements: 0,
             snapshot: None,
         }
@@ -305,8 +305,6 @@ impl Atlas {
     pub fn reset(&mut self) {
         self.epoch += 1;
         self.pages.clear();
-        self.pages
-            .push(Page::new(self.config.page_size, AtlasFormat::Coverage));
         self.snapshot = None;
     }
 
@@ -400,7 +398,10 @@ impl Atlas {
         // 0x0 region at the current shelf corner costs nothing and samples
         // transparent padding.
         if width == 0 || height == 0 {
-            // A zero-sized glyph never samples; any page's coordinates do.
+            // A zero-sized direct insertion still returns a valid page index.
+            if self.pages.is_empty() {
+                self.grow_page(format, size)?;
+            }
             let page = self.pages.len() - 1;
             let corner = (self.pages[page].shelf_x, self.pages[page].shelf_y);
             return Ok(Region {
@@ -523,7 +524,9 @@ impl Atlas {
 
     /// A page's pixel format and write revision (GPU upload decisions).
     pub fn page_format(&self, page: usize) -> AtlasFormat {
-        self.pages[page].format
+        self.pages
+            .get(page)
+            .map_or(AtlasFormat::Coverage, |p| p.format)
     }
 
     pub fn page_revision(&self, page: usize) -> u64 {

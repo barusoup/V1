@@ -139,7 +139,7 @@ pub(super) fn create_model_pipeline(
         .push_next(&mut rendering);
     unsafe {
         ctx.device()
-            .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+            .create_graphics_pipelines(ctx.pipeline_cache(), &[info], None)
             .map_err(|(_, err)| err)
             .expect("create model pipeline")[0]
     }
@@ -262,7 +262,7 @@ pub(super) fn create_pbr_pipeline(
         .push_next(&mut rendering);
     unsafe {
         ctx.device()
-            .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+            .create_graphics_pipelines(ctx.pipeline_cache(), &[info], None)
             .map_err(|(_, err)| err)
             .expect("create pbr pipeline")[0]
     }

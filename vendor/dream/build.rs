@@ -1,9 +1,14 @@
-fn fnv1a_64(bytes: &[u8]) -> u64 {
+fn fnv1a_64_normalized(bytes: &[u8]) -> (u64, usize) {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut len = 0usize;
     for &b in bytes {
+        if b == b'\r' {
+            continue;
+        }
         hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        len += 1;
     }
-    hash
+    (hash, len)
 }
 
 fn main() {
@@ -37,57 +42,22 @@ fn main() {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if name == "fsr3_common.wgsl" || name == "lighting.wgsl" {
-            // Shared preludes are prepended to pass shaders, but also validate them standalone.
+        let prelude_only = name == "fsr3_common.wgsl" || name == "lighting.wgsl";
+        let mut source = raw_source;
+        if name.starts_with("fsr3_") && name != "fsr3_common.wgsl" {
+            source = format!("{prelude}\n{source}");
         }
-        let mut variants = Vec::new();
-        for (p_pre, l_pre, src_var) in [
-            (prelude.as_str(), lighting.as_str(), raw_source.as_str()),
-            (
-                &prelude.replace(
-                    "
-
-", "
-",
-                ),
-                &lighting.replace(
-                    "
-
-", "
-",
-                ),
-                &raw_source.replace(
-                    "
-
-", "
-",
-                ),
-            ),
-        ] {
-            let mut s = src_var.to_string();
-            if name.starts_with("fsr3_") && name != "fsr3_common.wgsl" {
-                s = format!(
-                    "{p_pre}
-{s}"
-                );
-            }
-            if s.contains("lighting_eval") && name != "lighting.wgsl" {
-                s = format!(
-                    "{l_pre}
-{s}"
-                );
-            }
-            variants.push(s);
+        if source.contains("lighting_eval") && name != "lighting.wgsl" {
+            // Runtime callers concatenate `crate::lighting::SHADER` with no separator.
+            source = format!("{lighting}{source}");
         }
-        let source = &variants[0];
-        let module = match naga::front::wgsl::parse_str(source) {
+        let module = match naga::front::wgsl::parse_str(&source) {
             Ok(module) => module,
             Err(error) => {
                 eprintln!(
-                    "WGSL parse error in {}:
-{}",
+                    "WGSL parse error in {}:\n{}",
                     path.display(),
-                    error.emit_to_string(source)
+                    error.emit_to_string(&source)
                 );
                 failed = true;
                 continue;
@@ -100,23 +70,19 @@ fn main() {
         let info = match validator.validate(&module) {
             Ok(info) => info,
             Err(error) => {
-                eprintln!(
-                    "WGSL validation error in {}:
-{error:?}",
-                    path.display()
-                );
+                eprintln!("WGSL validation error in {}:\n{error:?}", path.display());
                 failed = true;
                 continue;
             }
         };
+        if prelude_only {
+            continue;
+        }
         match naga::back::spv::write_vec(&module, &info, &spv_options, None) {
             Ok(words) => {
-                for v in &variants {
-                    let h = fnv1a_64(v.as_bytes());
-                    let len = v.len();
-                    if seen_keys.insert((h, len)) {
-                        compiled_entries.push((h, len, words.clone()));
-                    }
+                let (h, len) = fnv1a_64_normalized(source.as_bytes());
+                if seen_keys.insert((h, len)) {
+                    compiled_entries.push((h, len, words));
                 }
             }
             Err(error) => {

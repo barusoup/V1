@@ -103,7 +103,24 @@ pub(super) fn barrier(device: &ash::Device, cmd: vk::CommandBuffer) {
     unsafe {
         device.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &memory,
+            &[],
+            &[],
+        );
+    }
+}
+
+pub(super) fn transfer_to_compute_barrier(device: &ash::Device, cmd: vk::CommandBuffer) {
+    let memory = [vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::DependencyFlags::empty(),
             &memory,
@@ -132,7 +149,7 @@ pub(super) fn create_compute_pipelines<const N: usize>(
         .collect();
     let vec = unsafe {
         ctx.device()
-            .create_compute_pipelines(vk::PipelineCache::null(), &infos, None)
+            .create_compute_pipelines(ctx.pipeline_cache(), &infos, None)
             .map_err(|(_, err)| err)
             .expect("create compute pipelines")
     };

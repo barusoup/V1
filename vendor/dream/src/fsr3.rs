@@ -24,7 +24,7 @@ use crate::gfx::{GpuBuffer, GpuContext};
 use ash::vk;
 use pipeline::{
     barrier, create_compute_pipelines, descriptor_bindings, image, image_binding, sampler_write,
-    storage_buffer, storage_image, uniform,
+    storage_buffer, storage_image, transfer_to_compute_barrier, uniform,
 };
 use std::sync::Arc;
 use targets::FsrTargets;
@@ -80,8 +80,8 @@ pub struct Fsr3 {
     layout: vk::PipelineLayout,
     dsl: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
-    /// One set per frame slot: writing descriptors for the slot whose fence
-    /// just recycled is safe, while the other slot may still be in flight.
+    /// Two sets per frame slot (ping 0 and ping 1): pre-written so `record`
+    /// never calls `vkUpdateDescriptorSets`.
     sets: Vec<vk::DescriptorSet>,
     pipelines: Pipelines,
     targets: FsrTargets,
@@ -98,6 +98,7 @@ pub struct Fsr3 {
     frame_index: f32,
     ping: usize,
     inputs: [vk::ImageView; 3],
+    skip_wait_on_drop: bool,
 }
 
 #[allow(clippy::struct_field_names)]
@@ -149,31 +150,31 @@ impl Fsr3 {
         };
 
         let pool = {
-            let slots = frame_slots as u32;
+            let set_count = (frame_slots * 2) as u32;
             let sizes = [
                 vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                    .descriptor_count(2 * slots),
+                    .descriptor_count(2 * set_count),
                 vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::SAMPLER)
-                    .descriptor_count(2 * slots),
+                    .descriptor_count(2 * set_count),
                 vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                    .descriptor_count(20 * slots),
+                    .descriptor_count(20 * set_count),
                 vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::STORAGE_IMAGE)
-                    .descriptor_count(16 * slots),
+                    .descriptor_count(16 * set_count),
                 vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(2 * slots),
+                    .descriptor_count(2 * set_count),
             ];
             let info = vk::DescriptorPoolCreateInfo::default()
-                .max_sets(slots)
+                .max_sets(set_count)
                 .pool_sizes(&sizes);
             unsafe { ctx.device().create_descriptor_pool(&info, None) }
                 .expect("fsr3 descriptor pool")
         };
-        let layouts: Vec<_> = (0..frame_slots).map(|_| dsl).collect();
+        let layouts: Vec<_> = (0..frame_slots * 2).map(|_| dsl).collect();
         let sets = unsafe {
             ctx.device().allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
@@ -293,12 +294,15 @@ impl Fsr3 {
             frame_index: 0.0,
             ping: 0,
             inputs,
+            skip_wait_on_drop: false,
         };
         fsr.write_rcas_config(0.6);
-        for slot in 0..frame_slots {
-            fsr.write_descriptors(slot);
-        }
+        fsr.write_all_descriptors();
         fsr
+    }
+
+    pub(crate) fn mark_idle_for_drop(&mut self) {
+        self.skip_wait_on_drop = true;
     }
 
     pub fn output_view(&self) -> vk::ImageView {
@@ -331,6 +335,7 @@ impl Fsr3 {
 
     pub fn set_inputs(&mut self, inputs: [vk::ImageView; 3]) {
         self.inputs = inputs;
+        self.write_all_descriptors();
     }
 
     pub fn resize(&mut self, render_size: (u32, u32), display_size: (u32, u32)) {
@@ -344,6 +349,7 @@ impl Fsr3 {
             );
         }
         self.reset();
+        self.write_all_descriptors();
     }
 
     pub fn write_rcas_config(&mut self, sharpness: f32) {
@@ -424,9 +430,16 @@ impl Fsr3 {
         self.frame_index += 1.0;
     }
 
-    fn write_descriptors(&self, frame: usize) {
-        let read = self.ping;
-        let write = 1 - self.ping;
+    fn write_all_descriptors(&self) {
+        for frame in 0..self.constants.len() {
+            self.write_descriptors_for(frame, 0);
+            self.write_descriptors_for(frame, 1);
+        }
+    }
+
+    fn write_descriptors_for(&self, frame: usize, ping: usize) {
+        let read = ping;
+        let write = 1 - ping;
 
         let sampled = |view: vk::ImageView| {
             vk::DescriptorImageInfo::default()
@@ -440,7 +453,7 @@ impl Fsr3 {
                 .range(size)
         };
 
-        let set = self.sets[frame];
+        let set = self.sets[frame * 2 + ping];
         let constants_info = buffer(
             &self.constants[frame],
             std::mem::size_of::<Fsr3Constants>() as u64,
@@ -521,25 +534,15 @@ impl Fsr3 {
         unsafe { self.ctx.device().update_descriptor_sets(&writes, &[]) };
     }
 
-    fn dispatch(
+    fn dispatch_bound(
         cmd: vk::CommandBuffer,
         pipeline: vk::Pipeline,
-        layout: vk::PipelineLayout,
-        set: vk::DescriptorSet,
         x: u32,
         y: u32,
         device: &ash::Device,
     ) {
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-            device.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                layout,
-                0,
-                &[set],
-                &[],
-            );
             device.cmd_dispatch(cmd, x, y, 1);
         }
     }
@@ -548,7 +551,6 @@ impl Fsr3 {
     /// false forces a restart frame.
     pub fn record(&mut self, cmd: vk::CommandBuffer, history_valid: bool, frame: usize) {
         let device = self.ctx.device().clone();
-        self.write_descriptors(frame);
 
         let (rw, rh) = self.render_size;
         let (dw, dh) = self.display_size;
@@ -580,15 +582,7 @@ impl Fsr3 {
                 0xFFFF_FFFF,
             );
         }
-        barrier(&device, cmd);
-
-        let set = self.sets[frame];
-        let layout = self.layout;
-        let pass = |pipeline: vk::Pipeline, w: u32, h: u32| {
-            let (x, y) = groups(w, h);
-            Self::dispatch(cmd, pipeline, layout, set, x, y, &device);
-            barrier(&device, cmd);
-        };
+        transfer_to_compute_barrier(&device, cmd);
 
         // Restart frame: clear the persistent state exactly like AMD's host
         // does on firstExecution (ACCUMULATION_1/2 and LUMA_1/2). Without
@@ -602,21 +596,45 @@ impl Fsr3 {
                 self.targets.luma_history[0].image,
                 self.targets.luma_history[1].image,
             ];
+            let subresource = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            let pre_barriers = clears.map(|image| {
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(subresource)
+                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            });
+            let post_barriers = clears.map(|image| {
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(subresource)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            });
             unsafe {
-                for &image in &clears {
-                    crate::gfx::vulkan::image_barrier(
-                        &device,
-                        cmd,
-                        image,
-                        vk::ImageLayout::GENERAL,
-                        vk::ImageLayout::GENERAL,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ,
-                        vk::AccessFlags::TRANSFER_WRITE,
-                        vk::ImageAspectFlags::COLOR,
-                    );
-                }
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &pre_barriers,
+                );
                 for &image in &clears {
                     device.cmd_clear_color_image(
                         cmd,
@@ -625,31 +643,37 @@ impl Fsr3 {
                         &vk::ClearColorValue {
                             float32: [0.0, 0.0, 0.0, 0.0],
                         },
-                        &[vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        }],
+                        &[subresource],
                     );
                 }
-                for &image in &clears {
-                    crate::gfx::vulkan::image_barrier(
-                        &device,
-                        cmd,
-                        image,
-                        vk::ImageLayout::GENERAL,
-                        vk::ImageLayout::GENERAL,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::AccessFlags::TRANSFER_WRITE,
-                        vk::AccessFlags::MEMORY_READ,
-                        vk::ImageAspectFlags::COLOR,
-                    );
-                }
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &post_barriers,
+                );
             }
         }
+
+        let set = self.sets[frame * 2 + self.ping];
+        unsafe {
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.layout,
+                0,
+                &[set],
+                &[],
+            );
+        }
+        let pass = |pipeline: vk::Pipeline, w: u32, h: u32| {
+            let (x, y) = groups(w, h);
+            Self::dispatch_bound(cmd, pipeline, x, y, &device);
+            barrier(&device, cmd);
+        };
         pass(self.pipelines.prepare_inputs, rw, rh);
         pass(
             self.pipelines.shading_change,
@@ -674,7 +698,8 @@ impl Fsr3 {
         pass(self.pipelines.prepare_reactivity, rw, rh);
         pass(self.pipelines.luma_instability, rw, rh);
         pass(self.pipelines.accumulate, dw, dh);
-        pass(self.pipelines.rcas, dw, dh);
+        let (rx, ry) = groups(dw, dh);
+        Self::dispatch_bound(cmd, self.pipelines.rcas, rx, ry, &device);
 
         self.ping = 1 - self.ping;
     }
@@ -684,7 +709,9 @@ impl Drop for Fsr3 {
     fn drop(&mut self) {
         unsafe {
             let device = self.ctx.device();
-            let _ = device.device_wait_idle();
+            if !self.skip_wait_on_drop {
+                let _ = device.device_wait_idle();
+            }
             for pipeline in [
                 self.pipelines.prepare_inputs,
                 self.pipelines.shading_change,

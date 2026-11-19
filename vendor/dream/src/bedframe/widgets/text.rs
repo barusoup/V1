@@ -61,29 +61,40 @@ impl Ui {
 
         // The editor state lives across frames; external text mutation
         // invalidates its offsets and undo inside `sync`.
-        self.editors
-            .entry(id)
-            .or_insert_with(|| editor::EditorState::new(text));
-        let (caret_now, pre_input) = {
-            let state = self.editors.get_mut(&id).expect("inserted above");
+        let mut inserted = false;
+        let (caret_now, pre_input, prev_scroll) = {
+            let frame = self.frame;
+            let state = self.editors.entry(id).or_insert_with(|| {
+                inserted = true;
+                editor::EditorState::new(text)
+            });
             state.sync(text);
-            state.last_frame = self.frame;
+            state.last_frame = frame;
             (
                 state.caret.min(text.len()),
                 (state.caret, state.anchor, text.len()),
+                state.scroll,
             )
         };
+        if inserted {
+            self.editors_dirty = true;
+        }
 
         // Pointer caret placement + drag selection. The pointer lands in
         // the field's *scrolled* text space — the scroll the field settled
         // on LAST frame, not a prefix-derived guess. Stops only resolve
         // on an actual pointer edge (no per-frame Vec for idle fields).
+        let pointer_press =
+            !self.view.replay && self.input.mouse_pressed && hovered && self.active_id == Some(id);
+        let drag_ok = !self.view.replay
+            && self.active_id == Some(id)
+            && self.input.mouse_down
+            && self.capture_allowed(id, rect);
         let (pointer_byte, pointer_shift) = if !self.view.replay
             && ((self.input.mouse_pressed && hovered)
                 || (self.active_id == Some(id) && self.input.mouse_down))
         {
-            let scroll = self.editors.get(&id).expect("inserted above").scroll;
-            let target = self.input.mouse.0 - (rect.x + style.text_inset) + scroll;
+            let target = self.input.mouse.0 - (rect.x + style.text_inset) + prev_scroll;
             let display = password_display(text, style.password);
             (
                 password_real_byte(
@@ -96,15 +107,9 @@ impl Ui {
         } else {
             (caret_now, false)
         };
-        // Capture legality is a Ui-level check; resolve it BEFORE the
-        // editor-state borrow.
-        let drag_ok = !self.view.replay
-            && self.active_id == Some(id)
-            && self.input.mouse_down
-            && self.capture_allowed(id, rect);
-        {
+        if pointer_press || drag_ok {
             let state = self.editors.get_mut(&id).expect("inserted above");
-            if self.input.mouse_pressed && hovered && self.active_id == Some(id) {
+            if pointer_press {
                 if pointer_shift {
                     // Shift-click extends the selection from the anchor.
                     state.move_to(text, pointer_byte, true);
@@ -127,6 +132,7 @@ impl Ui {
             if let Some(copied) = state.apply(text, &self.input, false) {
                 self.clipboard_out = Some(copied);
             }
+            self.editors_dirty = true;
             if nav.cancel {
                 state.collapse(state.caret);
                 self.focus_id = None;
@@ -151,62 +157,89 @@ impl Ui {
             .rounded_frame(rect, style.corner_radius, border_width, bg, border);
         // Clip so long text scrolls instead of spilling over neighbours.
         self.draw.push_clip(rect);
-        {
+
+        let composing = focused && self.input.preedit.is_some();
+        let scale = self.scale;
+        let label_style = LabelStyle::new(style.font)
+            .size(style.size)
+            .color(if enabled {
+                style.text
+            } else {
+                style.text_disabled
+            })
+            .align(Align::Left)
+            .vcenter(true);
+        let display = if text.is_empty() {
+            std::borrow::Cow::Borrowed("")
+        } else {
+            password_display(text, style.password)
+        };
+        let text_layout = if text.is_empty() {
+            None
+        } else {
+            Some(self.cached_layout(
+                &display,
+                style.font,
+                style.size * scale,
+                LayoutOptions {
+                    wrap_width: None,
+                    line_height: label_style.line_height,
+                    ..Default::default()
+                },
+            ))
+        };
+
+        let sel_dt = self.anim_dt();
+        let blink = style.caret_blink.max(0.0);
+        let window = (rect.w - 20.0).max(1.0);
+        let (
+            caret,
+            selection,
+            caret_px,
+            scroll,
+            sx1,
+            sx2,
+            sa,
+            cfade,
+            caret_last_x,
+            wake_after,
+            show_caret,
+        ) = {
+            let dt_pos = self.input.dt.max(0.0);
             let state = self.editors.get_mut(&id).expect("inserted above");
             if (state.caret, state.anchor, text.len()) != pre_input {
                 state.touched = true;
             }
-        }
-        let caret_px = {
-            let state = self.editors.get(&id).expect("inserted above");
-            self.stop_x(
-                &password_display(text, style.password),
-                password_display_byte(text, state.caret.min(text.len()), style.password),
-                style.font,
-                style.size,
-            )
-        };
-        // Persistent scroll: only adjust when the caret leaves the
-        // visible window — typing mid-field doesn't teleport the view.
-        let window = (rect.w - 20.0).max(1.0);
-        let scroll = {
-            let state = self.editors.get_mut(&id).expect("inserted above");
+            let caret = state.caret.min(text.len());
+            let selection = state.selection();
+            let caret_px = text_layout.as_deref().map_or(0.0, |layout| {
+                stop_x_in_layout(
+                    layout,
+                    password_display_byte(text, caret, style.password),
+                    scale,
+                )
+            });
             if caret_px < state.scroll {
                 state.scroll = caret_px;
             } else if caret_px > state.scroll + window {
                 state.scroll = caret_px - window;
             }
-            state.scroll
-        };
-        let state = self.editors.get(&id).expect("inserted above");
-        let caret = state.caret.min(text.len());
-        let selection = state.selection();
-        let shown_x = rect.x + style.text_inset - scroll;
-        // Selection highlight + caret fade-out. Geometry is instant —
-        // the highlight is exactly the live range and the caret is
-        // exactly the caret. Only disappearance animates: both fade out
-        // fast at the geometry they last had (text space, so a scroll
-        // change can't retarget them).
-        let sel_targets = selection.clone().map(|range| {
-            let display = password_display(text, style.password);
-            (
-                self.stop_x(
-                    &display,
-                    password_display_byte(text, range.start, style.password),
-                    style.font,
-                    style.size,
-                ),
-                self.stop_x(
-                    &display,
-                    password_display_byte(text, range.end, style.password),
-                    style.font,
-                    style.size,
-                ),
-            )
-        });
-        let sel_dt = self.anim_dt();
-        let (sx1, sx2, sa, cfade, caret_last_x) = {
-            let state = self.editors.get_mut(&id).expect("inserted above");
+            let sel_targets = selection.as_ref().and_then(|range| {
+                text_layout.as_deref().map(|layout| {
+                    (
+                        stop_x_in_layout(
+                            layout,
+                            password_display_byte(text, range.start, style.password),
+                            scale,
+                        ),
+                        stop_x_in_layout(
+                            layout,
+                            password_display_byte(text, range.end, style.password),
+                            scale,
+                        ),
+                    )
+                })
+            });
             match sel_targets {
                 Some((tx1, tx2)) => {
                     state.sel_last = (tx1.min(tx2), tx1.max(tx2));
@@ -226,14 +259,49 @@ impl Ui {
                     .caret_fade
                     .animate_to(0.0, style.fade_out, Ease::QuadIn);
             }
+            let sa = state.sel_fade.update(sel_dt);
+            let cfade = state.caret_fade.update(sel_dt);
+            let (wake_after, show_caret) = if focused {
+                if !state.blink_focused || state.touched {
+                    state.blink_elapsed = 0.0;
+                    state.touched = false;
+                } else {
+                    state.blink_elapsed += dt_pos;
+                }
+                state.blink_focused = true;
+                if blink > 0.0 {
+                    let phase = state.blink_elapsed % blink;
+                    let until_next = if phase < blink * 0.5 {
+                        blink * 0.5 - phase
+                    } else {
+                        blink - phase
+                    };
+                    (Some(until_next), !composing && phase < blink * 0.5)
+                } else {
+                    (None, !composing)
+                }
+            } else {
+                state.blink_focused = false;
+                (None, false)
+            };
             (
+                caret,
+                selection,
+                caret_px,
+                state.scroll,
                 state.sel_last.0,
                 state.sel_last.1,
-                state.sel_fade.update(sel_dt),
-                state.caret_fade.update(sel_dt),
+                sa,
+                cfade,
                 state.caret_last_x,
+                wake_after,
+                show_caret,
             )
         };
+        if let Some(until_next) = wake_after {
+            self.request_wake(until_next);
+        }
+        let shown_x = rect.x + style.text_inset - scroll;
         if sa > 0.002 && (sx2 - sx1).abs() > 0.5 {
             // Selection sits `selection_inset` inside the field, so its
             // radius is the concentric inner of the field's corner.
@@ -253,50 +321,14 @@ impl Ui {
                 ),
             );
         }
-        let composing = focused && self.input.preedit.is_some();
         if focused {
-            // Caret blink runs on the field's own wall-clock timer — NOT
-            // anim_loop_f32: a loop entry keeps `animating` true forever
-            // and would pin an idle editor's host at full frame rate.
-            // The timer resets on any real edit or caret move (tracked
-            // inside the focused-input block above via `state.touched`),
-            // and on the frame focus lands.
-            let state = self.editors.get_mut(&id).expect("inserted above");
-            // A reset frame (focus just gained, or an edit/caret move)
-            // starts the VISIBLE phase fresh — it must NOT also swallow
-            // the wall-clock dt that accumulated while the host was
-            // parked: a 10 s dt would land the caret mid-hidden-phase.
-            if !state.blink_focused || state.touched {
-                state.blink_elapsed = 0.0;
-                state.touched = false;
-            } else {
-                state.blink_elapsed += self.input.dt.max(0.0);
-            }
-            state.blink_focused = true;
-            // Half of `caret_blink` visible, half hidden — wake the host
-            // exactly at the next boundary, then go back to sleep. A
-            // non-positive period keeps the caret solid and never wakes.
-            let blink = style.caret_blink.max(0.0);
-            let phase = if blink > 0.0 {
-                state.blink_elapsed % blink
-            } else {
-                0.0
-            };
-            if blink > 0.0 {
-                let until_next = if phase < blink * 0.5 {
-                    blink * 0.5 - phase
-                } else {
-                    blink - phase
-                };
-                self.request_wake(until_next);
-            }
             let caret_rect = Rect::new(
                 shown_x + caret_px,
                 rect.y + style.caret_inset,
                 style.caret_width,
                 rect.h - style.caret_inset * 2.0,
             );
-            if !composing && (blink <= 0.0 || phase < blink * 0.5) {
+            if show_caret {
                 self.draw.rect(caret_rect, style.caret);
             }
             if !composing {
@@ -304,8 +336,6 @@ impl Ui {
                 // the field's whole box.
                 self.note_editing_caret(caret_rect);
             }
-        } else if let Some(state) = self.editors.get_mut(&id) {
-            state.blink_focused = false;
         }
         // Blur leaves a fading ghost of the caret at its last position —
         // same fade-out the selection highlight gets.
@@ -330,20 +360,21 @@ impl Ui {
         // While a composition preview replaces the selection visually,
         // the preview draw below renders the WHOLE document with the
         // preview spliced in — the prefix stays visible.
-        if !text.is_empty() && !composing {
-            self.label(
-                Rect::new(shown_x, rect.y, rect.w - 12.0, rect.h),
-                &password_display(text, style.password),
-                LabelStyle::new(style.font)
-                    .size(style.size)
-                    .color(if enabled {
-                        style.text
-                    } else {
-                        style.text_disabled
-                    })
-                    .align(Align::Left)
-                    .vcenter(true),
-            );
+        if let Some(layout) = text_layout.as_ref()
+            && !composing
+        {
+            let text_rect = Rect::new(shown_x, rect.y, rect.w - 12.0, rect.h);
+            let screen = Rect::new(0.0, 0.0, self.screen.0, self.screen.1);
+            if text_rect.w > 0.0
+                && text_rect.h > 0.0
+                && screen.intersect(text_rect).is_some()
+                && self
+                    .draw
+                    .clip_rect()
+                    .is_none_or(|clip| clip.intersect(text_rect).is_some())
+            {
+                self.draw_label(text_rect, layout, scale, label_style);
+            }
         }
         // IME preedit: the underlined composition preview is the WHOLE
         // document with the preview spliced over the current selection —
@@ -487,11 +518,7 @@ impl Ui {
                 ..Default::default()
             },
         );
-        let stops = &layout.stops;
-        match stops.iter().position(|&(_, b)| b == byte) {
-            Some(index) => stops[index].0 / scale,
-            None => layout.width / scale,
-        }
+        stop_x_in_layout(&layout, byte, scale)
     }
 
     /// Byte offset (a grapheme stop) nearest the LOGICAL pointer x — the
@@ -543,6 +570,15 @@ impl Ui {
                 break;
             }
         }
+        self.editors_dirty = false;
+    }
+}
+
+fn stop_x_in_layout(layout: &crate::ui::font::TextLayout, byte: usize, scale: f32) -> f32 {
+    let stops = &layout.stops;
+    match stops.iter().position(|&(_, b)| b == byte) {
+        Some(index) => stops[index].0 / scale,
+        None => layout.width / scale,
     }
 }
 

@@ -86,7 +86,7 @@ impl ThumbnailPass {
             .layout(layout);
         let pipeline = unsafe {
             ctx.device()
-                .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_compute_pipelines(ctx.pipeline_cache(), &[info], None)
                 .map_err(|(_, err)| err)
                 .expect("create thumbnail pipeline")[0]
         };

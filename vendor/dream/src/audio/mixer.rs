@@ -12,6 +12,7 @@
 
 use super::decode::AudioData;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Maximum simultaneous voices. The oldest playing voice is stolen when
 /// exceeded.
@@ -167,6 +168,9 @@ pub struct Mixer {
     stolen: u64,
     /// Monotonic play counter for oldest-voice stealing.
     next_order: u64,
+    /// Lock-free hint read by the real-time audio callback: `false` when no
+    /// voice is playing or fading out, letting the callback skip locking.
+    active_hint: Arc<AtomicBool>,
 }
 
 impl Mixer {
@@ -180,7 +184,12 @@ impl Mixer {
             mixed_frames: 0,
             stolen: 0,
             next_order: 1,
+            active_hint: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn active_hint(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.active_hint)
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -231,6 +240,7 @@ impl Mixer {
             order: self.next_order,
         };
         self.next_order += 1;
+        self.active_hint.store(true, Ordering::Release);
         VoiceHandle {
             slot: slot as u32,
             generation,
@@ -241,6 +251,7 @@ impl Mixer {
     /// the voice disappears.
     pub fn stop(&mut self, handle: VoiceHandle, fade_out: Option<f32>) {
         let sample_rate = self.sample_rate;
+        let mut died = false;
         if let Some(voice) = self.voice_mut(handle) {
             voice.state = match fade_out {
                 Some(seconds) if seconds > 0.0 => {
@@ -261,16 +272,28 @@ impl Mixer {
                     voice.fade_out_total = frames;
                     VoiceState::Stopping { frames_left }
                 }
-                _ => VoiceState::Dead,
+                _ => {
+                    voice.clip = None;
+                    died = true;
+                    VoiceState::Dead
+                }
             };
+        }
+        if died && self.is_silent() {
+            self.active_hint.store(false, Ordering::Release);
         }
     }
 
     pub fn pause(&mut self, handle: VoiceHandle) {
+        let mut paused = false;
         if let Some(voice) = self.voice_mut(handle)
             && voice.state == VoiceState::Playing
         {
             voice.state = VoiceState::Paused;
+            paused = true;
+        }
+        if paused && self.is_silent() {
+            self.active_hint.store(false, Ordering::Release);
         }
     }
 
@@ -279,6 +302,7 @@ impl Mixer {
             && voice.state == VoiceState::Paused
         {
             voice.state = VoiceState::Playing;
+            self.active_hint.store(true, Ordering::Release);
         }
     }
 
@@ -336,16 +360,21 @@ impl Mixer {
         debug_assert!(out.len().is_multiple_of(2), "stereo output");
         let frames = out.len() / 2;
         let sample_rate = self.sample_rate as f64;
+        let master_gain = self.bus_gain[Bus::Master.index()];
+        let bus_gain = self.bus_gain;
+        let listener = self.listener;
+        let mut any_audible = false;
         for voice in self.voices.iter_mut() {
             let (VoiceState::Playing | VoiceState::Stopping { .. }) = voice.state else {
                 continue;
             };
-            let Some(clip) = voice.clip.clone() else {
+            let Some(clip) = voice.clip.as_deref() else {
                 voice.state = VoiceState::Dead;
                 continue;
             };
             if clip.samples.is_empty() {
                 voice.state = VoiceState::Dead;
+                voice.clip = None;
                 continue;
             }
             let clip_frames = clip.frames() as f64;
@@ -354,15 +383,12 @@ impl Mixer {
             // Per-voice constant factors for this block.
             let (left_pan, right_pan) = stereo_pan(voice.pan);
             let (spatial_gain, spatial_left, spatial_right) = match voice.position {
-                Some(position) => spatialize(
-                    &self.listener,
-                    position,
-                    voice.min_distance,
-                    voice.max_distance,
-                ),
+                Some(position) => {
+                    spatialize(&listener, position, voice.min_distance, voice.max_distance)
+                }
                 None => (1.0, 1.0, 1.0),
             };
-            let bus = self.bus_gain[voice.bus.index()] * self.bus_gain[Bus::Master.index()];
+            let bus = bus_gain[voice.bus.index()] * master_gain;
             let base_gain = voice.gain * spatial_gain * bus;
             let (left_pan, right_pan) = (left_pan * spatial_left, right_pan * spatial_right);
 
@@ -373,6 +399,7 @@ impl Mixer {
             // The fixed ramp length (never the remaining frames, which would
             // reset the envelope to 1.0 at every block boundary).
             let fade_total = voice.fade_out_total.max(1) as f32;
+            let inv_sample_rate = 1.0 / self.sample_rate as f32;
 
             let mut mixed = 0u64;
             for frame in 0..frames {
@@ -381,8 +408,7 @@ impl Mixer {
                 if voice.fade_in_left > 0.0 {
                     let elapsed = voice.fade_in_total - voice.fade_in_left;
                     envelope *= (elapsed / voice.fade_in_total).clamp(0.0, 1.0);
-                    voice.fade_in_left =
-                        (voice.fade_in_left - 1.0 / self.sample_rate as f32).max(0.0);
+                    voice.fade_in_left = (voice.fade_in_left - inv_sample_rate).max(0.0);
                 }
                 if fade_frames_left != u64::MAX {
                     envelope *= (fade_frames_left as f32 / fade_total).clamp(0.0, 1.0);
@@ -394,7 +420,7 @@ impl Mixer {
                     break;
                 }
 
-                let (s0, s1) = sample_pair(&clip, voice.cursor);
+                let (s0, s1) = sample_pair(clip, voice.cursor);
                 out[frame * 2] += s0 * gain * left_pan;
                 out[frame * 2 + 1] += s1 * gain * right_pan;
                 voice.cursor += step;
@@ -420,8 +446,13 @@ impl Mixer {
                 let left = frames_left.saturating_sub(mixed.min(frames_left));
                 voice.state = VoiceState::Stopping { frames_left: left };
             }
-            let _ = mixed;
+            if matches!(voice.state, VoiceState::Dead) {
+                voice.clip = None;
+            } else {
+                any_audible = true;
+            }
         }
+        self.active_hint.store(any_audible, Ordering::Release);
         self.mixed_frames += frames as u64;
     }
 
@@ -834,5 +865,28 @@ mod tests {
         let (l, r) = stereo_pan(-0.5);
         assert_eq!(l, 1.0);
         assert!((r - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn dead_voice_releases_clip_arc_and_clears_active_hint() {
+        let mut m = mixer();
+        let data = clip(10, 48_000, 1.0);
+        let hint = m.active_hint();
+        assert!(!hint.load(Ordering::Acquire));
+        let h = m.play(Arc::clone(&data), PlayParams::default());
+        assert!(hint.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&data), 2);
+        m.pause(h);
+        assert!(!hint.load(Ordering::Acquire));
+        m.resume(h);
+        assert!(hint.load(Ordering::Acquire));
+        let mut out = vec![0.0; 20 * 2];
+        m.mix_into(&mut out);
+        assert_eq!(
+            Arc::strong_count(&data),
+            1,
+            "finished voice releases clip Arc"
+        );
+        assert!(!hint.load(Ordering::Acquire));
     }
 }

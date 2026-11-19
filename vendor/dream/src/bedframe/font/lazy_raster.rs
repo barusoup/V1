@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
 
 const CURVE_SCALE: f32 = 100.0;
@@ -468,6 +468,7 @@ pub(crate) struct LazyFont {
     default_advance: u16,
     has_legacy_kern: bool,
     gpos_first_glyphs: Vec<u64>,
+    ascii_kern: OnceLock<Option<Box<[i16; 128 * 128]>>>,
     kern_cache: Mutex<HashMap<u32, i16>>,
     /// Non-ASCII `char` -> `(glyph_id, advance_units)`; glyph 0 when unmapped.
     glyph_cache: Mutex<HashMap<char, (u16, u16)>>,
@@ -545,6 +546,7 @@ impl LazyFont {
             default_advance,
             has_legacy_kern,
             gpos_first_glyphs,
+            ascii_kern: OnceLock::new(),
             kern_cache: Mutex::new(HashMap::new()),
             glyph_cache: Mutex::new(HashMap::new()),
             compiled: Mutex::new(HashMap::new()),
@@ -610,6 +612,20 @@ impl LazyFont {
     }
 
     pub fn kern(&self, left: char, right: char, px: f32) -> f32 {
+        if (left as u32) < 128 && (right as u32) < 128 {
+            let table = self
+                .ascii_kern
+                .get_or_init(|| self.build_ascii_kern_table());
+            let Some(table) = table.as_deref() else {
+                return 0.0;
+            };
+            let units = table[((left as usize) << 7) | (right as usize)];
+            return if units == 0 {
+                0.0
+            } else {
+                (f32::from(units) * (px / self.units_per_em)).round()
+            };
+        }
         let first_id = self.glyph_index(left);
         if first_id == 0 {
             return 0.0;
@@ -661,6 +677,73 @@ impl LazyFont {
         }
         cache.insert(key, units);
         (f32::from(units) * (px / self.units_per_em)).round()
+    }
+
+    fn build_ascii_kern_table(&self) -> Option<Box<[i16; 128 * 128]>> {
+        let has_gpos = self.ascii_glyphs.iter().any(|&gid| {
+            gid != 0
+                && self
+                    .gpos_first_glyphs
+                    .get(gid as usize / 64)
+                    .is_some_and(|word| (word & (1u64 << (gid as usize % 64))) != 0)
+        });
+        if !has_gpos && !self.has_legacy_kern {
+            return None;
+        }
+        let face = Face::parse(&self.data, 0).ok()?;
+        let kern_table = if self.has_legacy_kern {
+            face.tables().kern
+        } else {
+            None
+        };
+        let mut table: Box<[i16; 128 * 128]> = vec![0i16; 128 * 128]
+            .into_boxed_slice()
+            .try_into()
+            .expect("exact 128x128 size");
+        for l in 0..128usize {
+            let first_id = self.ascii_glyphs[l];
+            if first_id == 0 {
+                continue;
+            }
+            let gid = first_id as usize;
+            let in_gpos = self
+                .gpos_first_glyphs
+                .get(gid / 64)
+                .is_some_and(|word| (word & (1u64 << (gid % 64))) != 0);
+            if !in_gpos && kern_table.is_none() {
+                continue;
+            }
+            let first = GlyphId(first_id);
+            for r in 0..128usize {
+                let second_id = self.ascii_glyphs[r];
+                if second_id == 0 {
+                    continue;
+                }
+                let second = GlyphId(second_id);
+                let mut units = if in_gpos {
+                    super::gpos_pair_kern_units(&face, first, second)
+                } else {
+                    None
+                };
+                if units.is_none()
+                    && let Some(kern) = kern_table
+                {
+                    for subtable in kern.subtables {
+                        if subtable.horizontal
+                            && !subtable.variable
+                            && let Some(v) = subtable.glyphs_kerning(first, second)
+                        {
+                            units = Some(v);
+                            break;
+                        }
+                    }
+                }
+                if let Some(u) = units {
+                    table[(l << 7) | r] = u;
+                }
+            }
+        }
+        Some(table)
     }
 
     pub fn rasterize(&self, ch: char, px: f32) -> (fontdue::Metrics, Vec<u8>) {

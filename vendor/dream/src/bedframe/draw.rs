@@ -151,6 +151,90 @@ impl UiFrame {
         self.cmds.is_empty()
     }
 
+    /// Compact content fingerprint of the frame's geometry, commands, target
+    /// size, and atlas snapshot revisions, used by app runners to skip
+    /// redundant GPU presentations when an input event (e.g. `CursorMoved`)
+    /// leaves the visual frame unchanged.
+    pub(crate) fn content_signature(&self) -> Option<(u64, u64, usize, usize, usize)> {
+        if !self.atlas_updates.is_empty() {
+            return None;
+        }
+        let mut h1 = 0xcbf2_9ce4_8422_2325u64;
+        let mut h2 = 0x9e37_79b9_7f4a_7c15u64;
+        let mix = |h1: &mut u64, h2: &mut u64, v: u64| {
+            *h1 = (*h1 ^ v).wrapping_mul(0x0000_0100_0000_01b3);
+            *h2 = h2
+                .rotate_left(13)
+                .wrapping_add(v)
+                .wrapping_mul(0xff51_afd7_ed55_8ccd);
+        };
+        mix(&mut h1, &mut h2, u64::from(self.size.0.to_bits()));
+        mix(&mut h1, &mut h2, u64::from(self.size.1.to_bits()));
+        if let Some(d) = self.dirty_rect {
+            mix(&mut h1, &mut h2, 1);
+            mix(&mut h1, &mut h2, u64::from(d.x.to_bits()));
+            mix(&mut h1, &mut h2, u64::from(d.y.to_bits()));
+            mix(&mut h1, &mut h2, u64::from(d.w.to_bits()));
+            mix(&mut h1, &mut h2, u64::from(d.h.to_bits()));
+        }
+        if let Some(snap) = &self.atlas_snapshot {
+            mix(&mut h1, &mut h2, snap.atlas_id);
+            mix(&mut h1, &mut h2, snap.epoch);
+            for p in &snap.pages {
+                mix(&mut h1, &mut h2, p.revision);
+            }
+        }
+        for cmd in &self.cmds {
+            match &cmd.texture {
+                CmdTexture::White => mix(&mut h1, &mut h2, 1),
+                CmdTexture::Backdrop => mix(&mut h1, &mut h2, 2),
+                CmdTexture::Custom(t) => {
+                    mix(&mut h1, &mut h2, 3);
+                    mix(&mut h1, &mut h2, Arc::as_ptr(t) as usize as u64);
+                }
+                CmdTexture::AtlasPage(p) => {
+                    mix(&mut h1, &mut h2, 4);
+                    mix(&mut h1, &mut h2, *p as u64);
+                }
+            }
+            if let Some(s) = cmd.scissor {
+                mix(&mut h1, &mut h2, u64::from(s.x.to_bits()));
+                mix(&mut h1, &mut h2, u64::from(s.y.to_bits()));
+                mix(&mut h1, &mut h2, u64::from(s.w.to_bits()));
+                mix(&mut h1, &mut h2, u64::from(s.h.to_bits()));
+            }
+            mix(&mut h1, &mut h2, u64::from(cmd.first_index));
+            mix(&mut h1, &mut h2, u64::from(cmd.index_count));
+            mix(&mut h1, &mut h2, cmd.layer as i64 as u64);
+        }
+        let (v_chunks, v_rem) =
+            bytemuck::cast_slice::<UiVertex, u8>(&self.vertices).as_chunks::<8>();
+        for chunk in v_chunks {
+            mix(&mut h1, &mut h2, u64::from_le_bytes(*chunk));
+        }
+        if !v_rem.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..v_rem.len()].copy_from_slice(v_rem);
+            mix(&mut h1, &mut h2, u64::from_le_bytes(buf));
+        }
+        let (i_chunks, i_rem) = bytemuck::cast_slice::<u32, u8>(&self.indices).as_chunks::<8>();
+        for chunk in i_chunks {
+            mix(&mut h1, &mut h2, u64::from_le_bytes(*chunk));
+        }
+        if !i_rem.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..i_rem.len()].copy_from_slice(i_rem);
+            mix(&mut h1, &mut h2, u64::from_le_bytes(buf));
+        }
+        Some((
+            h1,
+            h2,
+            self.vertices.len(),
+            self.indices.len(),
+            self.cmds.len(),
+        ))
+    }
+
     /// Restricts rendering to `rect` (in UI pixel coordinates) when
     /// updating a retained UI target.
     pub fn with_dirty_rect(mut self, rect: Rect) -> Self {
@@ -211,31 +295,6 @@ impl Clip {
     }
 }
 
-/// How a laid-out glyph is placed on the target.
-///
-/// Both modes draw the same cached coverage mask; they differ only in where
-/// the quad lands, so neither costs atlas space or rasterization work.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TextAa {
-    /// Subpixel positioning (the default). A glyph's quad keeps its exact
-    /// fractional pen position, quantized to a quarter of a physical pixel,
-    /// and the sampler's linear filter moves the mask by that fraction, so
-    /// letter spacing follows the shaping advance instead of jittering by up
-    /// to a pixel. This is what browsers and native toolkits do above 1x.
-    #[default]
-    Subpixel,
-    /// Whole-physical-pixel positioning: every mask texel covers exactly one
-    /// target pixel. Crispest for stems, but the pen's fraction is dropped, so
-    /// spacing can drift by up to half a pixel per glyph. Use it when a
-    /// display's scaling makes the filter's softening visible.
-    PixelSnap,
-}
-
-/// A quarter of a physical pixel: the subpixel grid glyph quads quantize to.
-/// Coarser than the 1/256 a full subpixel mask would track, fine enough that
-/// the mask moves by at most an eighth of a pixel.
-const SUBPIXEL_STEPS: f32 = 4.0;
-
 pub struct DrawList {
     vertices: Vec<UiVertex>,
     indices: Vec<u32>,
@@ -249,8 +308,8 @@ pub struct DrawList {
     /// Logical-to-physical multiplier applied by [`Self::finish`]: draw
     /// calls are submitted in logical units, the frame comes out physical.
     scale: f32,
-    /// Glyph placement; see [`TextAa`].
-    text_aa: TextAa,
+    /// True once any vertex with non-zero `params[3]` (SDF/gradient/rounded clip) is emitted.
+    has_shapes: bool,
 }
 
 impl Default for DrawList {
@@ -281,7 +340,7 @@ impl DrawList {
             scissor_stack: Vec::new(),
             size: (0.0, 0.0),
             scale: 1.0,
-            text_aa: TextAa::default(),
+            has_shapes: false,
         }
     }
 
@@ -293,6 +352,7 @@ impl DrawList {
         self.layer = 0;
         self.scissor_stack.clear();
         self.size = size;
+        self.has_shapes = false;
     }
 
     /// Reclaim a finished frame's buffers: whichever allocation of the
@@ -335,16 +395,6 @@ impl DrawList {
     /// The scale [`Self::finish`] applies (see [`Self::set_scale`]).
     pub fn scale(&self) -> f32 {
         self.scale
-    }
-
-    /// Glyph placement for text drawn from now on; see [`TextAa`].
-    pub fn set_text_aa(&mut self, aa: TextAa) {
-        self.text_aa = aa;
-    }
-
-    /// The current glyph placement mode (see [`Self::set_text_aa`]).
-    pub fn text_aa(&self) -> TextAa {
-        self.text_aa
     }
 
     /// Outward grow of an SDF quad, in logical units: one physical pixel.
@@ -401,6 +451,7 @@ impl DrawList {
         offset: (f32, f32),
     ) {
         let ((v0, i0, c0), (v1, i1, c1)) = (start, end);
+        self.has_shapes |= src.has_shapes;
         let base = self.vertices.len() as u32;
         for v in &src.vertices[v0..v1] {
             let mut v = *v;
@@ -564,10 +615,13 @@ impl DrawList {
         // historic all-zero params, so batching and instancing are
         // unchanged when rounding is not in use.
         let (params, extra) = match self.scissor_stack.last() {
-            Some(Clip::Rounded { rect: clip, radius }) => (
-                [clip.center().0, clip.center().1, *radius, -1.0],
-                [clip.w * 0.5, clip.h * 0.5],
-            ),
+            Some(Clip::Rounded { rect: clip, radius }) => {
+                self.has_shapes = true;
+                (
+                    [clip.center().0, clip.center().1, *radius, -1.0],
+                    [clip.w * 0.5, clip.h * 0.5],
+                )
+            }
             _ => (QUAD_PARAMS, QUAD_EXTRA),
         };
         self.vertices.extend_from_slice(&[
@@ -647,6 +701,7 @@ impl DrawList {
         let r = radius.clamp(0.0, hw.min(hh));
         let c = color.to_array();
         let params = [hw, hh, r, mode];
+        self.has_shapes = true;
         let base = self.vertices.len() as u32;
         self.vertices.extend_from_slice(&[
             UiVertex {
@@ -735,6 +790,7 @@ impl DrawList {
         }
         let c = color.to_array();
         let params = [r_mid, half_t, start, ARC_MODE];
+        self.has_shapes = true;
         let extra = [sweep, 0.0];
         let centre = (rect.x + hw, rect.y + hh);
         let corner = |pos: (f32, f32)| UiVertex {
@@ -1012,6 +1068,7 @@ impl DrawList {
         // from the padded quad origin by stepping back `extra` = pad.
         let params = [rect.w, rect.h, r, 2.0];
         let extra = [pad, pad];
+        self.has_shapes = true;
         let c = tint.to_array();
         // Extend the texture range linearly over the pad, so the padded
         // corners sample just past the shape's own UV edges.
@@ -1094,6 +1151,7 @@ impl DrawList {
         let (hw, hh) = (silhouette.w * 0.5, silhouette.h * 0.5);
         let r = (radius + spread).clamp(0.0, hw.min(hh));
         let params = [hw, hh, r, -(5.0 + softness)];
+        self.has_shapes = true;
         let c = color.to_array();
         let (qx, qy) = (quad.w * 0.5, quad.h * 0.5);
         let base = self.vertices.len() as u32;
@@ -1166,6 +1224,7 @@ impl DrawList {
         let r = (radius + spread).clamp(0.0, hw.min(hh));
         let params = [hw, hh, r, -4.0];
         let extra = [sigma, 0.0];
+        self.has_shapes = true;
         let c = color.to_array();
         let centre = silhouette.center();
         let corner = |x: f32, y: f32| UiVertex {
@@ -1220,6 +1279,7 @@ impl DrawList {
         let (hw, hh) = (rect.w * 0.5, rect.h * 0.5);
         let (cx, cy) = rect.center();
         let c = color.to_array();
+        self.has_shapes = true;
         // Quadrants in radii order; each reaches one pixel past the rect's
         // outer edges for the anti-aliased band, and stops at the centre.
         let quadrants = [
@@ -1332,6 +1392,7 @@ impl DrawList {
         let (ew, eh) = (hw + pad, hh + pad);
         let r = radius.clamp(0.0, hw.min(hh));
         let params = [hw, hh, r, 1.0];
+        self.has_shapes = true;
         let [tl, tr, br, bl] = corners;
         let base = self.vertices.len() as u32;
         self.vertices.extend_from_slice(&[
@@ -1394,6 +1455,7 @@ impl DrawList {
         // the shader from the padded quad origin back to the rect's origin.
         let params = [rect.w, rect.h, outer, -2.0];
         let extra = [pad, pad];
+        self.has_shapes = true;
         let uv = [packed, inner];
         let c = from.to_array();
         let base = self.vertices.len() as u32;
@@ -1459,19 +1521,12 @@ impl DrawList {
         } else {
             color
         };
-        // Vertical placement always lands on a physical pixel: glyph masks are
-        // baked with their baseline on the grid, and a fractional y would blur
-        // every horizontal stem. Horizontal placement depends on the mode —
-        // see `TextAa` — and is quantized in *physical* pixels, so a half
-        // logical unit at scale 2 is still a whole device pixel of precision.
+        // Snap at the *physical* pixel: a half-logical-unit at scale 2 is
+        // still a whole device pixel, and landing on one keeps the raster
+        // crisp where a logical snap would blur it.
         let scale = self.scale;
-        let x = (origin.0 + glyph.x) * scale;
-        let x = match self.text_aa {
-            TextAa::Subpixel => (x * SUBPIXEL_STEPS).round() / SUBPIXEL_STEPS,
-            TextAa::PixelSnap => x.round(),
-        } / scale;
         let rect = Rect::new(
-            x,
+            ((origin.0 + glyph.x) * scale).round() / scale,
             ((origin.1 + glyph.y) * scale).round() / scale,
             glyph.glyph.width,
             glyph.glyph.height,
@@ -1492,9 +1547,7 @@ impl DrawList {
         color: Color,
         cache: &GlyphCache,
     ) {
-        for &glyph in &layout.glyphs {
-            self.positioned_glyph(origin, glyph, color, cache);
-        }
+        self.text_layout_inner(origin, layout, 1.0, color, cache);
     }
 
     /// Draw a layout produced at *physical* size, scaled back into logical
@@ -1509,26 +1562,127 @@ impl DrawList {
         color: Color,
         cache: &GlyphCache,
     ) {
-        if (physical_scale - 1.0).abs() < 1e-6 {
-            self.text_layout(origin, layout, color, cache);
+        self.text_layout_inner(origin, layout, physical_scale, color, cache);
+    }
+
+    fn text_layout_inner(
+        &mut self,
+        origin: (f32, f32),
+        layout: &TextLayout,
+        physical_scale: f32,
+        color: Color,
+        cache: &GlyphCache,
+    ) {
+        if color.a == 0 || layout.glyphs.is_empty() || self.clipped_away() {
             return;
         }
-        let inv = 1.0 / physical_scale;
+        let inv = if (physical_scale - 1.0).abs() < 1e-6 {
+            1.0
+        } else {
+            1.0 / physical_scale
+        };
+        if matches!(self.scissor_stack.last(), Some(Clip::Rounded { .. })) {
+            for &glyph in &layout.glyphs {
+                if inv == 1.0 {
+                    self.positioned_glyph(origin, glyph, color, cache);
+                } else {
+                    let scaled = PositionedGlyph {
+                        x: glyph.x * inv,
+                        y: glyph.y * inv,
+                        ch: glyph.ch,
+                        glyph: super::font::Glyph {
+                            advance: glyph.glyph.advance * inv,
+                            x_offset: glyph.glyph.x_offset * inv,
+                            y_offset: glyph.glyph.y_offset * inv,
+                            width: glyph.glyph.width * inv,
+                            height: glyph.glyph.height * inv,
+                            region: glyph.glyph.region,
+                        },
+                    };
+                    self.positioned_glyph(origin, scaled, color, cache);
+                }
+            }
+            return;
+        }
+
+        let scale = self.scale;
+        let page_size = cache.atlas().page_size();
+        let mut last_page: Option<usize> = None;
+        let mut last_is_srgb = false;
+        let mut run_page: Option<usize> = None;
+        let mut run_indices: u32 = 0;
+
+        self.vertices.reserve(layout.glyphs.len() * 4);
+        self.indices.reserve(layout.glyphs.len() * 6);
+
         for &glyph in &layout.glyphs {
-            let scaled = PositionedGlyph {
-                x: glyph.x * inv,
-                y: glyph.y * inv,
-                ch: glyph.ch,
-                glyph: super::font::Glyph {
-                    advance: glyph.glyph.advance * inv,
-                    x_offset: glyph.glyph.x_offset * inv,
-                    y_offset: glyph.glyph.y_offset * inv,
-                    width: glyph.glyph.width * inv,
-                    height: glyph.glyph.height * inv,
-                    region: glyph.glyph.region,
-                },
+            let gw = glyph.glyph.width * inv;
+            let gh = glyph.glyph.height * inv;
+            if gw <= 0.0 || gh <= 0.0 {
+                continue;
+            }
+            let x = ((origin.0 + glyph.x * inv) * scale).round() / scale;
+            let y = ((origin.1 + glyph.y * inv) * scale).round() / scale;
+            let rect = Rect::new(x, y, gw, gh);
+            if self.culled(rect) {
+                continue;
+            }
+            let r = glyph.glyph.region;
+            if let Some(prev) = run_page
+                && prev != r.page
+            {
+                self.push_cmd(CmdTexture::AtlasPage(prev), run_indices);
+                run_indices = 0;
+            }
+            run_page = Some(r.page);
+            if last_page != Some(r.page) {
+                last_page = Some(r.page);
+                last_is_srgb =
+                    cache.atlas().page_format(r.page) == super::atlas::AtlasFormat::RgbaSrgb;
+            }
+            let c = if last_is_srgb {
+                [255, 255, 255, color.a]
+            } else {
+                color.to_array()
             };
-            self.positioned_glyph(origin, scaled, color, cache);
+            let [u0, v0, u1, v1] = r.uv(page_size);
+            let base = self.vertices.len() as u32;
+            self.vertices.extend_from_slice(&[
+                UiVertex {
+                    pos: [x, y],
+                    uv: [u0, v0],
+                    color: c,
+                    params: QUAD_PARAMS,
+                    extra: QUAD_EXTRA,
+                },
+                UiVertex {
+                    pos: [x + gw, y],
+                    uv: [u1, v0],
+                    color: c,
+                    params: QUAD_PARAMS,
+                    extra: QUAD_EXTRA,
+                },
+                UiVertex {
+                    pos: [x + gw, y + gh],
+                    uv: [u1, v1],
+                    color: c,
+                    params: QUAD_PARAMS,
+                    extra: QUAD_EXTRA,
+                },
+                UiVertex {
+                    pos: [x, y + gh],
+                    uv: [u0, v1],
+                    color: c,
+                    params: QUAD_PARAMS,
+                    extra: QUAD_EXTRA,
+                },
+            ]);
+            self.indices
+                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            run_indices += 6;
+        }
+        if let Some(p) = run_page {
+            self.push_cmd(CmdTexture::AtlasPage(p), run_indices);
         }
     }
 
@@ -1806,87 +1960,105 @@ impl DrawList {
     /// Fast path: when the commands were already submitted in layer order
     /// (the common case — layers are pushed deliberately), the buffers move
     /// across untouched. Sorting only costs when layers are interleaved.
-    pub fn finish(self, size: (f32, f32)) -> UiFrame {
+    pub fn finish(mut self, size: (f32, f32)) -> UiFrame {
+        self.finish_reuse(size)
+    }
+
+    pub(crate) fn finish_reuse(&mut self, size: (f32, f32)) -> UiFrame {
         let scale = self.scale;
-        let mut vertices = self.vertices;
-        let mut cmds = self.cmds;
+        let mut vertices = std::mem::take(&mut self.vertices);
+        let indices = std::mem::take(&mut self.indices);
+        let mut cmds = std::mem::take(&mut self.cmds);
+        self.layer = 0;
+        self.scissor_stack.clear();
+        let has_shapes = self.has_shapes;
+        self.has_shapes = false;
         let mut size = size;
         if scale != 1.0 {
-            for vertex in &mut vertices {
-                vertex.pos[0] *= scale;
-                vertex.pos[1] *= scale;
-                // Text and plain quads only scale their positions.
-                if vertex.params[3] == 0.0 {
-                    continue;
+            if !has_shapes {
+                for vertex in &mut vertices {
+                    vertex.pos[0] *= scale;
+                    vertex.pos[1] *= scale;
                 }
-                // Shape params are pixel-space too: [half_w, half_h,
-                // radius, is_shape] for flag 1 (plus SDF local coords in
-                // uv), [full_w, full_h, radius, 2] for the rounded-
-                // texture crop, and [half_w, half_h, radius, 3 + thickness]
-                // for a ring, whose thickness is itself a length. Only
-                // texture UVs remain unscaled; cropped-image
-                // dimensions/radius are pixel-space and scale too.
-                if vertex.params[3] == 1.0 {
-                    vertex.params[0] *= scale;
-                    vertex.params[1] *= scale;
-                    vertex.params[2] *= scale;
-                    vertex.uv[0] *= scale;
-                    vertex.uv[1] *= scale;
-                } else if vertex.params[3] == 2.0 {
-                    vertex.params[0] *= scale;
-                    vertex.params[1] *= scale;
-                    vertex.params[2] *= scale;
-                    // The pad from the quad origin to the shape: a length.
-                    vertex.extra[0] *= scale;
-                    vertex.extra[1] *= scale;
-                } else if vertex.params[3] > 2.5 {
-                    vertex.params[0] *= scale;
-                    vertex.params[1] *= scale;
-                    vertex.params[2] *= scale;
-                    vertex.params[3] = 3.0 + (vertex.params[3] - 3.0) * scale;
-                    vertex.uv[0] *= scale;
-                    vertex.uv[1] *= scale;
-                } else if vertex.params[3] == -1.0 {
-                    // Rounded-clip textured quad: the clip's centre, radius
-                    // and half extent are all pixel-space lengths.
-                    vertex.params[0] *= scale;
-                    vertex.params[1] *= scale;
-                    vertex.params[2] *= scale;
-                    vertex.extra[0] *= scale;
-                    vertex.extra[1] *= scale;
-                } else if vertex.params[3] == -2.0 {
-                    // Radial gradient: full size and both radii are lengths
-                    // (the inner rides in uv[1]); uv[0] holds the packed
-                    // "to" colour and must not be scaled.
-                    vertex.params[0] *= scale;
-                    vertex.params[1] *= scale;
-                    vertex.params[2] *= scale;
-                    vertex.uv[1] *= scale;
-                    // Origin pad (see mode 2): a length.
-                    vertex.extra[0] *= scale;
-                    vertex.extra[1] *= scale;
-                } else if vertex.params[3] > 0.25 && vertex.params[3] < 0.5 {
-                    vertex.params[0] *= scale;
-                    vertex.params[1] *= scale;
-                    vertex.params[2] *= scale;
-                } else if vertex.params[3] == ARC_MODE {
-                    // Arc stroke: the mid radius and half thickness are
-                    // lengths and uv is the centre-relative position. The
-                    // start angle (params.z) and the sweep (extra.x) are
-                    // angles — scaling them would bend the arc.
-                    vertex.params[0] *= scale;
-                    vertex.params[1] *= scale;
-                    vertex.uv[0] *= scale;
-                    vertex.uv[1] *= scale;
-                } else if vertex.params[3] < -0.5 {
-                    // Soft shadow: half extent, radius and the fade band
-                    // (packed into the mode as -(5 + softness)) are lengths.
-                    vertex.params[0] *= scale;
-                    vertex.params[1] *= scale;
-                    vertex.params[2] *= scale;
-                    vertex.params[3] = -(5.0 + (-vertex.params[3] - 5.0) * scale);
-                    vertex.uv[0] *= scale;
-                    vertex.uv[1] *= scale;
+            } else {
+                for vertex in &mut vertices {
+                    vertex.pos[0] *= scale;
+                    vertex.pos[1] *= scale;
+                    // Text and plain quads only scale their positions.
+                    if vertex.params[3] == 0.0 {
+                        continue;
+                    }
+                    // Shape params are pixel-space too: [half_w, half_h,
+                    // radius, is_shape] for flag 1 (plus SDF local coords in
+                    // uv), [full_w, full_h, radius, 2] for the rounded-
+                    // texture crop, and [half_w, half_h, radius, 3 + thickness]
+                    // for a ring, whose thickness is itself a length. Only
+                    // texture UVs remain unscaled; cropped-image
+                    // dimensions/radius are pixel-space and scale too.
+                    if vertex.params[3] == 1.0 {
+                        vertex.params[0] *= scale;
+                        vertex.params[1] *= scale;
+                        vertex.params[2] *= scale;
+                        vertex.uv[0] *= scale;
+                        vertex.uv[1] *= scale;
+                    } else if vertex.params[3] == 2.0 {
+                        vertex.params[0] *= scale;
+                        vertex.params[1] *= scale;
+                        vertex.params[2] *= scale;
+                        // The pad from the quad origin to the shape: a length.
+                        vertex.extra[0] *= scale;
+                        vertex.extra[1] *= scale;
+                    } else if vertex.params[3] > 2.5 {
+                        vertex.params[0] *= scale;
+                        vertex.params[1] *= scale;
+                        vertex.params[2] *= scale;
+                        vertex.params[3] = 3.0 + (vertex.params[3] - 3.0) * scale;
+                        vertex.uv[0] *= scale;
+                        vertex.uv[1] *= scale;
+                    } else if vertex.params[3] == -1.0 {
+                        // Rounded-clip textured quad: the clip's centre, radius
+                        // and half extent are all pixel-space lengths.
+                        vertex.params[0] *= scale;
+                        vertex.params[1] *= scale;
+                        vertex.params[2] *= scale;
+                        vertex.extra[0] *= scale;
+                        vertex.extra[1] *= scale;
+                    } else if vertex.params[3] == -2.0 {
+                        // Radial gradient: full size and both radii are lengths
+                        // (the inner rides in uv[1]); uv[0] holds the packed
+                        // "to" colour and must not be scaled.
+                        vertex.params[0] *= scale;
+                        vertex.params[1] *= scale;
+                        vertex.params[2] *= scale;
+                        vertex.uv[1] *= scale;
+                        // Origin pad (see mode 2): a length.
+                        vertex.extra[0] *= scale;
+                        vertex.extra[1] *= scale;
+                    } else if vertex.params[3] > 0.25 && vertex.params[3] < 0.5 {
+                        // Concave corner fillet: the circle centre and radius
+                        // are pixel-space lengths.
+                        vertex.params[0] *= scale;
+                        vertex.params[1] *= scale;
+                        vertex.params[2] *= scale;
+                    } else if vertex.params[3] == ARC_MODE {
+                        // Arc stroke: the mid radius and half thickness are
+                        // lengths and uv is the centre-relative position. The
+                        // start angle (params.z) and the sweep (extra.x) are
+                        // angles — scaling them would bend the arc.
+                        vertex.params[0] *= scale;
+                        vertex.params[1] *= scale;
+                        vertex.uv[0] *= scale;
+                        vertex.uv[1] *= scale;
+                    } else if vertex.params[3] < -0.5 {
+                        // Soft shadow: half extent, radius and the fade band
+                        // (packed into the mode as -(5 + softness)) are lengths.
+                        vertex.params[0] *= scale;
+                        vertex.params[1] *= scale;
+                        vertex.params[2] *= scale;
+                        vertex.params[3] = -(5.0 + (-vertex.params[3] - 5.0) * scale);
+                        vertex.uv[0] *= scale;
+                        vertex.uv[1] *= scale;
+                    }
                 }
             }
             for cmd in &mut cmds {
@@ -1900,25 +2072,16 @@ impl DrawList {
             size = (size.0 * scale, size.1 * scale);
         }
         let sorted = cmds.windows(2).any(|pair| pair[0].layer > pair[1].layer);
-        if !sorted {
-            return UiFrame {
-                vertices,
-                indices: self.indices,
-                cmds,
-                atlas_updates: Vec::new(),
-                atlas_snapshot: None,
-                size,
-                dirty_rect: None,
-            };
+        if sorted {
+            // Stable sort by layer: later layers draw on top. Indices and
+            // vertices are absolute, so reordering the commands alone is enough —
+            // no re-indexing pass (the renderer draws every command with a zero
+            // vertex offset).
+            cmds.sort_by_key(|cmd| cmd.layer);
         }
-        // Stable sort by layer: later layers draw on top. Indices and
-        // vertices are absolute, so reordering the commands alone is enough —
-        // no re-indexing pass (the renderer draws every command with a zero
-        // vertex offset).
-        cmds.sort_by_key(|cmd| cmd.layer);
         UiFrame {
             vertices,
-            indices: self.indices,
+            indices,
             cmds,
             atlas_updates: Vec::new(),
             atlas_snapshot: None,

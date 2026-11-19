@@ -19,7 +19,7 @@ use crate::gfx::DrawCtx;
 use crate::gfx::vulkan::{GpuContext, align_up};
 use crate::texture::{self, GpuTexture, TextureFormat, TextureOptions};
 use ash::vk;
-pub(crate) use material::{pack_transform, pbr_vertex_buffer};
+pub(crate) use material::{PbrFallbacks, pack_transform, pbr_vertex_buffer};
 use pipeline::create_model_pipeline;
 use std::sync::Arc;
 
@@ -135,8 +135,9 @@ impl ModelGpu {
     /// Upload mesh data. Textures wait until [`ModelRenderer::draw`], which
     /// needs a live texture manager anyway.
     pub fn upload(ctx: &Arc<GpuContext>, model: &Arc<Model>) -> Self {
+        let rest_globals = model.rest_globals();
         let mut meshes = Vec::with_capacity(model.meshes.len());
-        for (mesh_index, mesh) in model.meshes.iter().enumerate() {
+        for mesh in &model.meshes {
             let skinned = mesh.is_skinned();
             let label = format!("model mesh {}", mesh.name);
             // One interleaved buffer, cast once. The per-vertex
@@ -149,20 +150,31 @@ impl ModelGpu {
                 let vertices = static_vertices(mesh);
                 ctx.create_vertex_buffer(&label, bytemuck::cast_slice(&vertices))
             };
-            let index_bytes: Vec<u8> = mesh
-                .indices
-                .iter()
-                .flat_map(|index| index.to_le_bytes())
-                .collect();
-            let index_buffer =
-                ctx.create_index_buffer(&format!("model indices {}", mesh.name), &index_bytes);
+            #[cfg(target_endian = "little")]
+            let index_buffer = ctx.create_index_buffer(
+                &format!("model indices {}", mesh.name),
+                bytemuck::cast_slice(&mesh.indices),
+            );
+            #[cfg(not(target_endian = "little"))]
+            let index_buffer = {
+                let index_bytes: Vec<u8> = mesh
+                    .indices
+                    .iter()
+                    .flat_map(|index| index.to_le_bytes())
+                    .collect();
+                ctx.create_index_buffer(&format!("model indices {}", mesh.name), &index_bytes)
+            };
+            let node_transform = mesh
+                .node
+                .and_then(|node| rest_globals.get(node).copied())
+                .unwrap_or(glam::Mat4::IDENTITY);
             meshes.push(MeshGpu {
                 vertices: vertex_buffer,
                 indices: index_buffer,
                 index_count: mesh.indices.len() as u32,
                 material: mesh.material,
                 skinned,
-                node_transform: model.mesh_node_transform(mesh_index),
+                node_transform,
                 pbr_vertices: None,
             });
         }
@@ -287,12 +299,13 @@ pub struct ModelRenderer {
     pbr: Option<PbrState>,
 }
 
-/// Lazily-created PBR pipelines and the material descriptor layout.
+/// Lazily-created PBR pipelines, material descriptor layout, and shared 1x1 fallback maps.
 struct PbrState {
     pipeline: vk::Pipeline,
     pipeline_blended: vk::Pipeline,
     layout: vk::PipelineLayout,
     dsl_material: vk::DescriptorSetLayout,
+    fallbacks: PbrFallbacks,
 }
 
 /// A frame slot's descriptor pools: chunks of 64 draws, grown on demand.
@@ -746,16 +759,17 @@ impl ModelRenderer {
                 ));
             }
             if model.pbr_materials[material_index].is_none() {
+                let fallbacks = &self.pbr.as_ref().unwrap().fallbacks;
                 model.pbr_materials[material_index] = Some(Arc::new(PbrMaterialGpu::new(
                     &self.ctx,
                     dsl_material,
                     &model.model().materials[material_index],
+                    Some(fallbacks),
                 )));
             }
             let material_gpu = model.pbr_materials[material_index].clone().unwrap();
 
-            let set = self.alloc_draw_sets(ring_index);
-            let joint_set = set[0];
+            let joint_set = self.alloc_joint_set(ring_index);
             let buffer_info = vk::DescriptorBufferInfo::default()
                 .buffer(self.rings[ring_index].buffer.buffer)
                 .offset(0)
@@ -815,6 +829,33 @@ impl ModelRenderer {
                 device.cmd_draw_indexed(cmd, model.meshes[mesh_index].index_count, 1, 0, 0, 0);
             }
             self.draws += 1;
+        }
+    }
+
+    /// Allocate a single joint-ring set from `slot`'s pool chunks (for paths
+    /// like PBR whose material set is already persistent).
+    fn alloc_joint_set(&mut self, slot: usize) -> vk::DescriptorSet {
+        let layouts = [self.dsl_joints];
+        loop {
+            let pools = &mut self.pools[slot];
+            if pools.cursor == pools.chunks.len() {
+                let chunk = new_draw_pool(&self.ctx, &self.pool_sizes);
+                pools.chunks.push(chunk);
+            }
+            let result = unsafe {
+                self.ctx.device().allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(pools.chunks[pools.cursor])
+                        .set_layouts(&layouts),
+                )
+            };
+            match result {
+                Ok(sets) => return sets[0],
+                Err(err) if crate::gfx::vulkan::pool_exhaustion_is_growable(err) => {
+                    pools.cursor += 1;
+                }
+                Err(err) => panic!("model joint set allocation: {err}"),
+            }
         }
     }
 

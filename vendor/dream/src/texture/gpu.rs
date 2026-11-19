@@ -248,7 +248,14 @@ impl GpuTexture {
                 vk::ImageAspectFlags::COLOR,
             );
         });
-        Self::finish(ctx, image, sampler, (width, height), 1, (TextureFormat::Srgb, format))
+        Self::finish(
+            ctx,
+            image,
+            sampler,
+            (width, height),
+            1,
+            (TextureFormat::Srgb, format),
+        )
     }
 
     /// A single-mip BC7 sRGB texture ready to receive streaming uploads via [`TextureUploader`].
@@ -278,7 +285,14 @@ impl GpuTexture {
                 vk::ImageAspectFlags::COLOR,
             );
         });
-        Self::finish(ctx, image, sampler, (width, height), 1, (TextureFormat::Srgb, format))
+        Self::finish(
+            ctx,
+            image,
+            sampler,
+            (width, height),
+            1,
+            (TextureFormat::Srgb, format),
+        )
     }
 
     /// An all-zero texture, cleared on the GPU (no staging upload). Used for

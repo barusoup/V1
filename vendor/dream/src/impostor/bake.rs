@@ -17,7 +17,7 @@ use crate::gfx::GpuBuffer;
 #[cfg(test)]
 use crate::gfx::GpuImage;
 use crate::gfx::vulkan::GpuContext;
-use crate::model::render::{PbrMaterialGpu, PbrVertex};
+use crate::model::render::{PbrFallbacks, PbrMaterialGpu, PbrVertex};
 use crate::model::{Material, Model};
 #[cfg(test)]
 use crate::model::{TexelFilter, Wrap};
@@ -215,6 +215,7 @@ pub struct ImpostorBaker {
     material_dsl: vk::DescriptorSetLayout,
     base_dsl: vk::DescriptorSetLayout,
     post: PostPipes,
+    pbr_fallbacks: PbrFallbacks,
 }
 
 /// Destroys the capture and post-bake pipelines and their layouts. Without

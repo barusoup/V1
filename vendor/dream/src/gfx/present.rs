@@ -20,3 +20,13 @@ pub enum PresentMode {
     /// No vsync (`IMMEDIATE`), falling back to FIFO. May tear.
     Immediate,
 }
+
+/// Power/performance preference when selecting an adapter on multi-GPU systems.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GpuPreference {
+    /// Prefer a discrete GPU when available (best for 3D scenes).
+    #[default]
+    HighPerformance,
+    /// Prefer an integrated/low-power GPU when available (best for UI/desktop apps on laptops).
+    LowPower,
+}

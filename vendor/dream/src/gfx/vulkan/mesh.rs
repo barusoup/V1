@@ -2,111 +2,127 @@ use super::{GpuBuffer, GpuContext};
 use ash::vk;
 use std::sync::Arc;
 
-/// Device-local vertex + index storage for geometry the CPU rewrites
-/// every frame (ambient fields, particles, procedural grids).
+/// Host-visible vertex + index ring for geometry the CPU rewrites every frame
+/// (ambient fields, particles, procedural grids).
 ///
-/// One reused staging buffer feeds the device-local copy, so an update
-/// never allocates: buffers only ever grow. Bind the pair, then
-/// `draw_indexed`.
-pub struct DynamicBuffers {
-    ctx: Arc<GpuContext>,
+/// Uses CPU-to-GPU host-visible buffers tracked by GPU submission serials, so
+/// updating never stalls on `one_shot` or allocates temporary staging buffers.
+/// Only grows extra ring slots (up to `max_frames_in_flight + 1`) when an
+/// earlier slot is still in flight on the GPU.
+struct DynamicSlot {
     vertices: GpuBuffer,
     indices: GpuBuffer,
-    staging: GpuBuffer,
     vertex_capacity: u64,
     index_capacity: u64,
+    last_serial: u64,
+}
+
+pub struct DynamicBuffers {
+    ctx: Arc<GpuContext>,
+    label: String,
+    slots: Vec<DynamicSlot>,
+    active: usize,
 }
 
 impl DynamicBuffers {
     pub fn new(ctx: &Arc<GpuContext>, label: &str, vertex_bytes: u64, index_bytes: u64) -> Self {
-        let usage = vk::BufferUsageFlags::VERTEX_BUFFER
-            | vk::BufferUsageFlags::INDEX_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_DST;
+        let vertex_capacity = vertex_bytes.max(4);
+        let index_capacity = index_bytes.max(4);
+        let initial = DynamicSlot {
+            vertices: ctx.create_host_vertex_buffer(&format!("{label} vertices"), vertex_capacity),
+            indices: ctx.create_host_index_buffer(&format!("{label} indices"), index_capacity),
+            vertex_capacity,
+            index_capacity,
+            last_serial: 0,
+        };
         Self {
-            vertices: ctx.create_gpu_buffer(&format!("{label} vertices"), vertex_bytes, usage),
-            indices: ctx.create_gpu_buffer(&format!("{label} indices"), index_bytes, usage),
-            staging: ctx.create_transfer_buffer(
-                &format!("{label} staging"),
-                vertex_bytes.max(index_bytes).max(4),
-            ),
-            vertex_capacity: vertex_bytes,
-            index_capacity: index_bytes,
             ctx: Arc::clone(ctx),
+            label: label.to_owned(),
+            slots: vec![initial],
+            active: 0,
         }
     }
 
-    /// Upload this frame's geometry, growing the buffers when needed.
+    /// Upload this frame's geometry, reusing an idle slot or growing the ring when needed.
     pub fn update(&mut self, vertices: &[u8], indices: &[u8]) {
-        let vertex_bytes = vertices.len().max(4) as u64;
-        let index_bytes = indices.len().max(4) as u64;
-        if vertex_bytes > self.vertex_capacity {
-            self.vertex_capacity = vertex_bytes * 2;
-            self.vertices = self.ctx.create_gpu_buffer(
-                "dynamic vertices",
-                self.vertex_capacity,
-                vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        let vertex_bytes = (vertices.len() as u64).max(4);
+        let index_bytes = (indices.len() as u64).max(4);
+        let completed = self.ctx.completed_serial();
+        let next_serial = self.ctx.submitted_serial().saturating_add(1);
+        let max_slots = self.ctx.max_frames_in_flight() + 1;
+
+        let chosen = if self.slots[self.active].last_serial == 0
+            || self.slots[self.active].last_serial <= completed
+        {
+            self.active
+        } else if let Some(idx) = self
+            .slots
+            .iter()
+            .position(|slot| slot.last_serial <= completed)
+        {
+            idx
+        } else if self.slots.len() < max_slots {
+            let vcap = vertex_bytes.max(self.slots[0].vertex_capacity);
+            let icap = index_bytes.max(self.slots[0].index_capacity);
+            self.slots.push(DynamicSlot {
+                vertices: self
+                    .ctx
+                    .create_host_vertex_buffer(&format!("{} vertices", self.label), vcap),
+                indices: self
+                    .ctx
+                    .create_host_index_buffer(&format!("{} indices", self.label), icap),
+                vertex_capacity: vcap,
+                index_capacity: icap,
+                last_serial: 0,
+            });
+            self.slots.len() - 1
+        } else {
+            let idx = self
+                .slots
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, slot)| slot.last_serial)
+                .map_or(0, |(i, _)| i);
+            let submitted = self.ctx.submitted_serial();
+            if self.slots[idx].last_serial <= submitted && submitted > completed {
+                unsafe { self.ctx.device().device_wait_idle() }
+                    .expect("wait idle for dynamic buffer slot");
+                self.ctx.confirm_completed(submitted);
+                self.ctx.collect_retired_buffers();
+            }
+            idx
+        };
+
+        let slot = &mut self.slots[chosen];
+        if vertex_bytes > slot.vertex_capacity {
+            slot.vertex_capacity = vertex_bytes * 2;
+            slot.vertices = self.ctx.create_host_vertex_buffer(
+                &format!("{} vertices", self.label),
+                slot.vertex_capacity,
             );
         }
-        if index_bytes > self.index_capacity {
-            self.index_capacity = index_bytes * 2;
-            self.indices = self.ctx.create_gpu_buffer(
-                "dynamic indices",
-                self.index_capacity,
-                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            );
-        }
-        if vertex_bytes + index_bytes > self.staging.size {
-            self.staging = self
+        if index_bytes > slot.index_capacity {
+            slot.index_capacity = index_bytes * 2;
+            slot.indices = self
                 .ctx
-                .create_transfer_buffer("dynamic staging", vertex_bytes + index_bytes);
+                .create_host_index_buffer(&format!("{} indices", self.label), slot.index_capacity);
         }
         if !vertices.is_empty() {
-            self.staging.write(0, vertices);
+            slot.vertices.write(0, vertices);
         }
         if !indices.is_empty() {
-            self.staging.write(vertices.len().max(4) as u64, indices);
+            slot.indices.write(0, indices);
         }
-        let (vertex_buffer, index_buffer, staging) = (
-            self.vertices.buffer,
-            self.indices.buffer,
-            self.staging.buffer,
-        );
-        let index_offset = vertices.len().max(4) as u64;
-        let device = self.ctx.device().clone();
-        self.ctx.one_shot(|cmd| unsafe {
-            if !vertices.is_empty() {
-                let region = vk::BufferCopy::default().size(vertices.len() as u64);
-                device.cmd_copy_buffer(cmd, staging, vertex_buffer, &[region]);
-            }
-            if !indices.is_empty() {
-                let region = vk::BufferCopy::default()
-                    .src_offset(index_offset)
-                    .size(indices.len() as u64);
-                device.cmd_copy_buffer(cmd, staging, index_buffer, &[region]);
-            }
-            let barrier = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(
-                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
-                );
-            device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[barrier],
-                &[],
-                &[],
-            );
-        });
+        slot.last_serial = next_serial;
+        self.active = chosen;
     }
 
     pub fn vertices(&self) -> &GpuBuffer {
-        &self.vertices
+        &self.slots[self.active].vertices
     }
 
     pub fn indices(&self) -> &GpuBuffer {
-        &self.indices
+        &self.slots[self.active].indices
     }
 
     pub fn context(&self) -> &Arc<GpuContext> {

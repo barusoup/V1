@@ -207,7 +207,12 @@ impl UiRenderer {
         } else {
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL
         };
-        let blur = &self.blur;
+        let (blur_horizontal, blur_vertical, blur_layout) = {
+            let blur = self.blur.get_or_insert_with(|| {
+                BlurPipelines::new(&self.ctx, self.dsl, self.backdrop_format)
+            });
+            (blur.horizontal, blur.vertical, blur.layout)
+        };
         unsafe {
             if !general {
                 vulkan::image_barrier(
@@ -291,14 +296,14 @@ impl UiRenderer {
             // Four horizontal and four vertical passes, ping-ponging scratch and out. Each small pass
             // adds only a little blur, so the result is smooth; the radius comes from the rounds.
             let steps = [
-                (&source, &scratch, blur.horizontal),
-                (&scratch, &out, blur.vertical),
-                (&out, &scratch, blur.horizontal),
-                (&scratch, &out, blur.vertical),
-                (&out, &scratch, blur.horizontal),
-                (&scratch, &out, blur.vertical),
-                (&out, &scratch, blur.horizontal),
-                (&scratch, &out, blur.vertical),
+                (&source, &scratch, blur_horizontal),
+                (&scratch, &out, blur_vertical),
+                (&out, &scratch, blur_horizontal),
+                (&scratch, &out, blur_vertical),
+                (&out, &scratch, blur_horizontal),
+                (&scratch, &out, blur_vertical),
+                (&out, &scratch, blur_horizontal),
+                (&scratch, &out, blur_vertical),
             ];
             for (from, to, pipeline) in steps {
                 let attachment = vk::RenderingAttachmentInfo::default()
@@ -330,7 +335,7 @@ impl UiRenderer {
                 device.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
-                    blur.layout,
+                    blur_layout,
                     0,
                     &[from.sampled_descriptor_set()],
                     &[],
@@ -340,15 +345,6 @@ impl UiRenderer {
                 full_barrier(&device, cmd);
             }
         }
-    }
-
-    /// The descriptor set glass samples for `slot`. `ensure_backdrop` must have run.
-    pub(super) fn backdrop_set(&self, slot: usize) -> vk::DescriptorSet {
-        self.backdrop[slot]
-            .as_ref()
-            .expect("ensure_backdrop ran before a backdrop draw")
-            .out
-            .sampled_descriptor_set()
     }
 
     /// The blurred result `slot`'s glass samples, for retention.
