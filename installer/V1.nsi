@@ -41,12 +41,19 @@ Section "Install"
   File "${ROOT}\NOTICE"
   File "${ROOT}\THIRD-PARTY-LICENSES.md"
 
-  ; FFmpeg and ffprobe, staged by the release workflow. The app finds them in this folder.
-  SetOutPath "$INSTDIR\ffmpeg"
-  File "${ROOT}\build\ffmpeg\ffmpeg.exe"
-  File "${ROOT}\build\ffmpeg\ffprobe.exe"
-  File "/oname=LICENSE-FFmpeg.txt" "${ROOT}\build\ffmpeg\LICENSE.txt"
-  SetOutPath "$INSTDIR"
+  ; FFmpeg and ffprobe, staged by the release workflow. The app finds them in this folder. An
+  ; update over an existing install keeps the copies already there, so the click-to-restart path
+  ; does not rewrite a few hundred megabytes of media tools.
+  IfFileExists "$INSTDIR\ffmpeg\ffmpeg.exe" 0 ffmpeg_missing
+  IfFileExists "$INSTDIR\ffmpeg\ffprobe.exe" 0 ffmpeg_missing
+  Goto ffmpeg_ready
+  ffmpeg_missing:
+    SetOutPath "$INSTDIR\ffmpeg"
+    File "${ROOT}\build\ffmpeg\ffmpeg.exe"
+    File "${ROOT}\build\ffmpeg\ffprobe.exe"
+    File "/oname=LICENSE-FFmpeg.txt" "${ROOT}\build\ffmpeg\LICENSE.txt"
+  ffmpeg_ready:
+    SetOutPath "$INSTDIR"
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
 

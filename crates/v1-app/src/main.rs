@@ -155,9 +155,7 @@ struct Host {
     hidden_applied: bool,
     /// Wakes the event loop when a background callback has work for the UI (SMTC buttons, updates).
     proxy: EventLoopProxy<UserEvent>,
-    /// Asks the update worker to check now.
-    update_tx: Option<std::sync::mpsc::Sender<bool>>,
-    /// The release the worker last found, ready for the popup's Update button.
+    /// The release whose setup the worker has already downloaded and verified.
     pending_update: Option<update::Available>,
     /// The Windows media-controls session, once the window exists.
     media: Option<media::MediaControls>,
@@ -573,16 +571,10 @@ impl ApplicationHandler<UserEvent> for Host {
             }
             UserEvent::Update(event) => {
                 match event {
-                    update::UpdateEvent::Available(update) => {
-                        let version = update.version.to_string();
+                    update::UpdateEvent::Ready(update) => {
                         self.pending_update = Some(update);
-                        self.state.update_available(version);
+                        self.state.update_ready();
                     }
-                    update::UpdateEvent::UpToDate => {
-                        self.pending_update = None;
-                        self.state.update_up_to_date();
-                    }
-                    update::UpdateEvent::Failed(error) => self.state.update_failed(error),
                 }
                 self.redraw_request();
             }
@@ -786,41 +778,18 @@ impl Host {
         self.update_media();
     }
 
-    /// Carry out the update actions the UI asked for in the frame just presented. Checks are a
-    /// message to the worker; installs download and hand off on their own thread, so neither can
-    /// hold a frame.
+    /// Hand the prefetched setup to the installer when the sidebar entry is pressed. The download
+    /// is already done, so this is only the marker, the detached script and exit.
     fn handle_update_requests(&mut self) {
-        if self.state.take_update_check_request() {
-            match self.update_tx.as_ref() {
-                Some(tx) => {
-                    if tx.send(true).is_err() {
-                        self.state
-                            .update_failed("The update checker is not running.".to_owned());
-                    }
-                }
-                None => self
-                    .state
-                    .update_failed("Updates are unavailable in this build.".to_owned()),
-            }
-        }
         if self.state.take_update_install_request() {
             let Some(pending) = self.pending_update.clone() else {
-                self.state
-                    .update_failed("The update is no longer available.".to_owned());
+                self.state.update_ready();
                 return;
             };
-            let proxy = self.proxy.clone();
-            let spawned = std::thread::Builder::new()
-                .name("v1-update-install".to_owned())
-                .spawn(move || {
-                    if let Err(error) = update::install(&pending) {
-                        let _ =
-                            proxy.send_event(UserEvent::Update(update::UpdateEvent::Failed(error)));
-                    }
-                });
-            if spawned.is_err() {
-                self.state
-                    .update_failed("The updater could not start.".to_owned());
+            if let Err(error) = update::install(&pending) {
+                eprintln!("V1 update install: {error}");
+                // Put the entry back so the click can be retried if the handoff failed.
+                self.state.update_ready();
             }
         }
     }
@@ -1437,14 +1406,12 @@ fn main() {
     let proxy = event_loop.create_proxy();
     // The updater reports into the same event loop as the media controls. `--shot` stays out of it:
     // a screenshot run must not touch the network or replace the app underneath itself.
-    let update_tx = if shot_mode {
-        None
-    } else {
+    if !shot_mode {
         let proxy = proxy.clone();
         update::start_worker(move |event| {
             let _ = proxy.send_event(UserEvent::Update(event));
-        })
-    };
+        });
+    }
     let host = Host {
         window: None,
         renderer: None,
@@ -1472,7 +1439,6 @@ fn main() {
         memory: dream::memory::IdleTrim::new(),
         hidden_applied: false,
         proxy,
-        update_tx,
         pending_update: None,
         media: None,
         drag: None,
