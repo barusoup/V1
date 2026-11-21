@@ -16,8 +16,7 @@ use std::time::{Duration, Instant};
 /// Ask the OS to take back every resident page the process is not using right now.
 ///
 /// Returns whether the platform call ran. On targets without a supported
-/// call (anything other than Windows, glibc Linux and macOS) this returns
-/// `false` and does nothing.
+/// call (anything other than Windows) this returns `false` and does nothing.
 pub fn trim_working_set() -> bool {
     trim_os()
 }
@@ -32,198 +31,7 @@ fn trim_os() -> bool {
     unsafe { K32EmptyWorkingSet(GetCurrentProcess()) != 0 }
 }
 
-#[cfg(target_os = "linux")]
-fn linux_page_size() -> u64 {
-    static PAGE_SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *PAGE_SIZE.get_or_init(|| {
-        const SC_PAGESIZE: i32 = 30;
-        unsafe extern "C" {
-            fn sysconf(name: i32) -> isize;
-        }
-        let size = unsafe { sysconf(SC_PAGESIZE) };
-        if size > 0 { size as u64 } else { 4096 }
-    })
-}
-
-/// Parse a `/proc/self/smaps` VMA header into `Some((start, end))` when it is
-/// a strictly read-only private regular file mapping eligible for clean
-/// page-cache eviction (`r--p` or `r-xp`, absolute path, excluding `/dev/` and
-/// unlinked `(deleted)` mappings).
-#[cfg(target_os = "linux")]
-fn parse_clean_ro_smaps_header(line: &str) -> Option<(usize, usize)> {
-    let mut rest = line;
-    let mut next_tok = || {
-        rest = rest.trim_start_matches([' ', '\t']);
-        if rest.is_empty() {
-            return None;
-        }
-        match rest.find([' ', '\t']) {
-            Some(pos) => {
-                let tok = &rest[..pos];
-                rest = &rest[pos..];
-                Some(tok)
-            }
-            None => {
-                let tok = rest;
-                rest = "";
-                Some(tok)
-            }
-        }
-    };
-    let range = next_tok()?;
-    let perms = next_tok()?;
-    if perms != "r--p" && perms != "r-xp" {
-        return None;
-    }
-    let _offset = next_tok()?;
-    let _dev = next_tok()?;
-    let _inode = next_tok()?;
-    let pathname = rest.trim();
-    if !pathname.starts_with('/') || pathname.starts_with("/dev/") || pathname.contains("(deleted)")
-    {
-        return None;
-    }
-    let (start_hex, end_hex) = range.split_once('-')?;
-    let start = usize::from_str_radix(start_hex, 16).ok()?;
-    let end = usize::from_str_radix(end_hex, 16).ok()?;
-    (end > start).then_some((start, end))
-}
-
-#[cfg(target_os = "linux")]
-fn parse_smaps_kb(value: &str) -> Option<u64> {
-    value.split_whitespace().next()?.parse::<u64>().ok()
-}
-
-/// Evict resident PTEs from clean read-only file-backed mappings (such as cold
-/// driver `.so` code/rodata pages and unused embedded asset pages). Relies
-/// strictly on `Private_Dirty == 0 && Shared_Dirty == 0 && Anonymous == 0 &&
-/// Locked == 0`, keeping RELRO/GOT/anonymous data untouched and incurring zero
-/// swap writes — pages reload on demand via soft faults from kernel page cache.
-#[cfg(target_os = "linux")]
-fn evict_clean_ro_file_mappings() {
-    let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps") else {
-        return;
-    };
-    let page_size = linux_page_size() as usize;
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    let mut current: Option<(usize, usize)> = None;
-    let mut clean = false;
-    let mut saw_private_dirty = false;
-    let mut saw_shared_dirty = false;
-    let mut saw_anonymous = false;
-
-    let flush = |ranges: &mut Vec<(usize, usize)>,
-                 cur: Option<(usize, usize)>,
-                 is_clean: bool,
-                 p_dirty: bool,
-                 s_dirty: bool,
-                 anon: bool| {
-        if let Some((start, end)) = cur
-            && is_clean
-            && p_dirty
-            && s_dirty
-            && anon
-            && end > start
-            && start.is_multiple_of(page_size)
-            && end.is_multiple_of(page_size)
-        {
-            ranges.push((start, end));
-        }
-    };
-
-    for line in smaps.lines() {
-        let first_word = line.split_whitespace().next().unwrap_or("");
-        if let Some(key) = first_word.strip_suffix(':') {
-            if current.is_some() && clean {
-                let val_str = line.split_once(':').map_or("", |(_, v)| v);
-                match key {
-                    "Private_Dirty" => {
-                        saw_private_dirty = true;
-                        if parse_smaps_kb(val_str).unwrap_or(1) != 0 {
-                            clean = false;
-                        }
-                    }
-                    "Shared_Dirty" => {
-                        saw_shared_dirty = true;
-                        if parse_smaps_kb(val_str).unwrap_or(1) != 0 {
-                            clean = false;
-                        }
-                    }
-                    "Anonymous" => {
-                        saw_anonymous = true;
-                        if parse_smaps_kb(val_str).unwrap_or(1) != 0 {
-                            clean = false;
-                        }
-                    }
-                    "Locked" if parse_smaps_kb(val_str).unwrap_or(1) != 0 => {
-                        clean = false;
-                    }
-                    _ => {}
-                }
-            }
-            continue;
-        }
-        flush(
-            &mut ranges,
-            current,
-            clean,
-            saw_private_dirty,
-            saw_shared_dirty,
-            saw_anonymous,
-        );
-        current = parse_clean_ro_smaps_header(line);
-        clean = current.is_some();
-        saw_private_dirty = false;
-        saw_shared_dirty = false;
-        saw_anonymous = false;
-    }
-    flush(
-        &mut ranges,
-        current,
-        clean,
-        saw_private_dirty,
-        saw_shared_dirty,
-        saw_anonymous,
-    );
-
-    const MADV_DONTNEED: i32 = 4;
-    unsafe extern "C" {
-        fn madvise(addr: *mut core::ffi::c_void, length: usize, advice: i32) -> i32;
-    }
-    for (start, end) in ranges {
-        unsafe {
-            madvise(start as *mut core::ffi::c_void, end - start, MADV_DONTNEED);
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn trim_os() -> bool {
-    #[cfg(target_env = "gnu")]
-    {
-        unsafe extern "C" {
-            fn malloc_trim(pad: usize) -> i32;
-        }
-        unsafe {
-            malloc_trim(0);
-        }
-    }
-    evict_clean_ro_file_mappings();
-    true
-}
-
-#[cfg(target_os = "macos")]
-fn trim_os() -> bool {
-    unsafe extern "C" {
-        fn malloc_zone_pressure_relief(zone: *mut core::ffi::c_void, goal: usize) -> usize;
-    }
-    unsafe {
-        malloc_zone_pressure_relief(core::ptr::null_mut(), 0);
-    }
-    true
-}
-
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+#[cfg(not(windows))]
 fn trim_os() -> bool {
     false
 }
@@ -374,55 +182,7 @@ pub fn resident_bytes() -> u64 {
         }
         0
     }
-    #[cfg(target_os = "macos")]
-    {
-        // `proc_pid_rusage` is one libproc call: no subprocess, no `ps` fork,
-        // and it reports the same resident size as `ps`'s RSS column. (Forking
-        // `ps` from inside a frame is both slow and unavailable to sandboxed
-        // apps, which is why that path could return 0.)
-        #[repr(C)]
-        struct RusageInfoV0 {
-            uuid: [u8; 16],
-            user_time: u64,
-            system_time: u64,
-            pkg_idle_wkups: u64,
-            interrupt_wkups: u64,
-            pageins: u64,
-            wired_size: u64,
-            resident_size: u64,
-            phys_footprint: u64,
-            proc_start_abstime: u64,
-            proc_exit_abstime: u64,
-        }
-        unsafe extern "C" {
-            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut core::ffi::c_void) -> i32;
-        }
-        const RUSAGE_INFO_V0: i32 = 0;
-        let mut info = unsafe { core::mem::zeroed::<RusageInfoV0>() };
-        let rc = unsafe {
-            proc_pid_rusage(
-                std::process::id() as i32,
-                RUSAGE_INFO_V0,
-                &mut info as *mut RusageInfoV0 as *mut core::ffi::c_void,
-            )
-        };
-        if rc == 0 { info.resident_size } else { 0 }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // statm field 2 is RESIDENT pages; field 1 is total virtual size.
-        let page_size = linux_page_size();
-        std::fs::read_to_string("/proc/self/statm")
-            .ok()
-            .and_then(|text| {
-                text.split_whitespace()
-                    .nth(1)
-                    .and_then(|pages| pages.parse::<u64>().ok())
-            })
-            .map(|pages| pages * page_size)
-            .unwrap_or(0)
-    }
-    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    #[cfg(not(windows))]
     {
         0
     }
@@ -506,7 +266,7 @@ mod tests {
 
     #[test]
     fn memory_resident_bytes_reports_something_on_supported_platforms() {
-        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+        #[cfg(windows)]
         assert!(resident_bytes() > 0);
     }
 }

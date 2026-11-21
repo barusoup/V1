@@ -20,9 +20,6 @@ pub(crate) mod lazy_raster;
 mod metrics;
 pub(crate) mod roles;
 
-#[cfg(target_os = "macos")]
-pub(crate) mod native;
-
 /// Handle to a font inside a [`Fonts`] registry. The raw index is exposed so
 /// games can serialize it; validity is checked by the registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -530,21 +530,11 @@ impl Drop for GpuContext {
 }
 
 fn pipeline_cache_file(props: &vk::PhysicalDeviceProperties) -> Option<std::path::PathBuf> {
-    #[cfg(target_os = "linux")]
-    let dir = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|v| !v.is_empty())
-                .map(|home| std::path::PathBuf::from(home).join(".cache"))
-        })?
-        .join("dream");
     #[cfg(windows)]
     let dir = std::env::var_os("LOCALAPPDATA")
         .filter(|v| !v.is_empty())
         .map(|d| std::path::PathBuf::from(d).join("dream"))?;
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(windows))]
     let dir: std::path::PathBuf = return None;
 
     let mut uuid_hex = String::with_capacity(props.pipeline_cache_uuid.len() * 2);
@@ -589,9 +579,7 @@ fn persist_pipeline_cache(path: &std::path::Path, data: &[u8]) {
 }
 
 /// Load the Vulkan loader: an explicit `DREAM_VULKAN_LIBRARY` override
-/// first, then the system library, then the well-known macOS install
-/// paths (MoltenVK ships `libvulkan.dylib`, which the default search
-/// rules do not always find). Returns the entry plus a note naming where
+/// first, then the system library. Returns the entry plus a note naming where
 /// it came from for diagnostics.
 fn load_vulkan_entry() -> (Entry, String) {
     let mut tried = Vec::new();
@@ -604,24 +592,9 @@ fn load_vulkan_entry() -> (Entry, String) {
             return (entry, override_path);
         }
     }
-    // The system loader first, then the well-known macOS install paths
-    // (MoltenVK ships `libvulkan.dylib`, which the default search rules do
-    // not always find).
     tried.push("system loader".to_string());
     if let Ok(entry) = unsafe { Entry::load() } {
         return (entry, "system loader".to_string());
-    }
-    #[cfg(target_os = "macos")]
-    {
-        for path in [
-            "/opt/homebrew/lib/libvulkan.dylib",
-            "/usr/local/lib/libvulkan.dylib",
-        ] {
-            tried.push(path.to_string());
-            if let Ok(entry) = unsafe { Entry::load_from(std::path::Path::new(path)) } {
-                return (entry, path.to_string());
-            }
-        }
     }
     panic!("no Vulkan loader found (tried: {})", tried.join(", "));
 }

@@ -18,7 +18,6 @@ pub enum Acquire {
     Unavailable,
 }
 
-#[cfg(windows)]
 mod imp {
     use super::*;
     use std::ffi::c_void;
@@ -77,68 +76,6 @@ mod imp {
     }
 }
 
-#[cfg(unix)]
-mod imp {
-    use super::*;
-    use std::fs::{File, OpenOptions};
-    use std::os::fd::AsRawFd;
-
-    const LOCK_EX: i32 = 2;
-    const LOCK_NB: i32 = 4;
-
-    extern "C" {
-        fn flock(fd: i32, operation: i32) -> i32;
-    }
-
-    /// Keeps the advisory `flock` alive for as long as this process runs.
-    pub struct Guard(#[allow(dead_code)] File);
-
-    pub fn acquire() -> Acquire {
-        acquire_named("v1-app-single-instance")
-    }
-
-    fn acquire_named(name: &str) -> Acquire {
-        let path = std::env::temp_dir().join(format!("{name}.lock"));
-        let Ok(file) = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-        else {
-            return Acquire::Unavailable;
-        };
-        // SAFETY: `file.as_raw_fd()` is a valid open descriptor owned by `file`.
-        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
-        if rc == 0 {
-            Acquire::First(Guard(file))
-        } else {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                Acquire::AlreadyRunning
-            } else {
-                Acquire::Unavailable
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub fn test_acquire(name: &str) -> Acquire {
-        acquire_named(name)
-    }
-}
-
-#[cfg(not(any(windows, unix)))]
-mod imp {
-    use super::*;
-
-    pub struct Guard;
-
-    pub fn acquire() -> Acquire {
-        Acquire::First(Guard)
-    }
-}
-
 pub use imp::Guard;
 
 /// Ask to be the one running copy of V1.
@@ -146,7 +83,7 @@ pub fn acquire() -> Acquire {
     imp::acquire()
 }
 
-#[cfg(all(test, any(windows, unix)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

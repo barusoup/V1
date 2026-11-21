@@ -15,7 +15,7 @@ use dream::gfx::GpuContext;
 use dream::texture::{GpuTexture, SamplerDesc, TextureFormat, TextureOptions, TextureUploader};
 use dream::ui::Color;
 
-use crate::background::{BackgroundImage, BackgroundPixels, encode_bc7_rgba};
+use crate::background::{encode_bc7_rgba, BackgroundImage, BackgroundPixels};
 use crate::icons::{self, Icon};
 use crate::theme;
 
@@ -155,10 +155,9 @@ impl Gpu {
                 let same_size = animated
                     && self.background_animated
                     && self.background_bc7 == use_bc7
-                    && self
-                        .background
-                        .as_ref()
-                        .is_some_and(|texture| texture.size() == (background.width, background.height));
+                    && self.background.as_ref().is_some_and(|texture| {
+                        texture.size() == (background.width, background.height)
+                    });
                 if same_size {
                     let uploader = self
                         .background_uploader

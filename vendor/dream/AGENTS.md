@@ -1,6 +1,6 @@
 # Dream (Dream Engine)
 
-Rust 2024 Vulkan engine (Vulkan 1.3, ash). Custom renderer: scene pass -> FSR 3.1 temporal upscale -> blit. BedFrame (`dream::bedframe`, re-exported as `dream::ui`) is the UI and HUD framework. WGSL shaders are validated at build time by `build.rs` via naga; do not move `.wgsl` files without updating `include_str!` paths.
+Rust 2024 Vulkan engine (Vulkan 1.3, ash) targeting Windows (macOS + Metal support is on the `macos-metal` branch; Linux is not supported). Custom renderer: scene pass -> FSR 3.1 temporal upscale -> blit. BedFrame (`dream::bedframe`, re-exported as `dream::ui`) is the UI and HUD framework. WGSL shaders are validated at build time by `build.rs` via naga; do not move `.wgsl` files without updating `include_str!` paths.
 
 ## Verify
 

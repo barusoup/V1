@@ -45,11 +45,10 @@ use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WinitKey, NamedKey};
-#[cfg(windows)]
 use winit::platform::windows::{
     Color as WindowColor, CornerPreference, WindowAttributesExtWindows, WindowExtWindows,
 };
-use winit::window::{CursorIcon, Fullscreen, Window};
+use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window};
 
 /// `V1_BOOT=1` prints when each step of starting up finished, in milliseconds since `main` began.
 /// Off by default, and free then: the switch is read once.
@@ -93,28 +92,10 @@ fn fps_tick() {
 }
 
 fn data_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        let base = std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("Library/Application Support"))
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join("v1")
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let base = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join("v1")
-    }
-    #[cfg(windows)]
-    {
-        let base = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join("v1")
-    }
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("v1")
 }
 
 /// Events outside winit's own, delivered to the UI thread from background callbacks. The media
@@ -177,6 +158,13 @@ struct Host {
     media: Option<media::MediaControls>,
     /// A window drag in progress, if the host is moving the window (see [`Host::start_drag`]).
     drag: Option<WindowDrag>,
+    /// The edge under the pointer, when the window is not fullscreen.
+    resize: Option<ResizeDirection>,
+    /// A native resize is in progress; its release belongs to the OS, not to the UI.
+    resizing: bool,
+    /// The cursor last asked of the window, so it only changes when the pointer enters another
+    /// region.
+    cursor: CursorIcon,
     /// `--shot <path>`: render one frame, save it, exit. With `--delay`, run first.
     shot: Option<PathBuf>,
     shot_delay: std::time::Duration,
@@ -201,6 +189,32 @@ fn zoom_for(logical_w: f32, logical_h: f32) -> f32 {
     ((fit.clamp(0.85, 1.0) * 50.0).round()) / 50.0
 }
 
+/// How close to an edge, in UI units, starts a native resize. The window has no OS title bar or
+/// border, so this is the only place the resize zones exist.
+const RESIZE_BORDER: f32 = 6.0;
+
+/// Which window edge, if any, the pointer is over. Corners win over single edges.
+fn resize_direction(pos: (f32, f32), size: (f32, f32)) -> Option<ResizeDirection> {
+    if size.0 <= 0.0 || size.1 <= 0.0 {
+        return None;
+    }
+    let west = pos.0 <= RESIZE_BORDER;
+    let east = pos.0 >= size.0 - RESIZE_BORDER;
+    let north = pos.1 <= RESIZE_BORDER;
+    let south = pos.1 >= size.1 - RESIZE_BORDER;
+    match (west, east, north, south) {
+        (true, _, true, _) => Some(ResizeDirection::NorthWest),
+        (_, true, true, _) => Some(ResizeDirection::NorthEast),
+        (true, _, _, true) => Some(ResizeDirection::SouthWest),
+        (_, true, _, true) => Some(ResizeDirection::SouthEast),
+        (true, _, _, _) => Some(ResizeDirection::West),
+        (_, true, _, _) => Some(ResizeDirection::East),
+        (_, _, true, _) => Some(ResizeDirection::North),
+        (_, _, _, true) => Some(ResizeDirection::South),
+        _ => None,
+    }
+}
+
 #[test]
 fn larger_windows_keep_normal_ui_size() {
     for (w, h) in [
@@ -212,6 +226,44 @@ fn larger_windows_keep_normal_ui_size() {
         assert_eq!(zoom_for(w, h), 1.0);
     }
     assert!(zoom_for(960.0, 600.0) < 1.0);
+}
+
+#[test]
+fn borderless_edges_map_to_native_resize_directions() {
+    let size = (1280.0, 800.0);
+    assert_eq!(
+        resize_direction((0.0, 0.0), size),
+        Some(ResizeDirection::NorthWest)
+    );
+    assert_eq!(
+        resize_direction((1280.0, 0.0), size),
+        Some(ResizeDirection::NorthEast)
+    );
+    assert_eq!(
+        resize_direction((0.0, 800.0), size),
+        Some(ResizeDirection::SouthWest)
+    );
+    assert_eq!(
+        resize_direction((1280.0, 800.0), size),
+        Some(ResizeDirection::SouthEast)
+    );
+    assert_eq!(
+        resize_direction((640.0, 0.0), size),
+        Some(ResizeDirection::North)
+    );
+    assert_eq!(
+        resize_direction((640.0, 800.0), size),
+        Some(ResizeDirection::South)
+    );
+    assert_eq!(
+        resize_direction((0.0, 400.0), size),
+        Some(ResizeDirection::West)
+    );
+    assert_eq!(
+        resize_direction((1280.0, 400.0), size),
+        Some(ResizeDirection::East)
+    );
+    assert_eq!(resize_direction((640.0, 400.0), size), None);
 }
 
 /// Build a frame, making any textures it asked for first. A frame that finds its icons missing
@@ -297,21 +349,10 @@ impl ApplicationHandler<UserEvent> for Host {
             .with_visible(false)
             .with_min_inner_size(winit::dpi::LogicalSize::new(720.0, 480.0))
             .with_inner_size(winit::dpi::LogicalSize::new(start_w, start_h));
-        #[cfg(windows)]
         let attrs = attrs
             .with_taskbar_icon(taskbar_icon())
             // Windows 11 rounds the corners of the window itself; no shader work needed.
             .with_corner_preference(CornerPreference::Round);
-        // The desktop pairs a window with its launcher, icon and media controls by the
-        // application id (Wayland) or WM_CLASS (X11). winit cannot know what to call the app, so
-        // name it explicitly; this matches `v1.desktop` and `org.mpris.MediaPlayer2.v1`.
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let attrs = {
-            use winit::platform::wayland::WindowAttributesExtWayland;
-            use winit::platform::x11::WindowAttributesExtX11;
-            let attrs = WindowAttributesExtWayland::with_name(attrs, "v1", "v1");
-            WindowAttributesExtX11::with_name(attrs, "v1", "v1")
-        };
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         boot_mark("window created (hidden)");
         self.scale = window.scale_factor() as f32;
@@ -397,6 +438,7 @@ impl ApplicationHandler<UserEvent> for Host {
                     renderer.resize(size);
                 }
                 self.update_zoom();
+                self.update_resize_zone();
                 self.redraw_request();
             }
             WindowEvent::Occluded(occluded) => {
@@ -417,15 +459,18 @@ impl ApplicationHandler<UserEvent> for Host {
                     }
                 }
                 self.update_zoom();
+                self.update_resize_zone();
                 self.redraw_request();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let scale = self.ui_scale();
                 self.mouse = (position.x as f32 / scale, position.y as f32 / scale);
+                self.update_resize_zone();
                 self.redraw_request();
             }
             WindowEvent::CursorLeft { .. } => {
                 self.mouse = (-1.0, -1.0);
+                self.resize = None;
                 self.redraw_request();
             }
             WindowEvent::MouseInput {
@@ -435,13 +480,27 @@ impl ApplicationHandler<UserEvent> for Host {
             } => {
                 match state {
                     ElementState::Pressed => {
-                        self.down = true;
-                        self.pressed = true;
+                        self.resizing = false;
+                        if let Some(direction) = self.resize.take() {
+                            // Hand the press to Windows so it resizes the borderless window from
+                            // the edge, with the native modal resize loop.
+                            if let Some(window) = &self.window {
+                                let _ = window.drag_resize_window(direction);
+                            }
+                            self.down = false;
+                            self.pressed = false;
+                            self.resizing = true;
+                        } else {
+                            self.down = true;
+                            self.pressed = true;
+                        }
                     }
                     ElementState::Released => {
                         self.down = false;
-                        // The release that ends a window drag is the drag's, not a click's.
-                        if self.drag.take().is_none() {
+                        // The release that ends a window drag or resize is the OS's, not a click's.
+                        if self.resizing {
+                            self.resizing = false;
+                        } else if self.drag.take().is_none() {
                             self.released = true;
                         }
                     }
@@ -465,13 +524,8 @@ impl ApplicationHandler<UserEvent> for Host {
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 let state = modifiers.state();
-                let command = if cfg!(target_os = "macos") {
-                    state.super_key()
-                } else {
-                    state.control_key()
-                };
                 self.keys
-                    .modifiers(state.shift_key(), command, state.alt_key());
+                    .modifiers(state.shift_key(), state.control_key(), state.alt_key());
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
@@ -732,6 +786,28 @@ impl Host {
         }
     }
 
+    /// Recompute which resize border the pointer is on. Fullscreen windows have no edges to drag.
+    fn update_resize_zone(&mut self) {
+        self.resize = if self
+            .window
+            .as_ref()
+            .is_none_or(|window| window.fullscreen().is_some())
+        {
+            None
+        } else {
+            let scale = self.ui_scale();
+            let size = self
+                .window
+                .as_ref()
+                .map(|window| {
+                    let size = window.inner_size();
+                    (size.width as f32 / scale, size.height as f32 / scale)
+                })
+                .unwrap_or((0.0, 0.0));
+            resize_direction(self.mouse, size)
+        };
+    }
+
     /// Take the collection the loading thread read, and hand it to the state. The state starts with
     /// an empty one so that nothing waited for the disk before the window could open.
     fn attach_library(&mut self) {
@@ -745,9 +821,8 @@ impl Host {
     }
 
     /// Whether the OS sends transport buttons to the media session rather than as key events.
-    /// SMTC is the one that is exclusive; elsewhere the window keeps its key fallback.
     fn os_owns_media_keys(&self) -> bool {
-        cfg!(windows) && self.media.is_some()
+        self.media.is_some()
     }
 
     fn editing(&self) -> bool {
@@ -808,11 +883,9 @@ impl Host {
                 self.state.toggle_theater();
                 true
             }
-            // Keyboard media keys delivered as ordinary key events. On Windows most earbuds go
-            // through SMTC instead, and an active SMTC session may see the key both ways; guarding
-            // on it avoids toggling the song twice for one press. Other desktops either bind the
-            // keys themselves (a Wayland compositor usually consumes them) or deliver them here,
-            // so the listener keeps a working fallback.
+            // Keyboard media keys delivered as ordinary key events. Most earbuds go through SMTC
+            // instead, and an active SMTC session may see the key both ways; guarding on it avoids
+            // toggling the song twice for one press.
             WinitKey::Named(NamedKey::MediaPlayPause) if !self.os_owns_media_keys() => {
                 self.apply_media_command(media::Command::Toggle);
                 true
@@ -960,6 +1033,8 @@ impl Host {
     /// overwrite that placement.
     fn set_fullscreen(&mut self, window: &Window, fullscreen: Option<Fullscreen>) {
         self.drag = None;
+        self.resize = None;
+        self.resizing = false;
         #[cfg(windows)]
         let entering = fullscreen.is_some();
         window.set_fullscreen(fullscreen);
@@ -987,6 +1062,7 @@ impl Host {
     /// OS, whose modal loop takes over the thread: winit's loop stops running, so no frame is drawn
     /// until the button comes up, and every animation freezes for the length of the drag.
     fn start_drag(&mut self, window: &Window) {
+        self.resize = None;
         // A press in the title strip while fullscreen is a request to move the window. Leave
         // fullscreen first, through the same path as the toggle, so winit restores the former
         // window placement (size, position and maximized state). Then carry on below, dragging
@@ -1107,14 +1183,18 @@ impl Host {
         self.released = false;
         self.secondary_pressed = false;
 
-        if self.state.hand != self.hand_cursor {
-            self.hand_cursor = self.state.hand;
+        self.hand_cursor = self.state.hand;
+        let cursor = if let Some(direction) = self.resize {
+            CursorIcon::from(direction)
+        } else if self.hand_cursor {
+            CursorIcon::Pointer
+        } else {
+            CursorIcon::Default
+        };
+        if cursor != self.cursor {
+            self.cursor = cursor;
             if let Some(window) = &self.window {
-                window.set_cursor(if self.hand_cursor {
-                    CursorIcon::Pointer
-                } else {
-                    CursorIcon::Default
-                });
+                window.set_cursor(cursor);
             }
         }
 
@@ -1235,16 +1315,6 @@ fn any_mouse_button_down() -> bool {
     held < 0
 }
 
-#[cfg(not(windows))]
-fn cursor_screen_pos() -> Option<(i32, i32)> {
-    None
-}
-
-#[cfg(not(windows))]
-fn any_mouse_button_down() -> bool {
-    false
-}
-
 fn main() {
     boot_mark("main");
     #[cfg(windows)]
@@ -1340,6 +1410,9 @@ fn main() {
         proxy,
         media: None,
         drag: None,
+        resize: None,
+        resizing: false,
+        cursor: CursorIcon::Default,
         shot,
         shot_delay,
         shoot_at: None,

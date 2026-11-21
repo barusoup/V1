@@ -11,9 +11,6 @@ use dream::bedframe::widgets::{
 };
 use dream::fsr3::JitterSequence as Fsr3Jitter;
 use dream::gfx::ColorVertex;
-#[cfg(target_os = "macos")]
-use dream::gfx::metal::{DynamicBuffers, GpuBuffer, GpuContext, GpuImage, PulledMesh, Swapchain};
-#[cfg(not(target_os = "macos"))]
 use dream::gfx::vulkan::{DynamicBuffers, GpuBuffer, GpuContext, GpuImage, PulledMesh, Swapchain};
 use dream::model::render::{ModelVertex, PbrVertex, SkinnedVertex};
 use dream::model::{AlphaMode, Material, Model, ModelInstance, TexelFilter, UvTransform, Wrap};

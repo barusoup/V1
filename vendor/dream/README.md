@@ -9,6 +9,7 @@ A Rust game engine that doubles as an app framework. It includes BedFrame, a UI 
 
 ## Requirements
 
+- Windows (current target OS; macOS + Metal support lives on the `macos-metal` branch; Linux is not supported)
 - Rust (edition 2024)
 - GPU with Vulkan 1.3
 

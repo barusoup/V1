@@ -27,7 +27,9 @@ const MAX_VIDEO_FPS: f32 = 24.0;
 /// Maximum Gaussian sigma at full frost strength, in working pixels.
 const MAX_SIGMA: f32 = 26.0;
 
-const ANIMATED_EXTS: &[&str] = &["gif", "apng", "mp4", "webm", "mov", "mkv", "avi", "m4v", "ogv"];
+const ANIMATED_EXTS: &[&str] = &[
+    "gif", "apng", "mp4", "webm", "mov", "mkv", "avi", "m4v", "ogv",
+];
 
 /// Whether `path` is an animated background (GIF, APNG, or video).
 pub fn is_animated_path(path: &Path) -> bool {
@@ -153,7 +155,10 @@ fn prepare_still_background(src: &Path, bg_dir: &Path, stamp: u128) -> Result<Pa
         if codecs.has_av1_dec() {
             let avif_encoders: &[(&str, &[&str])] = &[
                 ("libsvtav1", &["-crf", "32", "-preset", "6"]),
-                ("libaom-av1", &["-crf", "32", "-cpu-used", "6", "-still-picture", "1"]),
+                (
+                    "libaom-av1",
+                    &["-crf", "32", "-cpu-used", "6", "-still-picture", "1"],
+                ),
             ];
             for (enc, args) in avif_encoders {
                 if codecs.has_enc(enc) {
@@ -298,19 +303,19 @@ fn prepare_animated_background(src: &Path, bg_dir: &Path, stamp: u128) -> Result
             faststart: true,
         },
         Candidate {
-            ext: "mp4",
-            encoder: "hevc_videotoolbox",
-            usable: cfg!(target_os = "macos")
-                && codecs.has_enc("hevc_videotoolbox")
-                && codecs.has_dec("hevc"),
-            args: &["-q:v", "55", "-tag:v", "hvc1"],
-            faststart: true,
-        },
-        Candidate {
             ext: "webm",
             encoder: "libvpx-vp9",
             usable: codecs.has_enc("libvpx-vp9") && codecs.has_dec("vp9"),
-            args: &["-crf", "34", "-b:v", "0", "-deadline", "good", "-cpu-used", "2"],
+            args: &[
+                "-crf",
+                "34",
+                "-b:v",
+                "0",
+                "-deadline",
+                "good",
+                "-cpu-used",
+                "2",
+            ],
             faststart: false,
         },
         Candidate {
@@ -318,15 +323,6 @@ fn prepare_animated_background(src: &Path, bg_dir: &Path, stamp: u128) -> Result
             encoder: "libx264",
             usable: codecs.has_enc("libx264") && codecs.has_dec("h264"),
             args: &["-crf", "26", "-preset", "medium"],
-            faststart: true,
-        },
-        Candidate {
-            ext: "mp4",
-            encoder: "h264_videotoolbox",
-            usable: cfg!(target_os = "macos")
-                && codecs.has_enc("h264_videotoolbox")
-                && codecs.has_dec("h264"),
-            args: &["-b:v", "2500k"],
             faststart: true,
         },
         Candidate {
@@ -396,16 +392,10 @@ pub fn prune_unused_backgrounds(data_dir: &Path, keep: &[&Path]) {
 }
 
 fn hidden_command(program: &Path) -> Command {
-    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = Command::new(program);
-    #[cfg(not(windows))]
-    let cmd = Command::new(program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    cmd.creation_flags(CREATE_NO_WINDOW);
     cmd
 }
 
@@ -601,7 +591,12 @@ impl Background {
             let (tx, rx) = mpsc::sync_channel(1);
             self.rx = Some(rx);
             if let Err(error) = queue_static(Box::new(move || {
-                let _ = tx.try_send(decode(generation, &path, strength, bc7.load(Ordering::Acquire)));
+                let _ = tx.try_send(decode(
+                    generation,
+                    &path,
+                    strength,
+                    bc7.load(Ordering::Acquire),
+                ));
             })) {
                 self.rx = None;
                 self.error = Some(error);
@@ -1101,9 +1096,8 @@ pub fn encode_bc7_rgba(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
             let mut far0 = block[0];
             let mut max_d = -1.0f32;
             for c in &block {
-                let d = (c[0] - mean[0]).powi(2)
-                    + (c[1] - mean[1]).powi(2)
-                    + (c[2] - mean[2]).powi(2);
+                let d =
+                    (c[0] - mean[0]).powi(2) + (c[1] - mean[1]).powi(2) + (c[2] - mean[2]).powi(2);
                 if d > max_d {
                     max_d = d;
                     far0 = *c;
@@ -1112,9 +1106,8 @@ pub fn encode_bc7_rgba(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
             let mut far1 = far0;
             max_d = -1.0;
             for c in &block {
-                let d = (c[0] - far0[0]).powi(2)
-                    + (c[1] - far0[1]).powi(2)
-                    + (c[2] - far0[2]).powi(2);
+                let d =
+                    (c[0] - far0[0]).powi(2) + (c[1] - far0[1]).powi(2) + (c[2] - far0[2]).powi(2);
                 if d > max_d {
                     max_d = d;
                     far1 = *c;

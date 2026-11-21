@@ -86,82 +86,8 @@ jobs:
           name: windows-dist
           path: dist/V1-Setup-${{ env.VERSION }}.exe
 
-  macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.CHECKOUT_REF }}
-
-      - name: Check the tag matches the Cargo version
-        run: |
-          version="${RELEASE_TAG#v}"
-          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          if [ "$version" != "$manifest" ]; then
-            echo "Tag $RELEASE_TAG does not match Cargo.toml version $manifest"
-            exit 1
-          fi
-          echo "VERSION=$version" >> "$GITHUB_ENV"
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build Apple Silicon DMG
-        run: ./installer/build-macos.sh
-
-      - name: Verify the DMG and the signed app
-        run: |
-          dmg="target/aarch64-apple-darwin/release/V1-$VERSION-arm64.dmg"
-          hdiutil verify "$dmg"
-          mount="$(mktemp -d)"
-          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount"
-          codesign --verify --deep --strict --verbose=2 "$mount/V1.app"
-          hdiutil detach "$mount" -quiet
-
-      - name: Upload macOS DMG
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-dist
-          path: target/aarch64-apple-darwin/release/V1-${{ env.VERSION }}-arm64.dmg
-
-  linux:
-    # The AppImage is a dynamically linked Linux binary, so it inherits the runner's glibc. 22.04
-    # (glibc 2.35) keeps the download runnable on Debian 12, Ubuntu 22.04+ and their contemporaries.
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.CHECKOUT_REF }}
-
-      - name: Check the tag matches the Cargo version
-        run: |
-          version="${RELEASE_TAG#v}"
-          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          if [ "$version" != "$manifest" ]; then
-            echo "Tag $RELEASE_TAG does not match Cargo.toml version $manifest"
-            exit 1
-          fi
-          echo "VERSION=$version" >> "$GITHUB_ENV"
-
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libasound2-dev pkg-config
-
-      - name: Build the AppImage
-        run: ./installer/build-linux.sh
-
-      - name: Upload Linux AppImage
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-dist
-          path: target/release/V1-${{ env.VERSION }}-x86_64.AppImage
-
   release:
-    needs: [windows, macos, linux]
+    needs: [windows]
     if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     steps:
@@ -176,7 +102,7 @@ jobs:
       - name: Write checksums
         run: |
           cd dist
-          sha256sum V1-Setup-*.exe V1-*-arm64.dmg V1-*-x86_64.AppImage > SHA256SUMS
+          sha256sum V1-Setup-*.exe > SHA256SUMS
 
       - name: Publish the release
         env:
@@ -185,7 +111,5 @@ jobs:
           version="${RELEASE_TAG#v}"
           gh release create "$RELEASE_TAG" \
             dist/V1-Setup-*.exe \
-            dist/V1-*-arm64.dmg \
-            dist/V1-*-x86_64.AppImage \
             dist/SHA256SUMS \
             --title "V1 $version" --generate-notes

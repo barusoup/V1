@@ -62,11 +62,16 @@
 //!   set is trimmed once after start-up and once after each quiet period. See
 //!   [`crate::memory::IdleTrim`].
 //! - **Input.** Mouse, wheel, keyboard, IME and clipboard are translated for
-//!   you. Keyboard focus rings are on.
+//!   you. Keyboard focus rings are on. Files dropped on the window arrive
+//!   through [`UiApp::files_dropped`].
 //!
 //! - **Cursor icons.** Widgets set [`Ui::cursor`] automatically (for text
 //!   fields, splitters and sliders) and [`run`] forwards it to the window;
 //!   custom code can override it via [`Ui::set_cursor`].
+//!
+//! - **Linux desktop integration.** [`AppOptions::app_id`] sets the Wayland
+//!   `app_id` and X11 `WM_CLASS`, so the window matches its `.desktop` entry
+//!   for its icon and launcher grouping.
 //!
 //! # Environment
 //!
@@ -127,6 +132,11 @@ pub struct AppOptions {
     /// [`GpuPreference::HighPerformance`]; UI-only apps on hybrid laptops can
     /// opt into [`GpuPreference::LowPower`] via [`AppOptions::low_power_gpu`].
     pub gpu_preference: GpuPreference,
+    /// Application ID for the Linux desktop: the Wayland `app_id` and the X11
+    /// `WM_CLASS`, used to match the window to its `.desktop` entry (icon,
+    /// launcher grouping, `StartupWMClass`). Default `None`, which leaves the
+    /// compositor's fallback. Ignored on other platforms.
+    pub app_id: Option<String>,
 }
 
 impl Default for AppOptions {
@@ -141,6 +151,7 @@ impl Default for AppOptions {
             ui_blend: UiBlend::default(),
             idle_trim: true,
             gpu_preference: GpuPreference::HighPerformance,
+            app_id: None,
         }
     }
 }
@@ -163,6 +174,12 @@ impl AppOptions {
     /// Set the colour palette.
     pub fn theme(mut self, theme: ThemeMode) -> Self {
         self.theme = theme;
+        self
+    }
+
+    /// Set the Linux application ID (Wayland `app_id` / X11 `WM_CLASS`).
+    pub fn app_id(mut self, app_id: impl Into<String>) -> Self {
+        self.app_id = Some(app_id.into());
         self
     }
 
@@ -215,6 +232,12 @@ pub trait UiApp {
     /// frame, so record state from events (`if resp.clicked { … }`) rather
     /// than assigning it from a response.
     fn view(&mut self, ui: &mut Ui, cx: &mut AppContext<'_>);
+
+    /// Files were dropped on the window. A drop of several files arrives as
+    /// one call with them in the order the OS listed them; drops that land
+    /// before the next frame are coalesced. The frame that follows this call
+    /// shows whatever the app made of the paths.
+    fn files_dropped(&mut self, _paths: Vec<std::path::PathBuf>, _cx: &mut AppContext<'_>) {}
 
     /// The window's close button was pressed. Return `false` to keep the app
     /// running. The default closes the window.
@@ -413,6 +436,9 @@ struct Runner<A> {
     left_down: bool,
     right_down: bool,
     preedit: Option<Composition>,
+    /// Paths the OS dropped on the window since the last frame that forwarded
+    /// them to [`UiApp::files_dropped`]. A multi-file drop coalesces here.
+    drops: Vec<std::path::PathBuf>,
     /// Physical pixels per logical point.
     scale: f32,
     /// The OS reported the window's appearance as dark.
@@ -444,10 +470,9 @@ struct Runner<A> {
     /// Consecutive `SurfaceError::Timeout` retries (used to back off on occluded Wayland surfaces).
     consecutive_timeouts: u32,
     timeout_until: Option<Instant>,
-    /// Last time `is_minimized` was polled (throttled so X11 doesn't round-trip per cursor move).
+    /// Last time `is_minimized` was polled.
     last_window_poll: Option<Instant>,
     window_minimised: bool,
-    wayland: bool,
     /// The handle [`AppContext::waker`] clones from.
     waker: AppWaker,
 }
@@ -459,8 +484,6 @@ impl<A: UiApp> Runner<A> {
         exit_at: Option<Instant>,
         proxy: EventLoopProxy<WakeEvent>,
     ) -> Self {
-        let wayland = cfg!(target_os = "linux")
-            && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
         Self {
             options,
             app,
@@ -477,6 +500,7 @@ impl<A: UiApp> Runner<A> {
             left_down: false,
             right_down: false,
             preedit: None,
+            drops: Vec::new(),
             scale: 1.0,
             system_dark: true,
             occluded: false,
@@ -496,7 +520,6 @@ impl<A: UiApp> Runner<A> {
             timeout_until: None,
             last_window_poll: None,
             window_minimised: false,
-            wayland,
         }
     }
 
@@ -590,6 +613,10 @@ impl<A: UiApp> Runner<A> {
         let screen = logical_size(live.renderer.display_size(), scale);
         live.ui.begin(input, screen);
         live.ui.set_theme(&live.theme);
+        if !self.drops.is_empty() {
+            let paths = std::mem::take(&mut self.drops);
+            self.with_app(|app, _ui, cx| app.files_dropped(paths, cx));
+        }
         self.with_app(|app, ui, cx| app.view(ui, cx));
 
         let Some(live) = self.live.as_mut() else {
@@ -926,15 +953,8 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 let state = modifiers.state();
-                // The platform shortcut modifier: Command on macOS, Control
-                // elsewhere.
-                let command = if cfg!(target_os = "macos") {
-                    state.super_key()
-                } else {
-                    state.control_key()
-                };
                 self.keys
-                    .modifiers(state.shift_key(), command, state.alt_key());
+                    .modifiers(state.shift_key(), state.control_key(), state.alt_key());
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 self.keyboard(&event);
@@ -952,6 +972,19 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
                 }
                 self.dirty = true;
             }
+            WindowEvent::DroppedFile(path) => {
+                self.drops.push(path);
+                self.dirty = true;
+            }
+            // The drag ending is the OS saying the last file has been dropped,
+            // so the whole drop can be forwarded now rather than waiting for
+            // the next frame to coalesce it.
+            WindowEvent::HoveredFileCancelled => {
+                if !self.drops.is_empty() {
+                    let paths = std::mem::take(&mut self.drops);
+                    self.with_app(|app, _ui, cx| app.files_dropped(paths, cx));
+                }
+            }
             _ => {}
         }
     }
@@ -962,12 +995,10 @@ impl<A: UiApp> ApplicationHandler<WakeEvent> for Runner<A> {
             return;
         }
         let now = Instant::now();
-        // Minimisation has no event on most platforms, so it is polled at low
-        // cadence off Wayland (Wayland never answers `is_minimized()`).
-        if !self.wayland
-            && self
-                .last_window_poll
-                .is_none_or(|at| now.duration_since(at) >= Duration::from_millis(250))
+        // Minimisation has no event on Windows, so it is polled at low cadence.
+        if self
+            .last_window_poll
+            .is_none_or(|at| now.duration_since(at) >= Duration::from_millis(250))
         {
             self.window_minimised = self
                 .live
