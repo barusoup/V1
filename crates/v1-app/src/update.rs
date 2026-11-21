@@ -1,18 +1,17 @@
 // Copyright (c) 2026 Hunter Lehr (Barusoup)
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Startup self-update. Beside the app starting, a thread asks GitHub for the latest full release.
-//! If it is newer than this build and its package matches the published checksum, a helper script
-//! waits for this process to exit, installs it, and starts the updated app in its place. Any
-//! failure (no network, a failed request, a bad download, a setup that will not verify) is dropped
-//! and the app starts as usual.
+//! In-app update checks. A worker thread asks GitHub for the latest full release every few hours,
+//! so an open app can tell the listener when a new version exists instead of waiting for the next
+//! launch. Installing is still a deliberate action: the popup's Update button stages the verified
+//! Windows setup, closes the app, installs it, and starts the new build again.
 //!
-//! Windows runs the NSIS setup program. Only installed copies update: the Windows installer leaves
-//! `uninstall.exe` beside the app, so a build run from a target folder sits this out. Set
-//! `V1_NO_UPDATE` to skip the check.
+//! Only installed copies update: the Windows installer leaves `uninstall.exe` beside the app, so a
+//! build run from a target folder sits this out. Set `V1_NO_UPDATE` to skip checks and installs.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -25,22 +24,23 @@ const ATTEMPTS: u32 = 3;
 const RETRY_PAUSE: Duration = Duration::from_millis(300);
 /// The release lookup, retries included, may take this long before the app gives up on it.
 const CHECK_BUDGET: Duration = Duration::from_secs(6);
-/// The package download may take this long. Past it, the update waits for the next launch. A
-/// Windows setup is ~90 MB, so a slow line needs more than a minute; the check runs beside the
-/// window, so a long budget only delays the update itself.
+/// The package download may take this long. A Windows setup is ~90 MB, so a slow line needs more
+/// than a minute; the download runs beside the app, so a long budget only delays the update itself.
 const DOWNLOAD_BUDGET: Duration = Duration::from_secs(90);
 /// Set by the installer, which starts the updated copy after replacing the old one.
 pub(crate) const UPDATED_FLAG: &str = "--updated";
 /// Marker covering the gap between the old process exiting and the installer starting the new one.
 const HANDOFF_FILE: &str = "update-in-progress";
 /// A marker older than this is treated as a crashed update, so a broken install cannot lock the app
-/// out for long. The helper scripts wait up to two minutes before they give up.
+/// out for long. The helper script waits up to two minutes before it gives up.
 const HANDOFF_TTL: Duration = Duration::from_secs(300);
-/// How long the background check waits before it starts. It builds a runtime and a TLS client,
-/// which is CPU the first frame wants: by the time this elapses the window is up. A launch that
-/// blocks the check behind a release installs it just as it did before, only a few milliseconds
-/// later.
-const START_DELAY: Duration = Duration::from_millis(500);
+/// Let the first frame settle before the worker builds a runtime and opens a TLS connection.
+const START_DELAY: Duration = Duration::from_secs(2);
+/// How often a quiet session looks again. The check is a single small request; six hours keeps it
+/// out of the way while still catching a release during a long listening session.
+const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+/// A check that could not reach GitHub waits this long before trying again.
+const RETRY_EVERY: Duration = Duration::from_secs(20 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(u64, u64, u64);
@@ -63,6 +63,24 @@ impl fmt::Display for Version {
     }
 }
 
+/// A newer release that the UI can offer to install.
+#[derive(Debug, Clone)]
+pub struct Available {
+    pub version: Version,
+    release: Release,
+}
+
+/// What the background worker reports back to the UI thread.
+#[derive(Debug)]
+pub enum UpdateEvent {
+    /// A newer release is ready. Sent once per version unless a manual check asks again.
+    Available(Available),
+    /// A manual check found nothing newer.
+    UpToDate,
+    /// A manual check or install could not finish.
+    Failed(String),
+}
+
 /// The release asset this build installs from: the Windows setup program.
 fn package_name(version: Version) -> String {
     format!("V1-Setup-{version}.exe")
@@ -76,15 +94,15 @@ struct Asset {
 
 /// The newest full release, with the package and checksum file it published.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Release {
-    pub version: Version,
+struct Release {
+    version: Version,
     package: Asset,
     checksums: Asset,
 }
 
 /// Reads the body of `releases/latest`. The package must carry this platform's name (see
 /// [`package_name`]), and both assets must come from this repository's release downloads.
-pub fn parse_latest(json: &[u8]) -> Option<Release> {
+fn parse_latest(json: &[u8]) -> Option<Release> {
     let value: serde_json::Value = serde_json::from_slice(json).ok()?;
     let version = Version::parse(value.get("tag_name")?.as_str()?)?;
     let assets = value.get("assets")?.as_array()?;
@@ -119,77 +137,115 @@ pub fn expected_hash(checksums: &str, file: &str) -> Option<String> {
     })
 }
 
-/// Runs the update check and, when a newer release is ready, installs it and restarts the app.
-/// Returns only when there is nothing to do or the update could not be staged.
-pub fn run_at_startup() {
-    if std::env::var_os("V1_NO_UPDATE").is_some() {
-        return;
+/// Start the update worker. The returned sender asks for an immediate manual check; dropping it
+/// stops the worker at its next wake-up. `None` means this build cannot update itself (a development
+/// build, `--shot`, or `V1_NO_UPDATE`).
+pub fn start_worker<F>(on_event: F) -> Option<Sender<bool>>
+where
+    F: Fn(UpdateEvent) + Send + 'static,
+{
+    if std::env::var_os("V1_NO_UPDATE").is_some() || install_target().is_none() {
+        return None;
     }
-    let Some(target) = install_target() else {
-        return;
-    };
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("v1-update".to_owned())
+        .spawn(move || {
+            let mut announced: Option<Version> = None;
+            let mut wait = START_DELAY;
+            loop {
+                let manual = match rx.recv_timeout(wait) {
+                    Ok(manual) => manual,
+                    Err(RecvTimeoutError::Timeout) => false,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                };
+                match check_once() {
+                    Ok(Some(update)) => {
+                        let version = update.version;
+                        if announced != Some(version) || manual {
+                            announced = Some(version);
+                            on_event(UpdateEvent::Available(update));
+                        }
+                        wait = CHECK_EVERY;
+                    }
+                    Ok(None) => {
+                        if manual {
+                            on_event(UpdateEvent::UpToDate);
+                        }
+                        wait = CHECK_EVERY;
+                    }
+                    Err(error) => {
+                        if manual {
+                            on_event(UpdateEvent::Failed(error));
+                        }
+                        wait = RETRY_EVERY;
+                    }
+                }
+            }
+        });
+    worker.ok().map(|_| tx)
+}
+
+/// Check once, on the worker thread. `Ok(None)` means this build is current.
+fn check_once() -> Result<Option<Available>, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-    else {
-        return;
-    };
-    let Ok(client) = reqwest::Client::builder()
+        .map_err(|_| "The update checker could not start.".to_owned())?;
+    let client = reqwest::Client::builder()
         .user_agent(format!("V1/{CURRENT}"))
         .connect_timeout(Duration::from_secs(3))
         .build()
-    else {
-        return;
-    };
-
-    let Some(release) = runtime.block_on(async {
-        tokio::time::timeout(CHECK_BUDGET, newer_release(&client))
+        .map_err(|_| "The update checker could not start.".to_owned())?;
+    runtime.block_on(async {
+        let release = tokio::time::timeout(CHECK_BUDGET, newer_release(&client))
             .await
-            .ok()
-            .flatten()
-    }) else {
-        return;
-    };
-    let Some(package) = runtime.block_on(async {
-        tokio::time::timeout(DOWNLOAD_BUDGET, stage_package(&client, &release))
-            .await
-            .ok()
-            .flatten()
-    }) else {
-        return;
-    };
-
-    if begin_handoff(release.version).is_err() {
-        // Without the marker another launch could race the installer into the old build, so leave
-        // the update for the next start rather than take that chance.
-        let _ = std::fs::remove_file(&package);
-        return;
-    }
-    if restart_into_update(&package, &target).is_ok() {
-        std::process::exit(0);
-    }
-    clear_handoff();
-    let _ = std::fs::remove_file(&package);
+            .map_err(|_| "The update check timed out.".to_owned())??;
+        Ok(release.map(|release| Available {
+            version: release.version,
+            release,
+        }))
+    })
 }
 
-/// Start the update check on a thread of its own, so a slow or unreachable GitHub can never hold
-/// the window shut. An installed copy still checks on every start; if a newer release is staged,
-/// the app exits and the helper installs it and starts it again.
-///
-/// The thread waits [`START_DELAY`] first. Starting the check takes the same CPU the renderer and
-/// the first frame want (a runtime, a TLS client, a name lookup), and nothing about an update is
-/// urgent to the millisecond: the window is up before the check begins.
-pub fn check_in_background() {
-    // A build that cannot replace itself has nothing to do on a thread; skip the wake-up entirely.
-    if std::env::var_os("V1_NO_UPDATE").is_some() || install_target().is_none() {
-        return;
+/// Download and verify the release, then hand off to the installer. This exits the process on
+/// success; a failure comes back as a message for the popup.
+pub fn install(update: &Available) -> Result<(), String> {
+    if std::env::var_os("V1_NO_UPDATE").is_some() {
+        return Err("Updates are turned off for this launch.".to_owned());
     }
-    let _ = std::thread::Builder::new()
-        .name("v1-update".to_owned())
-        .spawn(|| {
-            std::thread::sleep(START_DELAY);
-            run_at_startup();
-        });
+    let target = install_target()
+        .ok_or_else(|| "Updates are only available in an installed copy of V1.".to_owned())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "The updater could not start.".to_owned())?;
+    let client = reqwest::Client::builder()
+        .user_agent(format!("V1/{CURRENT}"))
+        .connect_timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|_| "The updater could not start.".to_owned())?;
+    let package = runtime
+        .block_on(async {
+            tokio::time::timeout(DOWNLOAD_BUDGET, stage_package(&client, &update.release))
+                .await
+                .ok()
+                .flatten()
+        })
+        .ok_or_else(|| "The update could not be downloaded. Check your connection.".to_owned())?;
+
+    if begin_handoff(update.version).is_err() {
+        // Without the marker another launch could race the installer into the old build, so leave
+        // the update for the next attempt rather than take that chance.
+        let _ = std::fs::remove_file(&package);
+        return Err("The update could not be prepared.".to_owned());
+    }
+    if let Err(error) = restart_into_update(&package, &target) {
+        clear_handoff();
+        let _ = std::fs::remove_file(&package);
+        return Err(format!("The installer could not start: {error}"));
+    }
+    std::process::exit(0);
 }
 
 /// What an update replaces: the folder the Windows app is installed in. `None` for a build run
@@ -258,18 +314,24 @@ pub fn blocked_by_update(from_installer: bool) -> bool {
     pending
 }
 
-async fn newer_release(client: &reqwest::Client) -> Option<Release> {
+async fn newer_release(client: &reqwest::Client) -> Result<Option<Release>, String> {
     let body = get(client, LATEST_URL, Duration::from_secs(4)).await?;
-    let release = parse_latest(&body)?;
-    (release.version > Version::parse(CURRENT)?).then_some(release)
+    let release = parse_latest(&body)
+        .ok_or_else(|| "The release information could not be read.".to_owned())?;
+    let current = Version::parse(CURRENT).ok_or_else(|| "This build has no version.".to_owned())?;
+    Ok((release.version > current).then_some(release))
 }
 
 /// Downloads the package for `release` and checks it against the published checksum. Returns the
 /// path of the verified file.
 async fn stage_package(client: &reqwest::Client, release: &Release) -> Option<PathBuf> {
-    let checksums = get(client, &release.checksums.url, Duration::from_secs(10)).await?;
+    let checksums = get(client, &release.checksums.url, Duration::from_secs(10))
+        .await
+        .ok()?;
     let expected = expected_hash(std::str::from_utf8(&checksums).ok()?, &release.package.name)?;
-    let package = get(client, &release.package.url, DOWNLOAD_BUDGET).await?;
+    let package = get(client, &release.package.url, DOWNLOAD_BUDGET)
+        .await
+        .ok()?;
     let actual = format!("{:x}", Sha256::digest(&package));
     if actual != expected {
         return None;
@@ -282,27 +344,45 @@ async fn stage_package(client: &reqwest::Client, release: &Release) -> Option<Pa
 }
 
 /// GET with a few attempts. Each attempt has its own `timeout`.
-async fn get(client: &reqwest::Client, url: &str, timeout: Duration) -> Option<Vec<u8>> {
+async fn get(client: &reqwest::Client, url: &str, timeout: Duration) -> Result<Vec<u8>, String> {
+    let mut last = "GitHub could not be reached.".to_owned();
     for attempt in 0..ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(RETRY_PAUSE).await;
         }
-        let result: reqwest::Result<Vec<u8>> = async {
+        let result: Result<Vec<u8>, String> = async {
             let response = client
                 .get(url)
                 .header(reqwest::header::ACCEPT, "application/vnd.github+json")
                 .timeout(timeout)
                 .send()
-                .await?
-                .error_for_status()?;
-            Ok(response.bytes().await?.to_vec())
+                .await
+                .map_err(|error| {
+                    if error.is_timeout() {
+                        "The update check timed out.".to_owned()
+                    } else {
+                        "GitHub could not be reached.".to_owned()
+                    }
+                })?;
+            let response = response
+                .error_for_status()
+                .map_err(|error| match error.status() {
+                    Some(status) => format!("GitHub returned {status}."),
+                    None => "GitHub could not be reached.".to_owned(),
+                })?;
+            Ok(response
+                .bytes()
+                .await
+                .map(|body| body.to_vec())
+                .map_err(|_| "The update download was interrupted.".to_owned())?)
         }
         .await;
-        if let Ok(body) = result {
-            return Some(body);
+        match result {
+            Ok(body) => return Ok(body),
+            Err(error) => last = error,
         }
     }
-    None
+    Err(last)
 }
 
 /// About two minutes of waiting, then the update is dropped instead of hanging.

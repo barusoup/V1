@@ -45,6 +45,7 @@ pub enum Icon {
     GripVertical,
     Trash2,
     Settings,
+    Download,
     Star,
     StarFilled,
     Image,
@@ -55,7 +56,7 @@ pub enum Icon {
 impl Icon {
     /// Every icon, for the tests that check each one parses and rasterizes.
     #[cfg(test)]
-    pub const ALL: [Icon; 33] = [
+    pub const ALL: [Icon; 34] = [
         Icon::House,
         Icon::Book,
         Icon::Disc,
@@ -84,6 +85,7 @@ impl Icon {
         Icon::GripVertical,
         Icon::Trash2,
         Icon::Settings,
+        Icon::Download,
         Icon::Star,
         Icon::StarFilled,
         Icon::Image,
@@ -128,6 +130,9 @@ impl Icon {
             Icon::GripVertical => include_str!("../assets/icons/grip-vertical.svg"),
             Icon::Trash2 => include_str!("../assets/icons/trash-2.svg"),
             Icon::Settings => include_str!("../assets/icons/settings.svg"),
+            Icon::Download => {
+                r#"<svg><path d="M12 3V15"/><path d="M7 10L12 15L17 10"/><path d="M5 21H19"/></svg>"#
+            }
             Icon::Star | Icon::StarFilled => include_str!("../assets/icons/star.svg"),
             Icon::Image => include_str!("../assets/icons/image.svg"),
             Icon::Folder => include_str!("../assets/icons/folder.svg"),

@@ -420,6 +420,14 @@ enum Action {
     ConfirmDialog(Option<ConfirmDialog>),
     /// Turn local downloads on or off. Off deletes what is already here.
     SetDownloads(bool),
+    /// Reveal the update card without starting a check.
+    ShowUpdate,
+    /// Ask the worker for an immediate update check.
+    CheckUpdate,
+    /// Install the waiting update and restart the app.
+    InstallUpdate,
+    /// Close the update card.
+    DismissUpdate,
     /// The equalizer's ten band gains, in dB.
     SetEq([f32; 10]),
     ResetEq,
@@ -435,6 +443,24 @@ pub enum WindowRequest {
     Close,
     /// Start moving the window: the press was on empty space in the top strip.
     Drag,
+}
+
+/// The in-app update notice. It is entirely local state: the host owns the worker and the release,
+/// and reports what happened here.
+#[derive(Default)]
+struct UpdateUi {
+    /// The release version to offer, when one is waiting.
+    available: Option<String>,
+    /// Whether the card is asked to be on screen. It stays drawn for the closing spring.
+    popup_open: bool,
+    /// The next frame should snap the opening spring to zero, so the first appearance animates.
+    opening: bool,
+    checking: bool,
+    up_to_date: bool,
+    installing: bool,
+    error: Option<String>,
+    check_requested: bool,
+    install_requested: bool,
 }
 
 pub struct State {
@@ -473,6 +499,8 @@ pub struct State {
     pub window_requests: Vec<WindowRequest>,
     /// Current native fullscreen state, supplied by the host before building a frame.
     pub fullscreen: bool,
+    /// The update notice and its card.
+    update: UpdateUi,
 
     tab: Tab,
     /// Which list the Collection page is showing.
@@ -978,6 +1006,7 @@ impl State {
             gpu: Gpu::default(),
             window_requests: Vec::new(),
             fullscreen: false,
+            update: UpdateUi::default(),
             tab: Tab::Library,
             collection_tab: CollectionTab::Songs,
             results_tab: ResultsTab::Songs,
@@ -1059,12 +1088,57 @@ impl State {
         self.background.set_bc7(enabled);
     }
 
-    /// Close the track menu, if one is open. Escape does this, along with the download
-    /// confirmation, which is the other thing that sits over the page.
+    /// Close the track menu, update card, or confirmation dialog. Escape does this.
     pub fn close_menu(&mut self) {
         self.menu = None;
         self.settings.confirm_dialog = None;
         self.settings.color_picker = None;
+        self.update.popup_open = false;
+    }
+
+    /// A background check found a newer release. Reveal it once, and leave a dismissed card closed
+    /// until the listener asks for it again.
+    pub fn update_available(&mut self, version: String) {
+        let was_open = self.update.popup_open;
+        if self.update.available.as_deref() != Some(version.as_str()) {
+            self.update.available = Some(version);
+        }
+        self.update.popup_open = true;
+        self.update.opening = !was_open;
+        self.update.checking = false;
+        self.update.up_to_date = false;
+        self.update.error = None;
+    }
+
+    /// A manual check found nothing newer.
+    pub fn update_up_to_date(&mut self) {
+        let was_open = self.update.popup_open;
+        self.update.available = None;
+        self.update.checking = false;
+        self.update.up_to_date = true;
+        self.update.error = None;
+        self.update.popup_open = true;
+        self.update.opening = !was_open;
+    }
+
+    /// A manual check or install could not finish.
+    pub fn update_failed(&mut self, message: String) {
+        let was_open = self.update.popup_open;
+        self.update.checking = false;
+        self.update.installing = false;
+        self.update.error = Some(message);
+        self.update.popup_open = true;
+        self.update.opening = !was_open;
+    }
+
+    /// Whether the UI asked for a check since the host last looked.
+    pub fn take_update_check_request(&mut self) -> bool {
+        std::mem::take(&mut self.update.check_requested)
+    }
+
+    /// Whether the UI asked to install the waiting update.
+    pub fn take_update_install_request(&mut self) -> bool {
+        std::mem::take(&mut self.update.install_requested)
     }
 
     /// Drain backend events. Called once per frame, before the build.
@@ -2819,6 +2893,34 @@ impl State {
                 }
                 self.settings.confirm_dialog = None;
             }
+            Action::ShowUpdate => {
+                if !self.update.popup_open {
+                    self.update.opening = true;
+                }
+                self.update.popup_open = true;
+            }
+            Action::CheckUpdate => {
+                if !self.update.checking && !self.update.installing {
+                    if !self.update.popup_open {
+                        self.update.opening = true;
+                    }
+                    self.update.popup_open = true;
+                    self.update.checking = true;
+                    self.update.up_to_date = false;
+                    self.update.error = None;
+                    self.update.check_requested = true;
+                }
+            }
+            Action::InstallUpdate => {
+                if self.update.available.is_some() && !self.update.installing {
+                    self.update.install_requested = true;
+                    self.update.installing = true;
+                    self.update.error = None;
+                    // The card closes; a failed install brings it back with the reason.
+                    self.update.popup_open = false;
+                }
+            }
+            Action::DismissUpdate => self.update.popup_open = false,
             Action::SetEq(gains) => {
                 self.eq = gains;
                 self.prefs.set_eq(gains);
@@ -3246,6 +3348,11 @@ pub fn build(
     let mut anims = std::mem::take(&mut state.anims);
     let gpu = std::mem::take(&mut state.gpu);
     anims.begin(dt);
+    // A fresh card starts just below its resting place, so the first frame can spring it up. A
+    // card that is already open keeps its velocity when another update lands.
+    if std::mem::take(&mut state.update.opening) {
+        anims.snap("update_pop", 0, 0.0);
+    }
 
     // Wheel input over the lyric page is the reader taking it over (see `LyricsFollow`). Read it
     // before `input` moves into the UI, along with the keys, which scroll the view under the pointer.
@@ -3298,6 +3405,25 @@ pub fn build(
         theme::CAPTION_BTN_W * 3.0,
         theme::CAPTION_H,
     );
+    let update_item = Rect::new(
+        sidebar.x + 12.0,
+        sidebar.h - 88.0,
+        (sidebar.w - 24.0).max(0.0),
+        36.0,
+    );
+    let update_popup = update_popup_rect(sidebar, width);
+    let update_visible =
+        state.update.popup_open || anims.value("update_pop", 0).unwrap_or(0.0) > 0.001;
+    // A press anywhere outside the card closes it. The update entry itself is left live so it can
+    // be used as a toggle.
+    if state.update.popup_open
+        && pointer.pressed
+        && !update_popup.contains(pointer.pos)
+        && !update_item.contains(pointer.pos)
+    {
+        state.update.popup_open = false;
+        left_dismissed = true;
+    }
 
     if state.lyrics_open && wheel != 0.0 && main.contains(pointer.pos) {
         state.lyrics_follow.reader = true;
@@ -3478,6 +3604,9 @@ pub fn build(
     // Everything drawn over the page. The page is drawn first, so these are known up front and a
     // page widget under one of them does not take the press.
     let mut covers = vec![bar, sidebar];
+    if update_visible {
+        covers.push(update_popup);
+    }
     if !theater {
         covers.push(caption);
     }
@@ -3562,6 +3691,10 @@ pub fn build(
         draw_caption(&mut cx, caption, state.fullscreen, &mut actions);
     }
     cx.blocked = false;
+    if update_visible {
+        cx.covering = false;
+        draw_update_popup(&mut cx, state, sidebar, width, &mut actions);
+    }
     cx.draw().set_layer(page_layer);
 
     if state.lyrics_open {
@@ -3757,12 +3890,64 @@ fn draw_sidebar(cx: &mut Cx, state: &State, rect: Rect, open_t: f32, actions: &m
             actions.push(Action::Tab(tab));
         }
     }
+    // Update sits just above Settings, quiet until a release is waiting.
+    let item = Rect::new(rect.x + 12.0, rect.h - 88.0, item_w, item_h);
+    if sidebar_update_item(cx, item, &state.update, label_a) {
+        actions.push(if state.update.popup_open {
+            Action::DismissUpdate
+        } else if state.update.available.is_some()
+            || state.update.checking
+            || state.update.installing
+            || state.update.up_to_date
+            || state.update.error.is_some()
+        {
+            Action::ShowUpdate
+        } else {
+            Action::CheckUpdate
+        });
+    }
     // Settings lives at the foot of the sidebar, above the player bar, away from the destinations.
     let item = Rect::new(rect.x + 12.0, rect.h - 48.0, item_w, item_h);
     let selected = on_tab && state.tab == Tab::Settings;
     if sidebar_item(cx, item, Tab::Settings, selected, label_a, 2) {
         actions.push(Action::Tab(Tab::Settings));
     }
+}
+
+/// The update entry: the same hover wash and label reveal as a destination, but no selected pill.
+/// Its glyph turns white once a release is waiting, or an install is underway.
+fn sidebar_update_item(cx: &mut Cx, item: Rect, update: &UpdateUi, label_a: f32) -> bool {
+    let has_bg = cx.gpu.background.is_some();
+    let hover = cx.over_clickable(item);
+    let hv = cx.anims.toggle("update_hv", 0, hover, rate::SNAP);
+    if hv > 0.005 {
+        let fill = if has_bg {
+            fade(theme::panel_hover(), hv * 0.65)
+        } else {
+            mix(theme::panel(), theme::panel_hover(), hv)
+        };
+        cx.draw().round_rect(item, 11.0, fill);
+    }
+    let active = update.available.is_some() || update.checking || update.installing;
+    let color = mix(
+        if active { theme::fg() } else { theme::muted() },
+        theme::fg(),
+        hv,
+    );
+    let center = (item.x + 22.0, item.y + item.h * 0.5);
+    cx.icon(Icon::Download, center, 19.0, color);
+    cx.clip(item);
+    cx.ui.label(
+        Rect::new(item.x + 40.0, item.y, 150.0, item.h),
+        "Update",
+        dream::ui::widgets::LabelStyle::new(FontId(2))
+            .size(13.0)
+            .color(fade(color, label_a))
+            .align(Align::Left)
+            .vcenter(true),
+    );
+    cx.unclip();
+    cx.clicked(item)
 }
 
 /// One sidebar destination: a pill when chosen, a wash under the pointer, the icon fixed at x = 34
@@ -3806,6 +3991,153 @@ fn sidebar_item(cx: &mut Cx, item: Rect, tab: Tab, selected: bool, label_a: f32,
     );
     cx.unclip();
     cx.clicked(item)
+}
+
+/// The update card's width and height. It sits above the sidebar's Update entry, clear of the
+/// player bar.
+const UPDATE_POPUP_W: f32 = 306.0;
+const UPDATE_POPUP_H: f32 = 150.0;
+/// The app version shown in the "up to date" card.
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn update_popup_rect(sidebar: Rect, width: f32) -> Rect {
+    let w = UPDATE_POPUP_W.min((width - 24.0).max(240.0));
+    let x = (sidebar.x + 12.0).clamp(12.0, (width - w - 12.0).max(12.0));
+    let bottom = sidebar.h - 98.0;
+    let y = (bottom - UPDATE_POPUP_H).max(12.0);
+    Rect::new(x, y, w, UPDATE_POPUP_H)
+}
+
+/// The little card that tells the listener a release is ready. It rises into place on a light
+/// spring with a touch of overshoot, and eases back down when dismissed.
+fn draw_update_popup(
+    cx: &mut Cx,
+    state: &mut State,
+    sidebar: Rect,
+    width: f32,
+    actions: &mut Vec<Action>,
+) {
+    let open = state.update.popup_open;
+    let last = cx.anims.value("update_pop", 0).unwrap_or(0.0);
+    if !open && last <= 0.001 {
+        return;
+    }
+    let t = cx.anims.spring_damped(
+        "update_pop",
+        0,
+        if open { 1.0 } else { 0.0 },
+        rate::POP,
+        rate::POP_DAMPING,
+    );
+    let alpha = t.clamp(0.0, 1.0);
+    if !open && alpha <= 0.001 {
+        return;
+    }
+    let base = update_popup_rect(sidebar, width);
+    let panel = Rect::new(base.x, base.y + (1.0 - t) * 14.0, base.w, base.h);
+    let layer = cx.draw().set_layer(MENU_LAYER);
+    cx.draw()
+        .backdrop_rounded(panel, fade(Color::WHITE, alpha), 14.0);
+    cx.draw()
+        .round_rect(panel, 14.0, fade(theme::raised(), alpha));
+    cx.draw()
+        .round_ring(panel, 14.0, 1.0, fade(theme::fg(), 0.06 * alpha));
+
+    let icon = (panel.x + 31.0, panel.y + 34.0);
+    cx.draw()
+        .fill_circle(icon, 18.0, fade(theme::panel_select(), alpha));
+    cx.icon(Icon::Download, icon, 18.0, fade(theme::fg(), alpha));
+
+    let title;
+    let body;
+    if let Some(error) = state.update.error.as_deref() {
+        title = if state.update.available.is_some() {
+            "Update didn't finish"
+        } else {
+            "Update check failed"
+        };
+        body = error.to_owned();
+    } else if state.update.installing {
+        title = "Updating V1";
+        body = "Downloading the update. V1 will restart when it is ready.".to_owned();
+    } else if let Some(version) = state.update.available.as_deref() {
+        title = "Update available";
+        body = format!("V1 {version} is ready to install.");
+    } else if state.update.checking {
+        title = "Checking for updates";
+        body = "Looking for a newer version of V1.".to_owned();
+    } else if state.update.up_to_date {
+        title = "You're up to date";
+        body = format!("V1 {CURRENT_VERSION} is the latest version.");
+    } else {
+        title = "Update";
+        body = "Check for a newer version of V1.".to_owned();
+    }
+
+    let text_x = panel.x + 58.0;
+    let text_w = panel.w - 76.0;
+    cx.text(
+        Rect::new(text_x, panel.y + 17.0, text_w, 22.0),
+        title,
+        15.5,
+        fade(theme::fg(), alpha),
+        Align::Left,
+    );
+    let body_h = cx.text_block_height(text_w, &body, 12.5, 1.35);
+    cx.clip(Rect::new(text_x, panel.y + 44.0, text_w, body_h.min(58.0)));
+    cx.text_block(
+        Rect::new(text_x, panel.y + 44.0, text_w, body_h),
+        &body,
+        12.5,
+        fade(theme::muted(), alpha),
+        1.35,
+        Align::Left,
+    );
+    cx.unclip();
+
+    if state.update.checking || state.update.installing {
+        cx.draw().set_layer(layer);
+        return;
+    }
+    let button_y = panel.y + panel.h - 42.0;
+    if state.update.error.is_some() {
+        let retry = Rect::new(panel.x + panel.w - 102.0, button_y, 86.0, 30.0);
+        let close = Rect::new(retry.x - 62.0, button_y, 56.0, 30.0);
+        if update_primary_button(cx, retry, "Try again") {
+            actions.push(if state.update.available.is_some() {
+                Action::InstallUpdate
+            } else {
+                Action::CheckUpdate
+            });
+        }
+        if text_button(cx, close, "Close", false) {
+            actions.push(Action::DismissUpdate);
+        }
+    } else if state.update.available.is_some() {
+        let update = Rect::new(panel.x + panel.w - 100.0, button_y, 84.0, 30.0);
+        let later = Rect::new(update.x - 64.0, button_y, 58.0, 30.0);
+        if update_primary_button(cx, update, "Update") {
+            actions.push(Action::InstallUpdate);
+        }
+        if text_button(cx, later, "Later", false) {
+            actions.push(Action::DismissUpdate);
+        }
+    } else {
+        let close = Rect::new(panel.x + panel.w - 76.0, button_y, 60.0, 30.0);
+        if update_primary_button(cx, close, "Close") {
+            actions.push(Action::DismissUpdate);
+        }
+    }
+    cx.draw().set_layer(layer);
+}
+
+fn update_primary_button(cx: &mut Cx, rect: Rect, label: &str) -> bool {
+    let hover = cx.over_clickable(rect);
+    let hv = cx.anims.toggle("update_primary", 0, hover, rate::SNAP);
+    cx.draw()
+        .round_rect(rect, 9.0, mix(theme::fg(), theme::accent(), hv * 0.15));
+    cx.text(rect, label, 13.0, theme::bg(), Align::Center);
+    cx.clicked(rect)
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -28,8 +28,9 @@ Windows is the current target. macOS is planned (Apple Silicon + Metal); Linux i
 On Windows, download `V1-Setup-<version>.exe` from the [Releases](https://github.com/barusoup/V1/releases) page.
 The installer includes FFmpeg and ffprobe.
 
-Every launch asks GitHub for a newer full release and, when there is one, installs it silently
-before the window opens. Only installed copies update: a build run from a folder never writes to
+V1 checks GitHub for a newer full release in the background. When one is ready, the **Update**
+entry above Settings turns white and a card offers to install it; click through to download,
+install and restart. Only installed copies update: a build run from a folder never writes to
 itself.
 
 Only one copy runs at a time. While a self-update replaces the app, launches made before the updated
