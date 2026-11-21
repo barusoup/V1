@@ -123,10 +123,9 @@ struct Host {
     /// Keyboard edges (typed text, navigation, clipboard chords) gathered since the last frame.
     pending: UiInput,
 
-    /// The display's scale factor (device pixels per OS logical pixel).
+    /// The display's scale factor (device pixels per OS logical pixel). UI density itself is fixed:
+    /// the window gets more or less content, not smaller or larger controls.
     scale: f32,
-    /// Compact-window adjustment to the UI scale; see [`zoom_for`].
-    zoom: f32,
     mouse: (f32, f32),
     down: bool,
     pressed: bool,
@@ -184,14 +183,6 @@ struct WindowDrag {
     origin: (i32, i32),
 }
 
-/// Keep text, icons and spacing at their normal size in larger windows, leaving more room for
-/// content. Compact windows shrink a little before the layout starts to give way. Display DPI
-/// scaling is applied separately. The 2% steps avoid churning the glyph cache during a resize.
-fn zoom_for(logical_w: f32, logical_h: f32) -> f32 {
-    let fit = (logical_w / 1280.0).min(logical_h / 800.0);
-    ((fit.clamp(0.85, 1.0) * 50.0).round()) / 50.0
-}
-
 /// How close to an edge, in UI units, starts a native resize. The window has no OS title bar or
 /// border, so this is the only place the resize zones exist.
 const RESIZE_BORDER: f32 = 6.0;
@@ -216,19 +207,6 @@ fn resize_direction(pos: (f32, f32), size: (f32, f32)) -> Option<ResizeDirection
         (_, _, _, true) => Some(ResizeDirection::South),
         _ => None,
     }
-}
-
-#[test]
-fn larger_windows_keep_normal_ui_size() {
-    for (w, h) in [
-        (1280.0, 800.0),
-        (1920.0, 1080.0),
-        (3840.0, 2160.0),
-        (3440.0, 1440.0),
-    ] {
-        assert_eq!(zoom_for(w, h), 1.0);
-    }
-    assert!(zoom_for(960.0, 600.0) < 1.0);
 }
 
 #[test]
@@ -399,7 +377,6 @@ impl ApplicationHandler<UserEvent> for Host {
             })
         });
         boot_mark("media controls attached");
-        self.update_zoom();
         self.attach_library();
         boot_mark("collection attached");
         self.reveal = self.shot.is_none() || !self.shot_delay.is_zero();
@@ -440,14 +417,12 @@ impl ApplicationHandler<UserEvent> for Host {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
                 }
-                self.update_zoom();
                 self.update_resize_zone();
                 self.redraw_request();
             }
             WindowEvent::Occluded(occluded) => {
                 self.occluded = occluded;
                 if !occluded {
-                    self.update_zoom();
                     self.redraw_request();
                 }
             }
@@ -461,7 +436,6 @@ impl ApplicationHandler<UserEvent> for Host {
                         renderer.resize(window.inner_size());
                     }
                 }
-                self.update_zoom();
                 self.update_resize_zone();
                 self.redraw_request();
             }
@@ -794,24 +768,10 @@ impl Host {
         }
     }
 
-    /// Device pixels per UI unit: the display's scale times the window zoom.
+    /// Device pixels per UI unit. The OS display scale is the only multiplier: a smaller window
+    /// shows less content at the same density instead of shrinking text and controls.
     fn ui_scale(&self) -> f32 {
-        self.scale * self.zoom
-    }
-
-    fn update_zoom(&mut self) {
-        if let Some(window) = &self.window {
-            let size = window.inner_size();
-            // A minimized window reports a zero size; `zoom_for(0, 0)` would shrink the whole UI
-            // and start every width-dependent animation over on restore.
-            if size.width == 0 || size.height == 0 {
-                return;
-            }
-            self.zoom = zoom_for(
-                size.width as f32 / self.scale,
-                size.height as f32 / self.scale,
-            );
-        }
+        self.scale
     }
 
     /// Recompute which resize border the pointer is on. Fullscreen windows have no edges to drag.
@@ -1148,7 +1108,6 @@ impl Host {
             return;
         }
 
-        self.update_zoom();
         self.state.fullscreen = self
             .window
             .as_ref()
@@ -1422,7 +1381,6 @@ fn main() {
         keys: KeyFeed::default(),
         pending: UiInput::default(),
         scale: 1.0,
-        zoom: 1.0,
         mouse: (-1.0, -1.0),
         down: false,
         pressed: false,
