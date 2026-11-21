@@ -21,8 +21,6 @@ pub enum Command {
     Stop,
     /// Seek to this position, in seconds.
     Seek(f64),
-    /// Set the output volume, 0 to 1.
-    Volume(f64),
 }
 
 /// What the SMTC session should show. Borrowed from the track view, so building it every frame
@@ -36,8 +34,6 @@ pub struct MediaInfo<'a> {
     pub position: f64,
     pub duration: f64,
     pub playing: bool,
-    /// The output volume, 0 to 1. Kept on the shared snapshot for UI-driven volume changes.
-    pub volume: f32,
 }
 
 pub use imp::MediaControls;

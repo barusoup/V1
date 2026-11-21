@@ -1630,7 +1630,6 @@ impl State {
                 position: 0.0,
                 duration: self.known_length(hit) as f64,
                 playing: false,
-                volume: self.volume,
             });
         }
         if let Some(track) = &self.now {
@@ -1641,7 +1640,6 @@ impl State {
                 position: track.position as f64,
                 duration: track.duration as f64,
                 playing: !track.paused,
-                volume: self.volume,
             });
         }
         self.demo_track
@@ -1653,7 +1651,6 @@ impl State {
                 position: track.position as f64,
                 duration: track.duration as f64,
                 playing: !track.paused,
-                volume: self.volume,
             })
     }
 
@@ -1673,7 +1670,6 @@ impl State {
             Command::Next => self.next(),
             Command::Previous => self.back(),
             Command::Stop => self.set_playing(false),
-            Command::Volume(volume) => self.set_volume(volume as f32),
             Command::Seek(seconds) => {
                 if let Some(track) = self.now.as_mut() {
                     let upper = if track.duration > 0.0 {
